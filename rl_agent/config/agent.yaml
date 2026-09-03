@@ -1,0 +1,21 @@
+# All paths are relative to this Agent directory. They are resolved at runtime.
+training_project: ../unitree_rl_gym
+experiment_root: experiments
+artifact_root: artifacts
+default_robot: go2
+provider: opencli
+num_reward_candidates: 3
+smoke_iterations: 50
+screening_iterations: 300
+trend_iterations: 500
+mid_iterations: 1000
+full_iterations: 1500
+max_total_iterations: 12000
+max_reward_revisions: 3
+evaluation_seeds: [1, 2, 3]
+rollouts_per_seed: 20
+video_fps: 30
+training_timeout_seconds: 86400
+log_stale_seconds: 600
+max_abs_reward_weight: 100.0
+allowed_robots: [go2, h1, h1_2, g1]

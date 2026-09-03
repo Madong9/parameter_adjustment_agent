@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b0e12">
+  <title>动境 · 强化学习上位机</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="ambient ambient-a"></div>
+  <div class="ambient ambient-b"></div>
+  <div class="shell">
+    <header class="topbar">
+      <a class="brand" href="#" aria-label="回到操作台顶部">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span>
+          <b>动境</b>
+          <small>KINETIC LAB · RL 上位机</small>
+        </span>
+      </a>
+      <div class="system-strip" aria-label="系统状态">
+        <span class="system-item"><i class="signal online"></i>控制服务在线</span>
+        <span class="system-item"><i class="signal" id="projectSignal"></i><span id="projectStatus">检查训练工程</span></span>
+        <span class="clock" id="clock">--:--:--</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="intro">
+        <div>
+          <p class="eyebrow">NATURAL LANGUAGE MOTION LAB</p>
+          <h1>描述动作，<em>让策略生长。</em></h1>
+          <p class="intro-copy">面向 Unitree 仿真训练的本地上位机。下发自然语言动作目标，观察 Agent 从奖励设计到视觉评估的完整学习过程。</p>
+        </div>
+        <div class="orbit-art" aria-hidden="true">
+          <div class="orbit orbit-one"></div>
+          <div class="orbit orbit-two"></div>
+          <div class="core"><span>RL</span></div>
+          <i class="satellite satellite-a"></i>
+          <i class="satellite satellite-b"></i>
+        </div>
+      </section>
+
+      <section class="control-grid">
+        <article class="panel command-panel">
+          <div class="panel-heading">
+            <div><span class="step-number">01</span><h2>任务下发</h2></div>
+            <span class="muted">自然语言动作目标</span>
+          </div>
+          <label class="sr-only" for="taskInput">想训练的动作</label>
+          <div class="prompt-box">
+            <textarea id="taskInput" maxlength="2000" placeholder="例如：让机器狗在碎石路面稳定小跑，遇到扰动后快速恢复平衡……"></textarea>
+            <div class="prompt-meta">
+              <span><kbd>Ctrl</kbd> + <kbd>Enter</kbd> 下发</span>
+              <span id="charCount">0 / 2000</span>
+            </div>
+          </div>
+          <div class="examples" aria-label="动作描述示例">
+            <button type="button" data-example="训练机器狗稳定向前小跑，并在受到侧向推力后快速恢复平衡">扰动恢复小跑</button>
+            <button type="button" data-example="训练机器狗原地向上跳跃，保持身体姿态并稳定落地">原地跳跃</button>
+            <button type="button" data-example="训练机器狗在不平整地面低速行走，减少足端打滑和身体晃动">崎岖地形行走</button>
+          </div>
+
+          <div class="section-label"><span class="step-number">02</span><h2>选择训练机型</h2></div>
+          <div class="robot-grid" id="robotGrid" role="radiogroup" aria-label="训练机器人"></div>
+
+          <div class="section-label mode-title"><span class="step-number">03</span><h2>运行方式</h2></div>
+          <div class="mode-switch" id="modeSwitch" role="radiogroup" aria-label="训练模式">
+            <button type="button" class="active" data-mode="dry-run" role="radio" aria-checked="true">
+              <span>离线演练</span><small>模拟完整流程 · 无需 GPU</small>
+            </button>
+            <button type="button" data-mode="real" role="radio" aria-checked="false">
+              <span>真实训练</span><small>OpenCLI 推理 · GPU 仿真</small>
+            </button>
+          </div>
+          <div class="safety-note" id="modeNote">
+            <span aria-hidden="true">◇</span>
+            <p><b>离线安全模式</b>将生成模拟训练结果，用于检查 Agent 全链路，不会启动实际 GPU 训练。</p>
+          </div>
+          <button class="launch-button" id="launchButton" type="button">
+            <span>下发训练任务</span><i aria-hidden="true">↗</i>
+          </button>
+          <p class="form-error" id="formError" role="alert"></p>
+        </article>
+
+        <article class="panel telemetry-panel">
+          <div class="panel-heading">
+            <div><span class="step-number">LIVE</span><h2>学习遥测</h2></div>
+            <span class="run-state idle" id="runState"><i></i>等待任务</span>
+          </div>
+
+          <div class="telemetry-empty" id="telemetryEmpty">
+            <div class="empty-glyph"><span></span><i></i><b>∞</b></div>
+            <h3>训练通道待命</h3>
+            <p>从左侧下发动作目标后，这里将实时呈现训练阶段与策略生长进度。</p>
+          </div>
+
+          <div class="telemetry-content hidden" id="telemetryContent">
+            <div class="progress-overview">
+              <div class="progress-ring" id="progressRing">
+                <div><strong id="progressValue">0</strong><small>%</small></div>
+              </div>
+              <div class="progress-copy">
+                <small>当前阶段</small>
+                <h3 id="stageLabel">准备训练</h3>
+                <p id="activeTask">—</p>
+              </div>
+            </div>
+            <div class="job-facts">
+              <div><span>实验编号</span><b id="taskId">—</b></div>
+              <div><span>训练机型</span><b id="activeRobot">—</b></div>
+              <div><span>运行模式</span><b id="activeMode">—</b></div>
+              <div><span>闭环轮次</span><b id="loopRound">—</b></div>
+              <div><span>剩余预算</span><b id="loopBudget">—</b></div>
+            </div>
+            <div class="stage-track" id="stageTrack" aria-label="训练阶段">
+              <div data-threshold="10"><i></i><span>环境检查</span></div>
+              <div data-threshold="25"><i></i><span>奖励设计</span></div>
+              <div data-threshold="48"><i></i><span>冒烟训练</span></div>
+              <div data-threshold="74"><i></i><span>完整训练</span></div>
+              <div data-threshold="89"><i></i><span>视觉评估</span></div>
+              <div data-threshold="100"><i></i><span>训练完成</span></div>
+            </div>
+            <div class="training-controls">
+              <button class="resume-button hidden" id="resumeButton" type="button" disabled>
+                <i aria-hidden="true">↻</i><span>从当前策略继续闭环</span>
+              </button>
+              <button class="stop-button" id="stopButton" type="button" disabled>
+                <i aria-hidden="true"></i><span>安全停止训练</span>
+              </button>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section class="lower-grid">
+        <article class="panel terminal-panel">
+          <div class="panel-heading terminal-heading">
+            <div><span class="step-number">LOG</span><h2>运行日志</h2></div>
+            <div class="terminal-actions">
+              <button type="button" id="autoScrollButton" class="active">自动跟随</button>
+              <button type="button" id="copyLogButton">复制</button>
+              <button type="button" id="clearLogButton">清屏</button>
+            </div>
+          </div>
+          <div class="terminal" id="terminal" tabindex="0" aria-label="实时训练日志">
+            <div class="terminal-welcome" id="terminalWelcome">
+              <span>RL TRAINING CONTROL SERVICE / READY</span>
+              <p>等待训练任务。日志将保存在相对目录 <b>artifacts/ui_jobs/</b> 中。</p>
+            </div>
+            <pre id="logOutput"></pre>
+          </div>
+        </article>
+
+        <article class="panel history-panel">
+          <div class="panel-heading">
+            <div><span class="step-number">REC</span><h2>最近实验</h2></div>
+            <button class="refresh-button" id="refreshButton" type="button" aria-label="刷新实验">↻</button>
+          </div>
+          <div class="history-list" id="historyList">
+            <div class="history-loading">正在读取实验记录…</div>
+          </div>
+        </article>
+      </section>
+    </main>
+
+    <footer>
+      <span>LOCAL OPERATOR STATION · 仅限仿真训练</span>
+      <span>UNITREE RL AGENT / CONTROL SURFACE 01</span>
+    </footer>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

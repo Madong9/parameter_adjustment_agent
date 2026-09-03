@@ -1,0 +1,249 @@
+diff --git a/legged_gym/envs/base/base_task.py b/legged_gym/envs/base/base_task.py
+index 325fcce..3014744 100644
+--- a/legged_gym/envs/base/base_task.py
++++ b/legged_gym/envs/base/base_task.py
+@@ -25,7 +25,8 @@ class BaseTask():
+ 
+         # graphics device for rendering, -1 for no rendering
+         self.graphics_device_id = self.sim_device_id
+-        if self.headless == True:
++        # 即使不创建桌面 viewer，离屏仿真摄像机仍需要图形设备。
++        if self.headless == True and not getattr(cfg.env, "record_video", False):
+             self.graphics_device_id = -1
+ 
+         self.num_envs = cfg.env.num_envs
+@@ -112,4 +113,4 @@ class BaseTask():
+                 if sync_frame_time:
+                     self.gym.sync_frame_time(self.sim)
+             else:
+-                self.gym.poll_viewer_events(self.viewer)
+\ No newline at end of file
++                self.gym.poll_viewer_events(self.viewer)
+diff --git a/legged_gym/envs/base/legged_robot.py b/legged_gym/envs/base/legged_robot.py
+index 00587b3..39b34a5 100644
+--- a/legged_gym/envs/base/legged_robot.py
++++ b/legged_gym/envs/base/legged_robot.py
+@@ -151,9 +151,35 @@ class LeggedRobot(BaseTask):
+         self.reset_buf[env_ids] = 1
+         # fill extras
+         self.extras["episode"] = {}
++        total_abs_contribution = torch.zeros(len(env_ids), dtype=torch.float, device=self.device)
++        for key in self.reward_step_stats.keys():
++            total_abs_contribution += self.reward_step_stats[key]["weighted_abs_sum"][env_ids]
+         for key in self.episode_sums.keys():
+             self.extras["episode"]['rew_' + key] = torch.mean(self.episode_sums[key][env_ids]) / self.max_episode_length_s
+             self.episode_sums[key][env_ids] = 0.
++            stats = self.reward_step_stats[key]
++            count = torch.clamp(stats["count"][env_ids], min=1.0)
++            raw_mean = stats["raw_sum"][env_ids] / count
++            raw_variance = torch.clamp(stats["raw_square_sum"][env_ids] / count - raw_mean.square(), min=0.0)
++            weighted_mean = stats["weighted_sum"][env_ids] / count
++            weighted_variance = torch.clamp(stats["weighted_square_sum"][env_ids] / count - weighted_mean.square(), min=0.0)
++            contribution = stats["weighted_abs_sum"][env_ids] / torch.clamp(total_abs_contribution, min=1e-12)
++            self.extras["episode"]["rew_raw_mean_" + key] = torch.mean(raw_mean)
++            self.extras["episode"]["rew_raw_std_" + key] = torch.mean(torch.sqrt(raw_variance))
++            self.extras["episode"]["rew_raw_min_" + key] = torch.min(stats["raw_min"][env_ids])
++            self.extras["episode"]["rew_raw_max_" + key] = torch.max(stats["raw_max"][env_ids])
++            self.extras["episode"]["rew_weight_" + key] = self.reward_config_weights[key]
++            self.extras["episode"]["rew_weighted_mean_" + key] = torch.mean(weighted_mean)
++            self.extras["episode"]["rew_weighted_std_" + key] = torch.mean(torch.sqrt(weighted_variance))
++            self.extras["episode"]["rew_contribution_ratio_" + key] = torch.mean(contribution)
++            self.extras["episode"]["rew_nonzero_ratio_" + key] = torch.mean(stats["nonzero_count"][env_ids] / count)
++            self.extras["episode"]["rew_saturation_ratio_" + key] = torch.mean(stats["saturation_count"][env_ids] / count)
++            self.extras["episode"]["rew_phase_all_" + key] = torch.mean(raw_mean)
++            self.extras["episode"]["rew_raw_episode_sum_" + key] = torch.mean(stats["raw_sum"][env_ids])
++            for statistic in stats.values():
++                statistic[env_ids] = 0.0
++            stats["raw_min"][env_ids] = float("inf")
++            stats["raw_max"][env_ids] = float("-inf")
+         if self.cfg.commands.curriculum:
+             self.extras["episode"]["max_command_x"] = self.command_ranges["lin_vel_x"][1]
+         # send timeout info to the algorithm
+@@ -168,16 +194,36 @@ class LeggedRobot(BaseTask):
+         self.rew_buf[:] = 0.
+         for i in range(len(self.reward_functions)):
+             name = self.reward_names[i]
+-            rew = self.reward_functions[i]() * self.reward_scales[name]
++            raw_rew = self.reward_functions[i]()
++            self.last_raw_rewards[name].copy_(raw_rew)
++            rew = raw_rew * self.reward_scales[name]
++            self._record_reward_statistics(name, raw_rew, rew)
+             self.rew_buf += rew
+             self.episode_sums[name] += rew
+         if self.cfg.rewards.only_positive_rewards:
+             self.rew_buf[:] = torch.clip(self.rew_buf[:], min=0.)
+         # add termination reward after clipping
+         if "termination" in self.reward_scales:
+-            rew = self._reward_termination() * self.reward_scales["termination"]
++            raw_rew = self._reward_termination()
++            self.last_raw_rewards["termination"].copy_(raw_rew)
++            rew = raw_rew * self.reward_scales["termination"]
++            self._record_reward_statistics("termination", raw_rew, rew)
+             self.rew_buf += rew
+             self.episode_sums["termination"] += rew
++
++    def _record_reward_statistics(self, name, raw_reward, weighted_reward):
++        """在不改变奖励语义的前提下，收集各环境的原始值和加权统计量。"""
++        stats = self.reward_step_stats[name]
++        stats["raw_sum"] += raw_reward
++        stats["raw_square_sum"] += raw_reward.square()
++        stats["raw_min"][:] = torch.minimum(stats["raw_min"], raw_reward)
++        stats["raw_max"][:] = torch.maximum(stats["raw_max"], raw_reward)
++        stats["weighted_sum"] += weighted_reward
++        stats["weighted_square_sum"] += weighted_reward.square()
++        stats["weighted_abs_sum"] += weighted_reward.abs()
++        stats["nonzero_count"] += (raw_reward != 0).float()
++        stats["saturation_count"] += (raw_reward.abs() >= 1.0).float()
++        stats["count"] += 1.0
+     
+     def compute_observations(self):
+         """ Computes observations
+@@ -486,6 +532,8 @@ class LeggedRobot(BaseTask):
+         """ Prepares a list of reward functions, whcih will be called to compute the total reward.
+             Looks for self._reward_<REWARD_NAME>, where <REWARD_NAME> are names of all non zero reward scales in the cfg.
+         """
++        # 转换为逐步尺度前，保留面向用户的原始权重。
++        self.reward_config_weights = dict(self.reward_scales)
+         # remove zero scales + multiply non-zero ones by dt
+         for key in list(self.reward_scales.keys()):
+             scale = self.reward_scales[key]
+@@ -506,6 +554,21 @@ class LeggedRobot(BaseTask):
+         # reward episode sums
+         self.episode_sums = {name: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+                              for name in self.reward_scales.keys()}
++        statistic_names = ("raw_sum", "raw_square_sum", "raw_min", "raw_max", "weighted_sum",
++                           "weighted_square_sum", "weighted_abs_sum", "nonzero_count",
++                           "saturation_count", "count")
++        self.reward_step_stats = {
++            name: {statistic: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
++                   for statistic in statistic_names}
++            for name in self.reward_scales.keys()
++        }
++        self.last_raw_rewards = {
++            name: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
++            for name in self.reward_scales.keys()
++        }
++        for stats in self.reward_step_stats.values():
++            stats["raw_min"][:] = float("inf")
++            stats["raw_max"][:] = float("-inf")
+ 
+     def _create_ground_plane(self):
+         """ Adds a ground plane to the simulation, sets friction and restitution based on the cfg.
+@@ -725,3 +788,74 @@ class LeggedRobot(BaseTask):
+     def _reward_feet_contact_forces(self):
+         # penalize high contact forces
+         return torch.sum((torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1) -  self.cfg.rewards.max_contact_force).clip(min=0.), dim=1)
++
++    def _reward_jump_height(self):
++        """按相对标称高度的垂直位移给分，并在配置目标处饱和。"""
++        displacement = self.base_pos[:, 2] - self.cfg.init_state.pos[2]
++        return torch.clamp(displacement / max(self.cfg.rewards.jump_height_target, 1e-6), min=0.0, max=1.0)
++
++    def _reward_feet_synchrony(self):
++        """奖励预期的同步接触状态，即四足全部着地或全部离地。"""
++        contacts = self.contact_forces[:, self.feet_indices, 2] > 1.0
++        contact_count = torch.sum(contacts, dim=1)
++        return torch.logical_or(contact_count == 0, contact_count == len(self.feet_indices)).float()
++
++    def _reward_landing_stability(self):
++        """奖励腾空阶段结束后四足接触且机身保持水平的状态。"""
++        contacts = self.contact_forces[:, self.feet_indices, 2] > 1.0
++        all_contact = torch.all(contacts, dim=1).float()
++        return all_contact * torch.exp(-4.0 * torch.sum(torch.square(self.rpy[:, :2]), dim=1))
++
++    def _reward_horizontal_drift(self):
++        """计算机身相对环境原点的水平漂移惩罚量。"""
++        return torch.norm(self.base_pos[:, :2] - self.env_origins[:, :2], dim=1)
++
++    def _reward_rear_leg_stand(self):
++        """奖励后足支撑、前足离地且接近目标高度和俯仰角的持续站立姿态。"""
++        contacts = self.contact_forces[:, self.feet_indices, 2] > 1.0
++        rear_support = torch.mean(contacts[:, 2:4].float(), dim=1)
++        front_air_fraction = 1.0 - torch.mean(contacts[:, 0:2].float(), dim=1)
++        height_error = (self.base_pos[:, 2] - self.cfg.rewards.rear_stand_height_target) \
++            / max(self.cfg.rewards.rear_stand_height_sigma, 1e-6)
++        pitch_error = (torch.abs(self.rpy[:, 1]) - self.cfg.rewards.rear_stand_pitch_target) \
++            / max(self.cfg.rewards.rear_stand_pitch_sigma, 1e-6)
++        height_score = torch.exp(-torch.square(height_error))
++        pitch_score = torch.exp(-torch.square(pitch_error))
++        pitch_progress = torch.clamp(
++            torch.abs(self.rpy[:, 1]) / max(self.cfg.rewards.rear_stand_pitch_target, 1e-6), 0.0, 1.0)
++        roll_score = torch.exp(-4.0 * torch.square(self.rpy[:, 0]))
++        dense_progress = 0.15 * height_score + 0.15 * pitch_progress
++        target_posture = 0.70 * front_air_fraction * height_score * pitch_score
++        return rear_support * (dense_progress + target_posture) * roll_score
++
++    def _reward_rear_leg_walk(self):
++        """仅在后腿站立姿态成立时奖励线速度跟踪，阻止趴低爬行利用速度奖励。"""
++        contacts = self.contact_forces[:, self.feet_indices, 2] > 1.0
++        rear_support = torch.mean(contacts[:, 2:4].float(), dim=1)
++        front_air_fraction = 1.0 - torch.mean(contacts[:, 0:2].float(), dim=1)
++        return rear_support * front_air_fraction * self._reward_rear_leg_stand() * self._reward_tracking_lin_vel()
++
++    def _reward_front_leg_stand(self):
++        """奖励前足支撑、后足离地且接近目标高度和俯仰角的倒立姿态。"""
++        contacts = self.contact_forces[:, self.feet_indices, 2] > 1.0
++        front_support = torch.mean(contacts[:, 0:2].float(), dim=1)
++        rear_air_fraction = 1.0 - torch.mean(contacts[:, 2:4].float(), dim=1)
++        height_error = (self.base_pos[:, 2] - self.cfg.rewards.front_stand_height_target) \
++            / max(self.cfg.rewards.front_stand_height_sigma, 1e-6)
++        pitch_error = (torch.abs(self.rpy[:, 1]) - self.cfg.rewards.front_stand_pitch_target) \
++            / max(self.cfg.rewards.front_stand_pitch_sigma, 1e-6)
++        height_score = torch.exp(-torch.square(height_error))
++        pitch_score = torch.exp(-torch.square(pitch_error))
++        pitch_progress = torch.clamp(
++            torch.abs(self.rpy[:, 1]) / max(self.cfg.rewards.front_stand_pitch_target, 1e-6), 0.0, 1.0)
++        roll_score = torch.exp(-4.0 * torch.square(self.rpy[:, 0]))
++        dense_progress = 0.15 * height_score + 0.15 * pitch_progress
++        target_posture = 0.70 * rear_air_fraction * height_score * pitch_score
++        return front_support * (dense_progress + target_posture) * roll_score
++
++    def _reward_front_leg_walk(self):
++        """仅在前腿倒立姿态成立时奖励线速度跟踪，避免四足普通行走利用任务奖励。"""
++        contacts = self.contact_forces[:, self.feet_indices, 2] > 1.0
++        front_support = torch.mean(contacts[:, 0:2].float(), dim=1)
++        rear_air_fraction = 1.0 - torch.mean(contacts[:, 2:4].float(), dim=1)
++        return front_support * rear_air_fraction * self._reward_front_leg_stand() * self._reward_tracking_lin_vel()
+diff --git a/legged_gym/envs/base/legged_robot_config.py b/legged_gym/envs/base/legged_robot_config.py
+index 03f09a2..c1db18b 100644
+--- a/legged_gym/envs/base/legged_robot_config.py
++++ b/legged_gym/envs/base/legged_robot_config.py
+@@ -115,6 +115,15 @@ class LeggedRobotCfg(BaseConfig):
+             feet_stumble = -0.0 
+             action_rate = -0.01
+             stand_still = -0.
++            # 任务专用奖励原语默认关闭，可由 Agent 按需启用。
++            jump_height = 0.0
++            feet_synchrony = 0.0
++            landing_stability = 0.0
++            horizontal_drift = -0.0
++            rear_leg_stand = 0.0
++            rear_leg_walk = 0.0
++            front_leg_stand = 0.0
++            front_leg_walk = 0.0
+ 
+         only_positive_rewards = True # if true negative total rewards are clipped at zero (avoids early termination problems)
+         tracking_sigma = 0.25 # tracking reward = exp(-error^2/sigma)
+@@ -122,6 +131,15 @@ class LeggedRobotCfg(BaseConfig):
+         soft_dof_vel_limit = 1.
+         soft_torque_limit = 1.
+         base_height_target = 1.
++        jump_height_target = 0.18
++        rear_stand_height_target = 0.42
++        rear_stand_pitch_target = 0.85
++        rear_stand_height_sigma = 0.08
++        rear_stand_pitch_sigma = 0.25
++        front_stand_height_target = 0.42
++        front_stand_pitch_target = 0.85
++        front_stand_height_sigma = 0.08
++        front_stand_pitch_sigma = 0.25
+         max_contact_force = 100. # forces above this value are penalized
+ 
+     class normalization:
+@@ -212,4 +230,4 @@ class LeggedRobotCfgPPO(BaseConfig):
+         resume = False
+         load_run = -1 # -1 = last run
+         checkpoint = -1 # -1 = last saved model
+-        resume_path = None # updated from load_run and chkpt
+\ No newline at end of file
++        resume_path = None # updated from load_run and chkpt

@@ -1,0 +1,18 @@
+# External simulator/training dependency. Recreate it using README.md.
+/unitree_rl_gym/
+
+# Python/editor/runtime files outside the package-specific ignore file.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.env
+.venv/
+.idea/
+.vscode/
+.DS_Store
+*.log
+*.pt
+*.pth
+*.ckpt
+*.onnx
