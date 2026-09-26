@@ -1,0 +1,77 @@
+%%{init: {"theme":"dark","themeVariables":{"background":"#0a0e10","primaryColor":"#17271f","primaryTextColor":"#f5f7f4","primaryBorderColor":"#bdf56a","lineColor":"#a7b3ad","secondaryColor":"#15242c","tertiaryColor":"#101719","clusterBkg":"#101719","clusterBorder":"#344248","fontFamily":"Noto Sans CJK SC, sans-serif"}}}%%
+flowchart TB
+    classDef ui fill:#13222a,stroke:#45d4ff,color:#f5f7f4,stroke-width:2px
+    classDef local fill:#17271f,stroke:#bdf56a,color:#f5f7f4,stroke-width:2px
+    classDef model fill:#15242c,stroke:#45d4ff,color:#f5f7f4,stroke-width:2px
+    classDef train fill:#22242a,stroke:#d2d9dc,color:#f5f7f4,stroke-width:2px
+    classDef memory fill:#1d2930,stroke:#79d7ca,color:#f5f7f4,stroke-width:2px
+    classDef terminal fill:#202d1c,stroke:#bdf56a,color:#f5f7f4,stroke-width:2px
+    classDef review fill:#302817,stroke:#f0b84b,color:#fff4d1,stroke-width:2px
+
+    subgraph U[用户与上位机]
+        INPUT[动作输入 · 机器人选择]:::ui --> UI[上位机<br/>任务下发 · 训练进度 · 日志 · 恢复]:::ui
+    end
+
+    subgraph L[本地确定性编排与安全控制]
+        ORCH[TrainingOrchestrator<br/>持久化状态机 · 预算 · 幂等恢复]:::local
+        SPEC[TaskIntentSpec]:::local
+        CONTEXT[上下文构建器<br/>环境能力 · 机器人配置 · RAG · 记忆]:::local
+        PROMPT[提示词编译器<br/>固定模板 · 版本 · SHA-256]:::local
+        BUNDLE[TaskRewardBundle]:::local
+        REVIEW[奖励审查与安全编译<br/>奖励注册表 · Schema · 权重 · 指标覆盖]:::local
+        NUM[确定性数值评估<br/>任务指标 · 硬约束 · 适用时的反事实测试]:::local
+        GATE[本地联合验收与状态决策<br/>完成门槛 · 修订预算 · HUMAN_REVIEW]:::local
+    end
+
+    subgraph A[按职责分工的模型 Agent]
+        TASK[任务理解 Agent<br/>GPT · OpenCLI 聊天]:::model
+        REWARD[奖励设计 Agent<br/>百炼 GLM API]:::model
+        VISION[视觉评估 Agent<br/>GPT · OpenCLI 多模态]:::model
+        DIAG[训练诊断 Agent<br/>百炼 GLM API]:::model
+        DOUBAO[豆包对话<br/>网页 Provider 回退]:::model
+    end
+
+    subgraph E[仿真训练与证据]
+        ENV[环境检查器<br/>Unitree RL Gym · 能力清单]:::train
+        PPO[PPO 训练<br/>多随机种子 · Checkpoint · 日志]:::train
+        ROLLOUT[确定性 Rollout<br/>数值轨迹 · 视觉视频]:::train
+        SELECT[保守视觉样本选择<br/>最差 · 中央 · 最好]:::train
+    end
+
+    subgraph K[检索知识与分层记忆]
+        RAG[RAG<br/>项目文档 · 白名单实验 · 混合检索]:::memory
+        WM[工作记忆<br/>当前状态 · 预算 · 最新证据]:::memory
+        EM[情景记忆<br/>已验证实验记录]:::memory
+        SM[语义记忆<br/>多证据支持的通用规律]:::memory
+        PM[程序记忆<br/>Prompt · Schema · 流程规则]:::memory
+        PROMOTION[记忆晋升门控<br/>仅保存验收通过且证据完整的经验]:::memory
+    end
+
+    UI --> ORCH
+    ORCH --> TASK --> SPEC --> CONTEXT --> PROMPT --> REWARD --> BUNDLE --> REVIEW --> PPO
+    ENV --> ORCH
+    ENV --> REVIEW
+    ENV <--> PPO
+    RAG --> CONTEXT
+    WM --> CONTEXT
+    EM --> CONTEXT
+    SM --> CONTEXT
+    PM -. 流程版本与规则 .-> ORCH
+
+    PPO --> ROLLOUT
+    ROLLOUT --> NUM
+    ROLLOUT --> SELECT --> VISION
+    TASK -. ChatGPT 故障时 .-> DOUBAO
+    VISION -. ChatGPT 故障时 .-> DOUBAO
+    NUM --> DIAG
+    VISION --> DIAG
+    DIAG --> GATE
+    NUM --> GATE
+    GATE -- 未通过且预算充足：修订奖励后再训练 --> REVIEW
+    GATE -- 视觉、数值与硬约束均通过 --> DONE[COMPLETED]:::terminal
+    GATE -- 需要用户判断 / Provider 故障 / 预算耗尽 --> HUMAN[HUMAN_REVIEW]:::review
+    GATE -- 训练或确定性流程失败 --> FAILED[FAILED]:::review
+    DONE --> PROMOTION --> EM --> SM
+    ORCH --> WM
+
+    %% 视觉评估保持独立，不把奖励设计 RAG 或奖励方案作为视觉判断依据。
