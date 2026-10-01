@@ -16,6 +16,12 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest
 
 Provider 会在绑定标签页前执行连接预检。若 Browser Bridge 扩展断线，会自动重启一次 OpenCLI 守护进程并在 `connect_timeout` 时间内等待扩展重连，不会直接卡在 `bind` 命令直到超时。
 
+## ChatGPT 进入“工作”模式或不可用
+
+`config/opencli.yaml` 默认启用 `force_chat_mode: true`。每次打开 ChatGPT 或创建新会话时，Provider 都会读取网页上的模式开关；发现“工作”处于启用状态时会切换到“聊天”并再次确认。无法读取或切换模式会按 Provider 故障处理，不会在工作模式中继续提交任务。
+
+`config/agent.yaml` 的任务理解和视觉角色默认都是 `opencli-doubao`。ChatGPT 因额度、登录、验证码、扩展、超时或响应格式故障而失败时，同一个高层请求会自动在豆包“对话”模式重试。使用备用链路前，需要在安装 Browser Bridge 的 Chrome 中登录 `https://www.doubao.com/chat/`。切换原因记录在当前任务的 `provider_records/opencli-doubao/fallback.log`；若豆包也失败，上位机才进入人工复核并同时显示两个原因。
+
 若自动恢复后仍提示扩展未连接，请打开安装了 Browser Bridge 扩展的 Chrome，确认扩展已启用，并保持一个已登录 ChatGPT 的标签页。执行 `opencli doctor`，看到 `Extension: connected` 后重新下发任务。若扩展已连接但无法绑定，把 ChatGPT 标签页切到前台并处理登录或验证码弹窗。
 
 ## ChatGPT 输入内容后没有发送
@@ -35,6 +41,12 @@ ChatGPT 使用 ProseMirror 富文本编辑器，它可能把一个段落换行�
 消息发送后，ChatGPT 会把 Markdown 反引号渲染为代码样式，读取用户消息的 `innerText` 时反引号本身会消失。提交确认会忽略反引号并严格比较其余全文；正文截断、字段缺失或其他字符差异仍会失败。
 
 失败日志会同时保留 OpenCLI 的 stdout 和 stderr，代理产生的 `UNDICI-EHPA` 警告不会再遮住真实页面错误。若日志提示找不到发送按钮，请保持已登录的 ChatGPT 标签页位于前台，并执行 `opencli doctor` 和 `opencli chatgpt status -f json`。不要手动点击仍残留在输入框中的旧提示词，以免与下一次任务重复。
+
+## 百炼奖励设计不可用
+
+如果上位机顶部显示 `glm-4.7 未配置`，请在启动上位机的同一终端设置 `DASHSCOPE_API_KEY`。使用业务空间专属域名时还需设置 `DASHSCOPE_BASE_URL`，其值应以 `/compatible-mode/v1` 结尾。模型 ID 与控制台实际开通结果不一致时，用 `BAILIAN_MODEL` 覆盖。
+
+HTTP 错误和回复校验错误会写入训练日志，原始 GLM 回复位于 `experiments/<task-id>/provider_records/bailian/`。审计请求不包含 Authorization 头。系统不会在百炼失败时静默改用 Mock；需要临时使用 ChatGPT 完成全部推理时，必须在命令行显式选择 `--provider opencli`。
 
 ## ChatGPT 回复无法通过 Schema 校验
 

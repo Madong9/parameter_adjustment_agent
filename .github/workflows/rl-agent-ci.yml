@@ -1,0 +1,29 @@
+name: rl-agent-ci
+
+on:
+  push:
+    paths:
+      - "rl_agent/**"
+      - ".github/workflows/rl-agent-ci.yml"
+  pull_request:
+    paths:
+      - "rl_agent/**"
+
+jobs:
+  cpu-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rl_agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+          cache: pip
+          cache-dependency-path: rl_agent/requirements.txt
+      - run: python -m pip install --upgrade pip
+      - run: pip install -r requirements.lock
+      - run: pip install -e . --no-deps
+      - run: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
+      - run: python -m compileall -q rl_training_agent tests

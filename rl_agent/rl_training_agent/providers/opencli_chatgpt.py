@@ -1,35 +1,37 @@
 from __future__ import annotations
 
 import base64
+import difflib
 import json
+import os
 import re
 import shutil
 import subprocess
 import time
+import unicodedata
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Type, TypeVar
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ValidationError
 
+from ..agents.context_builder import ContextBuilder
+from ..schemas.agent_workflow import TaskIntentSpec, TaskRewardBundle
+from ..feasibility.motion_prototype.schema import MotionPrototype
+from ..feasibility.prompts import MOTION_PROTOTYPE_PROMPT
 from ..schemas.decisions import TrainingDiagnosis
 from ..schemas.experiments import ConversationHandle, ProviderHealth
 from ..schemas.rewards import RewardPlan
 from ..schemas.task import TaskSpec
 from ..schemas.visual import VisualBehaviorReport
+from ..memory.reward_experience.prompts import REWARD_EXPERIENCE_PROMPT
+from ..memory.reward_experience.schema import RewardExperienceNarrative
 from ..settings import OpenCLISettings, load_opencli_settings
 from ..utils.io import atomic_write_text, json_safe
 from .errors import ProviderError, ProviderNeedsHuman, ProviderResponseError, ProviderTimeout
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 Runner = Callable[[Sequence[str], int], subprocess.CompletedProcess]
-
-
-class TaskRewardBundle(BaseModel):
-    task_spec: TaskSpec
-    reward_plans: List[RewardPlan]
-    reward_hacking_risks: List[str] = Field(default_factory=list)
-    termination_suggestions: List[str] = Field(default_factory=list)
 
 
 def _default_runner(args: Sequence[str], timeout: int) -> subprocess.CompletedProcess:
@@ -93,29 +95,12 @@ def _repair_common_json_syntax(text: str) -> str:
 
 def _compact_capabilities(capabilities: Dict[str, Any]) -> Dict[str, Any]:
     """保留奖励设计必需字段并移除环境清单中的路径与重复观察描述。"""
-    variable_fields = ("name", "shape", "unit", "coordinate_frame", "normalized",
-                       "available_to_policy", "available_to_reward", "simulation_only", "derivation")
-    reward_fields = ("name", "implementation", "config_key", "parameters", "expected_raw_range",
-                     "default_weight", "sign", "dependencies", "supported_phases")
-
-    def select_fields(item: Any, fields: Sequence[str]) -> Dict[str, Any]:
-        """从单条能力记录中选择模型决策所需字段。"""
-        if not isinstance(item, dict):
-            return {}
-        return {field: item[field] for field in fields if field in item}
-
-    return {
-        "project": capabilities.get("project"),
-        "robot": capabilities.get("robot"),
-        "robots": capabilities.get("robots", []),
-        "reward_variables": [select_fields(item, variable_fields)
-                             for item in capabilities.get("reward_variables", [])],
-        "rewards": [select_fields(item, reward_fields) for item in capabilities.get("rewards", [])],
-        "terminations": capabilities.get("terminations", []),
-        "command_space": capabilities.get("command_space", []),
-        "evaluation_metrics": capabilities.get("evaluation_metrics", []),
-        "unsupported": capabilities.get("unsupported", []),
-    }
+    compact = ContextBuilder.compact_manifest(capabilities)
+    compact["retrieved_experience"] = capabilities.get(
+        "retrieved_experience", {"enabled": False, "hits": []})
+    compact["long_term_memory"] = capabilities.get(
+        "long_term_memory", {"enabled": False, "hits": []})
+    return compact
 
 
 class OpenCLIChatGPTWebProvider:
@@ -154,6 +139,7 @@ class OpenCLIChatGPTWebProvider:
     def _state(self) -> str:
         """刷新页面状态并检测登录失效或验证码。"""
         state = self._browser(["state"])
+        self._raise_for_usage_limit(state)
         lowered = state.lower()
         if any(item in lowered for item in ("captcha", "verify you are human", "cloudflare")):
             raise ProviderNeedsHuman("ChatGPT page requires CAPTCHA verification")
@@ -162,18 +148,74 @@ class OpenCLIChatGPTWebProvider:
         return state
 
     @staticmethod
+    def _raise_for_usage_limit(text: str) -> None:
+        """识别 ChatGPT 额度耗尽页面或回复，并给出可执行的人工恢复提示。"""
+        normalized = re.sub(r"\s+", " ", str(text)).strip()
+        lowered = normalized.lower()
+        exhausted_markers = (
+            "你暂时已用完工作用量",
+            "你已达到使用上限",
+            "升级订阅套餐或添加额度",
+            "you've reached your usage limit",
+            "you have reached your usage limit",
+            "usage limit reached",
+        )
+        if not any(marker in lowered for marker in exhausted_markers):
+            return
+        reset = re.search(r"(?:在\s*)?(\d{1,2}:\d{2})(?:\s*后)?(?:\s*重置|\s*重试)", normalized)
+        reset_hint = "；页面显示可在 %s 后重试" % reset.group(1) if reset else ""
+        raise ProviderNeedsHuman(
+            "ChatGPT 工作用量已耗尽%s。请等待额度重置或添加额度后，再从当前策略继续闭环；"
+            "已有训练 checkpoint 不受影响。" % reset_hint)
+
+    def _check_page_usage_limit(self) -> None:
+        """读取完整页面可见正文，弥补 OpenCLI 精简状态可能遗漏的额度弹窗。"""
+        output = self._browser(
+            ["eval", "JSON.stringify((document.body&&document.body.innerText||'').slice(0,30000))"],
+            allow_failure=True,
+        )
+        page_text = self._parse_eval_result(output)
+        self._raise_for_usage_limit(page_text if isinstance(page_text, str) else "")
+
+    @staticmethod
     def _bridge_connected(doctor_output: str) -> bool:
         """判断 OpenCLI doctor 输出是否确认浏览器扩展已经连接。"""
         normalized = re.sub(r"\s+", " ", doctor_output).strip().lower()
         return bool(re.search(r"\[ok\]\s+extension:\s*connected", normalized))
 
+    def _launch_bridge_browser(self) -> bool:
+        """在图形会话中启动默认 Chrome 的 ChatGPT 标签页，以激活 OpenCLI 扩展。"""
+        if not self.settings.auto_launch_browser or self.runner is not _default_runner:
+            return False
+        if not (os.getenv("DISPLAY") or os.getenv("WAYLAND_DISPLAY")):
+            return False
+        candidates = ([self.settings.bridge_browser_executable]
+                      if self.settings.bridge_browser_executable else
+                      ["google-chrome", "chromium", "chromium-browser"])
+        executable = next((shutil.which(name) for name in candidates if name), None)
+        if executable is None:
+            return False
+        try:
+            subprocess.Popen(
+                [executable, "--new-window", self.settings.chatgpt_url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                shell=False,
+            )
+            return True
+        except OSError:
+            return False
+
     def _ensure_bridge_connected(self) -> None:
-        """检查浏览器桥接，断线时重启守护进程并等待扩展自动重连。"""
+        """检查浏览器桥接，断线时重启守护进程、启动默认 Chrome 并等待重连。"""
         doctor = self._run(["doctor"], timeout=self.settings.connect_timeout, allow_failure=True)
         if self._bridge_connected(doctor):
             return
 
         self._run(["daemon", "restart"], timeout=self.settings.connect_timeout, allow_failure=True)
+        browser_started = self._launch_bridge_browser()
         deadline = time.monotonic() + self.settings.connect_timeout
         while time.monotonic() < deadline:
             time.sleep(1.0)
@@ -181,7 +223,8 @@ class OpenCLIChatGPTWebProvider:
             if self._bridge_connected(doctor):
                 return
         raise ProviderNeedsHuman(
-            "OpenCLI 浏览器扩展未连接。程序已自动重启守护进程，但扩展仍未重连；"
+            "OpenCLI 浏览器扩展未连接。程序已自动重启守护进程%s，但扩展仍未重连；" %
+            ("并启动默认 Chrome" if browser_started else "") +
             "请打开安装了 Browser Bridge 扩展的 Chrome，确认扩展已启用，并保持一个已登录 ChatGPT 的标签页，"
             "看到 opencli doctor 显示 Extension: connected 后再重新下发任务。"
         )
@@ -193,10 +236,23 @@ class OpenCLIChatGPTWebProvider:
             return ProviderHealth(available=False, opencli_available=False, extension_connected=False,
                                   chatgpt_logged_in=False, image_upload_supported=False,
                                   recoverable=False, details=["opencli executable not found"])
-        doctor = self._run(["doctor"], allow_failure=True)
+        try:
+            doctor = self._run(["doctor"], allow_failure=True)
+        except ProviderError as exc:
+            return ProviderHealth(
+                available=False, opencli_available=True, extension_connected=False,
+                chatgpt_logged_in=False, image_upload_supported=False, recoverable=True,
+                details=["OpenCLI 健康检查失败：%s" % exc])
         extension = "extension: connected" in doctor.lower()
         details.append(doctor.strip()[-1000:])
-        status_text = self._run(["chatgpt", "status", "-f", "json"], allow_failure=True)
+        try:
+            status_text = self._run(["chatgpt", "status", "-f", "json"], allow_failure=True)
+        except ProviderError as exc:
+            details.append("ChatGPT 登录状态检查失败：%s" % exc)
+            return ProviderHealth(
+                available=False, opencli_available=True, extension_connected=extension,
+                chatgpt_logged_in=False, image_upload_supported=False, recoverable=True,
+                details=details)
         status = _json_from_output(status_text)
         logged_in = "\"login\":\"yes\"" in re.sub(r"\s+", "", status_text.lower())
         if isinstance(status, list) and status:
@@ -220,6 +276,7 @@ class OpenCLIChatGPTWebProvider:
             self._browser(["open", self.settings.chatgpt_url])
             self.settings.owned_session = True
         self._state()
+        self._ensure_chat_mode()
         self._opened = True
 
     def new_conversation(self, title_hint: str) -> ConversationHandle:
@@ -232,8 +289,53 @@ class OpenCLIChatGPTWebProvider:
             # 在已绑定标签页打开根地址，以创建新的网页会话。
             self._browser(["open", self.settings.chatgpt_url])
         self._state()
+        self._ensure_chat_mode()
         return ConversationHandle(conversation_id=uuid.uuid4().hex, title_hint=title_hint,
                                   owned=self.settings.owned_session)
+
+    def _ensure_chat_mode(self) -> None:
+        """发现 ChatGPT 的聊天/工作切换器时，强制选择普通聊天模式并验证结果。"""
+        if not self.settings.force_chat_mode:
+            return
+        inspect_script = """
+(() => {
+  const chat = document.querySelector('[data-tpp-toggle-value="chatgpt"]');
+  const work = document.querySelector('[data-tpp-toggle-value="work"]');
+  if (!chat && !work) return JSON.stringify({available: false, active: 'legacy_chat'});
+  const chatActive = Boolean(chat && (chat.getAttribute('aria-checked') === 'true' ||
+    chat.getAttribute('data-state') === 'on'));
+  const workActive = Boolean(work && (work.getAttribute('aria-checked') === 'true' ||
+    work.getAttribute('data-state') === 'on'));
+  return JSON.stringify({available: true, chat_active: chatActive, work_active: workActive});
+})()
+"""
+        state = self._parse_eval_result(self._browser(["eval", inspect_script], allow_failure=True))
+        if not isinstance(state, dict):
+            raise ProviderNeedsHuman("无法读取 ChatGPT 聊天/工作模式，请刷新页面后重试。")
+        if not state.get("available"):
+            # 兼容尚未提供双模式切换器的旧版纯聊天页面。
+            return
+        if state.get("chat_active") and not state.get("work_active"):
+            return
+        click_script = """
+(() => {
+  const chat = document.querySelector('[data-tpp-toggle-value="chatgpt"]');
+  if (!chat) return JSON.stringify({clicked: false});
+  chat.click();
+  return JSON.stringify({clicked: true});
+})()
+"""
+        clicked = self._parse_eval_result(self._browser(["eval", click_script], allow_failure=True))
+        if not (isinstance(clicked, dict) and clicked.get("clicked")):
+            raise ProviderNeedsHuman("无法从 ChatGPT 工作模式切换到聊天模式，请手动选择“聊天”后重试。")
+        deadline = time.monotonic() + min(10, self.settings.submit_timeout)
+        while time.monotonic() < deadline:
+            time.sleep(0.25)
+            state = self._parse_eval_result(
+                self._browser(["eval", inspect_script], allow_failure=True))
+            if isinstance(state, dict) and state.get("chat_active") and not state.get("work_active"):
+                return
+        raise ProviderNeedsHuman("ChatGPT 模式切换未生效，请手动选择“聊天”后重试。")
 
     def _record(self, conversation: ConversationHandle, prompt: str, response: str) -> None:
         """将提示词和原始回复写入会话记录目录。"""
@@ -377,12 +479,115 @@ class OpenCLIChatGPTWebProvider:
             return nested if isinstance(nested, str) else value
         return ""
 
+    def _submission_snapshot(self) -> Dict[str, Any]:
+        """一次读取最新用户消息和编辑器状态，避免高频 state 调用干扰页面时序。"""
+        script = """
+(() => {
+  const users = Array.from(document.querySelectorAll('[data-message-author-role=user]'))
+    .map(element => element.innerText || '').filter(Boolean);
+  const assistants = Array.from(document.querySelectorAll('[data-message-author-role=assistant]'))
+    .map(element => element.innerText || '').filter(Boolean);
+  const composer = document.querySelector(
+    '#prompt-textarea, [data-testid="prompt-textarea"], [contenteditable="true"][role="textbox"]');
+  const composerText = composer
+    ? (composer.isContentEditable ? (composer.innerText || composer.textContent || '')
+      : String(composer.value || '')) : '';
+  return JSON.stringify({
+    latest_user: users.slice(-1)[0] || '',
+    user_count: users.length,
+    latest_assistant: assistants.slice(-1)[0] || '',
+    assistant_count: assistants.length,
+    composer_found: Boolean(composer),
+    composer_text: composerText,
+    url: location.href,
+    generating: Boolean(document.querySelector('button[data-testid="stop-button"]'))
+  });
+})()
+"""
+        output = self._browser(["eval", script], allow_failure=True)
+        parsed = self._parse_eval_result(output)
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _collect_page_debug_artifacts(self, conversation: Optional[ConversationHandle], label: str) -> None:
+        """采集页面快照、主要 DOM / 按钮状态、性能资源与有限的控制台线索，写入记录目录以便离线分析。"""
+        try:
+            base = self.record_dir or (Path.cwd() / "artifacts" / "provider_records")
+            convo_dir = base / (conversation.conversation_id if conversation else "no-conversation")
+            convo_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = int(time.time())
+            # 1) 结构化 submission snapshot
+            try:
+                snapshot = self._submission_snapshot()
+            except Exception as exc:
+                snapshot = {"error": "failed_to_capture_submission_snapshot", "detail": str(exc)}
+            atomic_write_text(convo_dir / (f"debug_snapshot_{label}_{timestamp}.json"), json.dumps(snapshot, ensure_ascii=False, indent=2))
+
+            # 2) Lightweight DOM / buttons / perf summary
+            script = r'''
+(() => {
+  const body = document.body ? String(document.body.innerText || '').slice(0, 20000) : '';
+  const buttons = Array.from(document.querySelectorAll('button')).slice(0,200).map(b=>({label: b.getAttribute('aria-label')||b.innerText||'', disabled: !!b.disabled, dataset: b.dataset?Object.fromEntries(Object.entries(b.dataset)):{}}));
+  const stop = !!document.querySelector('button[data-testid="stop-button"]');
+  const imgs = Array.from(document.querySelectorAll('img')).slice(0,10).map(i=>i.src);
+  const perf = (window.performance && typeof window.performance.getEntries === 'function') ? window.performance.getEntries().slice(-50).map(e=>({name: e.name, initiatorType: e.initiatorType, duration: e.duration, transferSize: e.transferSize||0})) : [];
+  return JSON.stringify({body_prefix: body, buttons, stop, imgs, perf, url: location.href, title: document.title});
+})()
+'''
+            try:
+                output = self._browser(["eval", script], allow_failure=True)
+                parsed = self._parse_eval_result(output)
+            except Exception as exc:
+                parsed = {"error": "eval_failed", "detail": str(exc)}
+            atomic_write_text(convo_dir / (f"debug_dom_{label}_{timestamp}.json"), json.dumps(parsed, ensure_ascii=False, indent=2))
+
+            # 3) Try to capture visible HTML head/body (trimmed)
+            try:
+                html_out = self._browser(["eval", "JSON.stringify((document.documentElement&&document.documentElement.outerHTML||'').slice(0,200000))"], allow_failure=True)
+                html_parsed = _json_from_output(html_out)
+                if isinstance(html_parsed, str):
+                    atomic_write_text(convo_dir / (f"debug_page_html_{label}_{timestamp}.html"), html_parsed)
+            except Exception:
+                # best-effort
+                pass
+
+            # 4) File inputs info
+            try:
+                found = self._browser(["find", "--css", "input[type=file]", "--limit", "10"], allow_failure=True)
+                found_data = _json_from_output(found)
+                atomic_write_text(convo_dir / (f"debug_file_inputs_{label}_{timestamp}.json"), json.dumps(found_data, ensure_ascii=False, indent=2))
+            except Exception:
+                pass
+        except Exception:
+            # never fail the provider because debug capture failed
+            return
+
+    @staticmethod
+    def _can_retry_silent_response(snapshot: Dict[str, Any]) -> bool:
+        """仅在消息已提交但页面静默无回复时允许换新会话重试。"""
+        composer = OpenCLIChatGPTWebProvider._normalize_submitted_text(
+            str(snapshot.get("composer_text", "")))
+        return bool(
+            int(snapshot.get("user_count", 0)) > 0 and
+            int(snapshot.get("assistant_count", 0)) == 0 and
+            not str(snapshot.get("latest_assistant", "")).strip() and
+            snapshot.get("composer_found") and
+            not composer and
+            not snapshot.get("generating")
+        )
+
+    @staticmethod
+    def _normalize_submitted_text(value: str) -> str:
+        """消除网页渲染引入的 Unicode 格式字符、Markdown 反引号和空白差异。"""
+        normalized = unicodedata.normalize("NFKC", value).replace("`", "")
+        normalized = "".join(
+            character for character in normalized if unicodedata.category(character) != "Cf")
+        return re.sub(r"\s+", " ", normalized).strip()
+
     @staticmethod
     def _matches_submitted_prompt(actual: str, prompt: str) -> bool:
-        """比较已渲染用户消息与原文，并识别 ChatGPT 添加的附件元数据前缀。"""
-        normalize = lambda value: re.sub(r"\s+", " ", value.replace("`", "")).strip()
-        actual_normalized = normalize(actual)
-        prompt_normalized = normalize(prompt)
+        """比较已渲染用户消息与原文，容忍受限的 DOM 渲染差异。"""
+        actual_normalized = OpenCLIChatGPTWebProvider._normalize_submitted_text(actual)
+        prompt_normalized = OpenCLIChatGPTWebProvider._normalize_submitted_text(prompt)
         if not actual_normalized or not prompt_normalized:
             return False
         if actual_normalized == prompt_normalized:
@@ -393,14 +598,28 @@ class OpenCLIChatGPTWebProvider:
             if re.fullmatch(r"(?:%s\s*)+" % safe_attachment, attachment_prefix,
                             flags=re.IGNORECASE):
                 return True
-        return (
+        if (
             len(prompt_normalized) > 200 and
             actual_normalized.startswith(prompt_normalized[:120]) and
             actual_normalized.endswith(prompt_normalized[-120:])
-        )
+        ):
+            return True
+        # ChatGPT 偶发会在长消息 DOM 中增加一个不可见或排版字符。
+        # 只对长文本、长度差极小且全文相似度足够高的新消息放行，
+        # 避免把截断、旧消息或其他页面文字误认为已提交。
+        length_tolerance = max(8, int(len(prompt_normalized) * 0.01))
+        if (len(prompt_normalized) >= 500 and
+                abs(len(actual_normalized) - len(prompt_normalized)) <= length_tolerance):
+            similarity = difflib.SequenceMatcher(
+                None, actual_normalized, prompt_normalized, autojunk=False).ratio()
+            return similarity >= 0.995
+        return False
 
     def _click_send_button(self) -> None:
         """等待 ChatGPT 发送按钮可用并显式点击，避免依赖输入框焦点。"""
+        # OpenCLI 的精简 state 有时不包含侧栏中的额度弹窗；发送前直接读取
+        # 一次可见正文，避免额度为零时仍等待按钮和提交确认超时。
+        self._check_page_usage_limit()
         selectors = [
             'button[data-testid="send-button"]:not([disabled])',
             '#composer-submit-button:not([disabled])',
@@ -423,35 +642,58 @@ class OpenCLIChatGPTWebProvider:
                 if isinstance(clicked_data, dict) and clicked_data.get("clicked"):
                     return
             time.sleep(0.25)
+        self._check_page_usage_limit()
         detail = last_output[-1000:] if last_output else "没有发现已启用的发送按钮"
         raise ProviderTimeout("ChatGPT 发送按钮在 %s 秒内未变为可点击状态：%s" %
                               (self.settings.submit_timeout, detail))
 
-    def _wait_for_submission(self, previous_user: str, prompt: str) -> None:
+    def _wait_for_submission(self, previous_user: str, prompt: str,
+                             timeout: Optional[int] = None) -> None:
         """确认新用户消息已进入会话，防止把仅填入输入框误判为发送成功。"""
-        deadline = time.monotonic() + self.settings.submit_timeout
+        wait_seconds = int(timeout or self.settings.submit_timeout)
+        deadline = time.monotonic() + wait_seconds
         latest = ""
+        snapshot: Dict[str, Any] = {}
         while time.monotonic() < deadline:
-            self._state()
-            latest = self._latest_user()
+            snapshot = self._submission_snapshot()
+            latest = str(snapshot.get("latest_user", ""))
             if latest != previous_user and self._matches_submitted_prompt(latest, prompt):
                 return
-            time.sleep(0.25)
-        # 边界时刻再读取一次；若回复已经很快生成，后续等待逻辑会直接接续该回复。
+            # _fill_prompt 在点击前已严格验证全文。点击后编辑器被清空，
+            # 说明 React 已接收提交；用户消息 DOM 在新会话中可能延迟十余秒才出现。
+            if (snapshot.get("composer_found") and
+                    not self._normalize_submitted_text(str(snapshot.get("composer_text", "")))):
+                return
+            time.sleep(0.5)
+        # 边界时刻检查页面健康状态并再读取一次。
         self._state()
-        latest = self._latest_user()
+        snapshot = self._submission_snapshot()
+        latest = str(snapshot.get("latest_user", ""))
         if latest != previous_user and self._matches_submitted_prompt(latest, prompt):
             return
-        raise ProviderTimeout("已点击发送按钮，但未在会话中确认新的用户消息；最新用户消息长度=%s" % len(latest))
+        if (snapshot.get("composer_found") and
+                not self._normalize_submitted_text(str(snapshot.get("composer_text", "")))):
+            return
+        latest_normalized = self._normalize_submitted_text(latest)
+        prompt_normalized = self._normalize_submitted_text(prompt)
+        similarity = difflib.SequenceMatcher(
+            None, latest_normalized, prompt_normalized, autojunk=False).ratio() \
+            if latest_normalized and prompt_normalized else 0.0
+        raise ProviderTimeout(
+            "已点击发送按钮，但未在会话中确认新的用户消息；"
+            "原始长度=%s，规范化长度=%s，期望长度=%s，相似度=%.4f，编辑器存在=%s" % (
+                len(latest), len(latest_normalized), len(prompt_normalized), similarity,
+                bool(snapshot.get("composer_found"))))
 
     def _wait_for_response(self, previous: str) -> str:
-        """轮询页面直到最新助手回复稳定或超时。"""
+        """等待助手回复稳定，并防止把流式 JSON 的前缀误判为完整结果。"""
         deadline = time.monotonic() + self.settings.response_timeout
         last = ""
         stable_count = 0
         while time.monotonic() < deadline:
             self._state()
             current = self._latest_assistant()
+            self._raise_for_usage_limit(current)
             if current and current != previous:
                 if current == last:
                     stable_count += 1
@@ -459,9 +701,27 @@ class OpenCLIChatGPTWebProvider:
                     stable_count = 0
                     last = current
                 if stable_count >= 2 and not self._is_generating():
-                    return current
+                    # OpenCLI 偶尔无法识别新版 ChatGPT 的流式生成按钮。结构化
+                    # 回复必须形成完整 JSON 后才能返回，避免只记录 "{" 或半段对象。
+                    if self._response_contains_complete_json(current):
+                        return current
+                    # 非 JSON 的拒答或错误信息仍允许在更长静默期后交给上层处理。
+                    if stable_count >= 8:
+                        return current
             time.sleep(1.0)
         raise ProviderTimeout("ChatGPT response did not complete before timeout")
+
+    @classmethod
+    def _response_contains_complete_json(cls, response: str) -> bool:
+        """判断回复中是否已经出现可完整解析的 JSON 对象或数组。"""
+        stripped = str(response).strip()
+        if not stripped:
+            return False
+        try:
+            cls._parse_candidate(stripped)
+            return True
+        except ValueError:
+            return False
 
     def _is_generating(self) -> bool:
         """检测 ChatGPT 是否仍在思考、调用视觉工具或流式生成回复。"""
@@ -477,7 +737,8 @@ class OpenCLIChatGPTWebProvider:
         output = self._browser(["eval", script], allow_failure=True)
         return self._parse_eval_result(output) is True
 
-    def send_text(self, prompt: str, conversation: ConversationHandle) -> str:
+    def send_text(self, prompt: str, conversation: ConversationHandle,
+                  submission_timeout: Optional[int] = None) -> str:
         """向指定网页会话发送文本并返回最新助手回复。"""
         previous_assistant = self._latest_assistant()
         previous_user = self._latest_user()
@@ -494,9 +755,26 @@ class OpenCLIChatGPTWebProvider:
                 time.sleep(1.0)
         else:
             raise ProviderError("OpenCLI 提交消息失败，重试后仍未确认发送：%s" % error)
-        # 点击动作一旦成功便不再重复提交，避免页面状态读取异常时发送重复消息。
-        self._wait_for_submission(previous_user, prompt)
-        response = self._wait_for_response(previous_assistant)
+        # 点击动作一旦成功便不再重复点击。大附件可能需要较长时间才在会话中
+        # 生成用户消息，重复点击可能造成重复请求或中断已开始的回复。
+        try:
+            self._wait_for_submission(previous_user, prompt, timeout=submission_timeout)
+        except ProviderTimeout as exc:
+            # 在提交确认超时时收集页面调试信息以便事后分析，但不要影响提交的重试语义
+            try:
+                self._collect_page_debug_artifacts(conversation, "submission_timeout")
+            except Exception:
+                pass
+            raise
+        try:
+            response = self._wait_for_response(previous_assistant)
+        except ProviderTimeout as exc:
+            # 响应等待超时（静默无回复），采集详细调试信息并再抛出以由上层决定恢复策略
+            try:
+                self._collect_page_debug_artifacts(conversation, "response_timeout")
+            except Exception:
+                pass
+            raise
         self._record(conversation, prompt, response)
         return response
 
@@ -541,7 +819,8 @@ class OpenCLIChatGPTWebProvider:
         message = str(error).lower()
         return any(fragment in message for fragment in (
             "not allowed", "unknown action", "not supported", "setfileinput",
-            "set-file-input", "no element found",
+            "set-file-input", "no element found", "filechooseropened", "file chooser",
+            "may not have opened a file chooser",
         ))
 
     @staticmethod
@@ -553,8 +832,10 @@ class OpenCLIChatGPTWebProvider:
             return nested if nested is not None else parsed
         return parsed
 
-    def _upload_binary_files_via_data_transfer(self, files: List[Path], nth: int) -> None:
-        """分块传输二进制文件并用 DataTransfer 附加，规避 Chrome 的 Not allowed。"""
+    def _upload_binary_files_via_data_transfer(
+            self, files: List[Path], nth: int,
+            selector: str = "input[type=file]") -> None:
+        """分块传输二进制文件并用 DataTransfer 附加到指定文件框。"""
         mime_types = {
             ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
             ".webp": "image/webp", ".gif": "image/gif", ".mp4": "video/mp4",
@@ -600,7 +881,7 @@ class OpenCLIChatGPTWebProvider:
 (() => {
   const uploads = window.__rlAgentFileUploads || {};
   const upload = uploads[%s];
-  const inputs = Array.from(document.querySelectorAll('input[type=file]'));
+  const inputs = Array.from(document.querySelectorAll(%s));
   const input = inputs[%d];
   if (!upload) return JSON.stringify({ok: false, reason: 'upload_session_missing'});
   if (!(input instanceof HTMLInputElement)) {
@@ -632,7 +913,7 @@ class OpenCLIChatGPTWebProvider:
   delete uploads[%s];
   return JSON.stringify({ok: true, count: names.length, names});
 })()
-""" % (token_json, nth, token_json, token_json)
+""" % (token_json, json.dumps(selector), nth, token_json, token_json)
             commit_output = self._browser(["eval", commit_script])
             commit_result = self._parse_eval_result(commit_output)
             expected_names = [path.name for path in files]
@@ -649,6 +930,44 @@ class OpenCLIChatGPTWebProvider:
 """ % token_json
             self._browser(["eval", cleanup], allow_failure=True)
             raise
+
+    def _upload_files_via_doubao(self, files: List[Path], conversation: Optional[ConversationHandle]) -> Optional[List[str]]:
+        """当 ChatGPT 存储配额受限时的回退：通过 OpenCLI 打开豆包页面并上传，返回可分享的链接列表。
+
+        此方法为 best-effort，使用配置的 `doubao_upload_input_selector` 和 `doubao_result_selector`。
+        """
+        if not self.settings.use_doubao_on_quota:
+            return None
+        # 以 opencli browser open 指向豆包上传页，然后尝试填充文件输入并读取分享链接
+        try:
+            self._browser(["open", self.settings.doubao_url])
+        except Exception:
+            # best-effort, do not raise here
+            pass
+        # find file input and perform upload via opencli upload
+        try:
+            found = self._browser(["find", "--css", self.settings.doubao_upload_input_selector, "--limit", "5"], allow_failure=True)
+            found_data = _json_from_output(found) or {}
+            entries = found_data.get("entries", []) if isinstance(found_data, dict) else []
+            nth = str(entries[0].get("nth", 0)) if entries else "0"
+            output = self._browser(["upload", "--nth", nth, self.settings.doubao_upload_input_selector] + [str(p) for p in files], allow_failure=True)
+            parsed = _json_from_output(output)
+            # wait for result selector to appear and extract link(s)
+            deadline = time.monotonic() + int(self.settings.doubao_max_wait)
+            links = []
+            while time.monotonic() < deadline:
+                try:
+                    res = self._browser(["eval", "JSON.stringify(Array.from(document.querySelectorAll('%s')).map(e=>e.href||e.value||e.innerText))" % self.settings.doubao_result_selector], allow_failure=True)
+                    parsed_links = _json_from_output(res)
+                    if isinstance(parsed_links, list) and parsed_links:
+                        links = [str(item) for item in parsed_links if item]
+                        break
+                except Exception:
+                    pass
+                time.sleep(1.0)
+            return links if links else None
+        except Exception:
+            return None
 
     def _wait_for_upload_preview(self, file_names: List[str]) -> None:
         """等待 ChatGPT 编辑器显示全部附件名称或对应数量的媒体预览。"""
@@ -696,6 +1015,8 @@ class OpenCLIChatGPTWebProvider:
         if missing:
             raise FileNotFoundError("files for ChatGPT upload do not exist: %s" % missing)
         self._state()
+        # 额度耗尽时不再执行耗时且注定无效的附件上传。
+        self._check_page_usage_limit()
         text_suffixes = (".md", ".txt", ".json", ".yaml", ".yml")
         text_files = [path for path in resolved if path.suffix.lower() in text_suffixes]
         binary_files = [path for path in resolved if path.suffix.lower() not in text_suffixes]
@@ -726,11 +1047,26 @@ class OpenCLIChatGPTWebProvider:
             if not isinstance(parsed, dict) or not parsed.get("uploaded"):
                 raise ProviderError("OpenCLI 未确认视觉文件上传：%s" % output[-1000:])
         except ProviderError as exc:
+            msg = str(exc).lower()
+            if "storage quota exceeded" in msg:
+                # 尝试豆包回退上传（仅在配置允许时）
+                links = None
+                try:
+                    links = self._upload_files_via_doubao(binary_files, conversation)
+                except Exception:
+                    links = None
+                if links:
+                    # 将分享链接作为短文本替代附件发送
+                    links_text = "\n".join(links)
+                    prompt = prompt + "\n\n[附件已回退至外部分享链接，按需下载：]\n" + links_text
+                    return self.send_text(prompt, conversation, submission_timeout=max(self.settings.submit_timeout, 120))
+                # 若回退失败则继续按旧逻辑判断是否可恢复
             if not self._recoverable_file_upload_error(exc):
                 raise
             self._upload_binary_files_via_data_transfer(binary_files, int(nth))
         self._wait_for_upload_preview([path.name for path in binary_files])
-        return self.send_text(prompt, conversation)
+        return self.send_text(
+            prompt, conversation, submission_timeout=max(self.settings.submit_timeout, 120))
 
     @staticmethod
     def _parse_candidate(raw_response: str) -> Any:
@@ -761,12 +1097,41 @@ class OpenCLIChatGPTWebProvider:
     def _request_model(self, prompt: str, schema: Type[ModelT], title: str,
                        files: Optional[List[Path]] = None) -> ModelT:
         """发送结构化请求并在校验失败时进行有限修复。"""
-        conversation = self.new_conversation(title)
-        raw = self._send_model_prompt(conversation, prompt, title, files)
+        conversation: Optional[ConversationHandle] = None
+        raw = ""
+        for request_attempt in range(self.settings.max_retries + 1):
+            conversation = self.new_conversation(
+                title if request_attempt == 0 else "%s-silent-retry-%02d" % (
+                    title, request_attempt))
+            try:
+                raw = self._send_model_prompt(conversation, prompt, title, files)
+                break
+            except ProviderTimeout:
+                snapshot = self._submission_snapshot()
+                if (request_attempt >= self.settings.max_retries or
+                        not self._can_retry_silent_response(snapshot)):
+                    raise
+                time.sleep(1.0)
+        if conversation is None:
+            raise ProviderResponseError("ChatGPT 会话未创建")
         for attempt in range(self.settings.max_retries + 1):
             try:
                 return self.parse_json_response(raw, schema)
             except ProviderResponseError as exc:
+                # 页面 DOM 可能在 OpenCLI 返回后又补齐了流式回复。发送修复消息前
+                # 再读取一次；若已成为合法结果，直接使用，避免重复消息与额度消耗。
+                latest = ""
+                try:
+                    self._parse_candidate(raw)
+                except ValueError:
+                    latest = self._latest_assistant()
+                if latest and len(latest) > len(raw):
+                    try:
+                        return self.parse_json_response(latest, schema)
+                    except ProviderResponseError:
+                        # 页面可能仍停留在上一项任务的较长回复。它不满足本次 Schema
+                        # 就不能覆盖本次原始响应，否则恢复会把旧会话内容发给新任务。
+                        pass
                 if attempt >= self.settings.max_retries:
                     raise
                 repair = ("Return only corrected strict JSON matching this JSON Schema. Validation error: %s\nSchema: %s\n"
@@ -793,6 +1158,24 @@ class OpenCLIChatGPTWebProvider:
                    TaskRewardBundle.schema_json()))
         return self._request_model(prompt, TaskRewardBundle, "task-reward-design").dict()
 
+    def understand_task(self, instruction: str, robot: str) -> TaskIntentSpec:
+        """把上位机动作输入转换为结构化任务意图，不在此阶段设计奖励。"""
+        template = (Path(__file__).parents[1] / "prompts" / "task_intent.md").read_text(encoding="utf-8")
+        prompt = (template + "\nRobot: %s\nInstruction: %s\nJSON Schema: %s" %
+                  (robot, instruction, TaskIntentSpec.schema_json()))
+        return self._request_model(prompt, TaskIntentSpec, "task-intent")
+
+    def generate_motion_prototype(self, intent: TaskIntentSpec) -> MotionPrototype:
+        """生成高层动作阶段语义，不允许输出关节角或控制策略。"""
+        prompt = (MOTION_PROTOTYPE_PROMPT + "\nTASK_INTENT_SPEC: " + intent.json(ensure_ascii=False) +
+                  "\nJSON Schema: " + MotionPrototype.schema_json())
+        return self._request_model(prompt, MotionPrototype, "motion-prototype")
+
+    def design_task_bundle(self, compiled_prompt: str) -> Dict[str, Any]:
+        """执行已经由本地固定模板编译的奖励设计请求。"""
+        return self._request_model(
+            compiled_prompt, TaskRewardBundle, "compiled-reward-design").dict()
+
     def design_visual_evaluation(self, task: TaskSpec) -> Dict[str, Any]:
         """为任务生成视觉评估输入与事件设计。"""
         template = (Path(__file__).parents[1] / "prompts" / "visual_spec_design.md").read_text(encoding="utf-8")
@@ -806,8 +1189,26 @@ class OpenCLIChatGPTWebProvider:
     def critique_visual_behavior(self, task: TaskSpec, files: List[Path]) -> VisualBehaviorReport:
         """基于视觉材料生成不受奖励数值锚定的行为评论。"""
         template = (Path(__file__).parents[1] / "prompts" / "visual_critic.md").read_text(encoding="utf-8")
-        prompt = template + "\nTaskSpec: " + task.json() + "\nJSON Schema: " + VisualBehaviorReport.schema_json()
-        return self._request_model(prompt, VisualBehaviorReport, "visual-critique", files)
+        selected_files = self._select_visual_evidence_files(files)
+        prompt = (template + "\nTaskSpec: " + task.json() +
+                  "\n已按可靠上传上限选择关键证据附件：" +
+                  ", ".join(path.name for path in selected_files) +
+                  "\nJSON Schema: " + VisualBehaviorReport.schema_json())
+        return self._request_model(
+            prompt, VisualBehaviorReport, "visual-critique", selected_files)
+
+    def _select_visual_evidence_files(self, files: List[Path]) -> List[Path]:
+        """保留关键连续帧、三视角图和物理证据，避免冗余图片导致网页上传超时。"""
+        available = {path.name: path for path in files}
+        image_priority = (
+            "contact_sheet_annotated.png", "contact_sheet_multiview.png",
+            "contact_sheet_clean.png", "event_takeoff.png", "event_landing.png",
+        )
+        document_priority = ("behavior_evidence.json", "visual_attachment_manifest.json")
+        images = [available[name] for name in image_priority if name in available]
+        documents = [available[name] for name in document_priority if name in available]
+        selected = images[:self.settings.visual_image_attachment_limit] + documents
+        return selected or list(files)
 
     def diagnose_training(self, payload: Dict[str, Any]) -> TrainingDiagnosis:
         """融合视觉、物理和 PPO 证据生成训练诊断。"""
@@ -816,6 +1217,14 @@ class OpenCLIChatGPTWebProvider:
                   json.dumps(json_safe(payload), ensure_ascii=False, separators=(",", ":"), allow_nan=False) +
                   "\nJSON Schema: " + TrainingDiagnosis.schema_json())
         return self._request_model(prompt, TrainingDiagnosis, "training-diagnosis")
+
+    def summarize_reward_experience(self, payload: Dict[str, Any]) -> RewardExperienceNarrative:
+        """使用普通聊天模式归纳受证据 ID 限定的奖励实验叙述。"""
+        prompt = (REWARD_EXPERIENCE_PROMPT + "\n\nEvidence: " +
+                  json.dumps(json_safe(payload), ensure_ascii=False,
+                             separators=(",", ":"), allow_nan=False) +
+                  "\nJSON Schema: " + RewardExperienceNarrative.schema_json())
+        return self._request_model(prompt, RewardExperienceNarrative, "reward-experience")
 
     def close(self) -> None:
         """释放 Provider 持有或绑定的浏览器资源。"""

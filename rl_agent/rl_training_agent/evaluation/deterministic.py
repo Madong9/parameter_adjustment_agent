@@ -28,7 +28,8 @@ class DeterministicEvaluator:
                            metrics.get("torque_limit_violations", 0.0) == 0.0 and
                            metrics.get("forbidden_collisions", 0.0) == 0.0 and
                            metrics.get("abnormal_terminations", 0.0) == 0.0)
-        hard = implicit_safety and all(item.passed for item in safety)
+        counterfactual_passed = bool(metrics.get("counterfactual_passed", True))
+        hard = implicit_safety and counterfactual_passed and all(item.passed for item in safety)
         task_passed = bool(task_results) and all(item.passed for item in task_results)
         visual_passed = visual.visual_success and visual.alignment_score >= 0.7 and not visual.requires_human_review
         conflicts: List[str] = []
@@ -38,7 +39,8 @@ class DeterministicEvaluator:
         violations = [item.name for item in safety if not item.passed]
         if not implicit_safety:
             violations.append("implicit_simulation_safety")
+        if not counterfactual_passed:
+            violations.append("reward_hacking_counterfactual")
         return EvaluationResult(hard_constraints_passed=hard, task_metrics_passed=task_passed,
                                 visual_alignment_passed=visual_passed, completed=completed,
                                 metrics=safety + task_results, violations=violations, conflicts=conflicts)
-

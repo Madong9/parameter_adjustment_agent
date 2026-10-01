@@ -1,0 +1,41 @@
+# Robot assets are resolved relative to the configured training project; generated files
+# are resolved relative to this configuration file's parent directory (rl_agent/config).
+robots:
+  go2:
+    urdf: resources/robots/go2/urdf/go2.urdf
+    mjcf: ""
+    # Go2 真实 Feasibility 使用 Unitree Isaac Gym PPO 环境，不转换为 MJCF。
+    convert_urdf_to_mjcf: false
+    base_initial_height: 0.42
+    default_joint_positions:
+      FL_hip_joint: 0.1
+      RL_hip_joint: 0.1
+      FR_hip_joint: -0.1
+      RR_hip_joint: -0.1
+      FL_thigh_joint: 0.8
+      RL_thigh_joint: 1.0
+      FR_thigh_joint: 0.8
+      RR_thigh_joint: 1.0
+      FL_calf_joint: -1.5
+      RL_calf_joint: -1.5
+      FR_calf_joint: -1.5
+      RR_calf_joint: -1.5
+    position_kp: 20.0
+    position_kd: 0.5
+    foot_frames: [FL_foot, FR_foot, RL_foot, RR_foot]
+    nominal_lift_height: 0.12
+  h1:
+    urdf: resources/robots/h1/urdf/h1.urdf
+    mjcf: resources/robots/h1/h1.xml
+    convert_urdf_to_mjcf: false
+    foot_frames: [left_ankle_roll_link, right_ankle_roll_link]
+  h1_2:
+    urdf: resources/robots/h1_2/h1_2_12dof.urdf
+    mjcf: resources/robots/h1_2/h1_2_12dof.xml
+    convert_urdf_to_mjcf: false
+    foot_frames: [left_ankle_roll_link, right_ankle_roll_link]
+  g1:
+    urdf: resources/robots/g1_description/g1_12dof.urdf
+    mjcf: resources/robots/g1_description/g1_12dof.xml
+    convert_urdf_to_mjcf: false
+    foot_frames: [left_ankle_roll_link, right_ankle_roll_link]

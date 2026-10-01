@@ -16,9 +16,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
+from .environment.project_adapter import UnitreeProjectAdapter
 from .orchestration.orchestrator import TrainingOrchestrator
+from .memory.store import LongTermMemoryStore
+from .observability import JsonlEventRecorder, sample_gpu
+from .providers.bailian_glm import BailianGLMProvider
 from .settings import Settings, load_settings
 from .utils.io import read_json, utc_now, write_json
+from .utils.paths import ensure_within, relative_display
 
 
 ROBOT_CATALOG = [
@@ -31,7 +36,17 @@ ROBOT_CATALOG = [
 STATE_PRESENTATION: Dict[str, Tuple[int, str]] = {
     "RECEIVED": (3, "接收任务"),
     "ENVIRONMENT_INSPECTED": (10, "检查训练环境"),
-    "TASK_DESIGNED": (18, "解析动作目标"),
+    "TASK_UNDERSTANDING": (13, "GPT 理解动作目标"),
+    "TASK_FEASIBILITY_CHECK": (15, "预检动作可行性"),
+    "MOTION_PROTOTYPE_GENERATING": (16, "生成低维动作原型"),
+    "STATIC_MOTION_VALIDATION": (17, "静态物理预检"),
+    "DYNAMIC_MOTION_VALIDATION": (18, "动态运动预检"),
+    "RAG_RETRIEVING": (19, "检索训练经验"),
+    "CONTEXT_BUILDING": (20, "构建任务上下文"),
+    "PROMPT_COMPILING": (21, "编译奖励提示词"),
+    "REWARD_DESIGNING": (22, "GLM 设计奖励"),
+    "REWARD_REVIEWING": (24, "审查奖励风险"),
+    "TASK_DESIGNED": (23, "完成任务设计"),
     "REWARD_CANDIDATES_CREATED": (25, "生成奖励候选"),
     "CONFIGS_COMPILED": (32, "编译训练配置"),
     "VALIDATED": (38, "验证奖励与配置"),
@@ -42,6 +57,7 @@ STATE_PRESENTATION: Dict[str, Tuple[int, str]] = {
     "VISUAL_EVALUATING": (89, "视觉效果评估"),
     "NUMERIC_EVALUATING": (93, "数值指标评估"),
     "DIAGNOSING": (97, "综合诊断"),
+    "MEMORY_CURATING": (99, "整理长期记忆"),
     "CONTINUE_TRAINING": (76, "继续训练"),
     "REVISE_REWARD": (42, "修订奖励函数"),
     "REVISE_CURRICULUM": (42, "修订课程策略"),
@@ -151,7 +167,11 @@ class JobManager:
         self._lock = threading.RLock()
         self._jobs: Dict[str, Dict[str, Any]] = {}
         self._processes: Dict[str, subprocess.Popen] = {}
+        self._playback_process: Optional[subprocess.Popen] = None
+        self._playback_task_id: Optional[str] = None
+        self._playback_kind: Optional[str] = None
         self._load_jobs()
+        self._dispatch_queued()
 
     def _load_jobs(self) -> None:
         """从磁盘加载历史界面作业，并标记无法继续跟踪的旧进程。"""
@@ -163,10 +183,15 @@ class JobManager:
             job_id = str(job.get("job_id", ""))
             if not JOB_ID_PATTERN.fullmatch(job_id):
                 continue
-            if job.get("status") in ("queued", "running", "stopping"):
+            if job.get("status") in ("running", "stopping"):
                 job["status"] = "interrupted"
                 job["finished_at"] = utc_now()
                 job["message"] = "界面服务曾中断，请根据实验状态决定是否恢复训练"
+                write_json(metadata_path, job)
+            elif job.get("status") == "queued" and not job.get("command"):
+                job["status"] = "interrupted"
+                job["finished_at"] = utc_now()
+                job["message"] = "旧队列记录缺少安全命令，不能自动恢复"
                 write_json(metadata_path, job)
             self._jobs[job_id] = job
 
@@ -187,25 +212,57 @@ class JobManager:
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(message.rstrip() + "\n")
 
-    def _ensure_no_active_job(self) -> None:
-        """确保同一上位机服务当前没有其他训练或恢复作业占用 GPU。"""
+    def _allocate_gpu(self) -> Optional[int]:
+        """从配置 GPU 池中分配未被活动作业占用的设备，无空闲时返回 None。"""
         with self._lock:
             active = [job for job in self._jobs.values()
                       if job.get("status") in ("queued", "running", "stopping")]
-        if active:
-            raise JobValidationError("已有训练作业正在运行，请先等待完成或安全停止")
+        used = {int(job["gpu_id"]) for job in active if job.get("gpu_id") is not None}
+        available = [gpu for gpu in self.settings.gpu_ids if gpu not in used]
+        legacy_unassigned = sum(
+            job.get("gpu_id") is None and job.get("status") in ("running", "stopping")
+            for job in active)
+        available = available[legacy_unassigned:]
+        return available[0] if available else None
 
     def _launch_job_process(self, job: Dict[str, Any], command: List[str],
                             log_lines: List[str]) -> Dict[str, Any]:
-        """创建界面作业目录并以受限参数数组启动训练或闭环恢复进程。"""
+        """持久化新作业；有空闲 GPU 时启动，否则保留在等待队列。"""
         job_id = job["job_id"]
         job_dir = self._job_dir(job_id)
         job_dir.mkdir(parents=True, exist_ok=False)
+        job["command"] = list(command)
         self._save_job(job)
         for line in log_lines:
             self._append_log(job_id, line)
+        with self._lock:
+            self._jobs[job_id] = job
+        if job.get("gpu_id") is None:
+            job["message"] = "等待可用 GPU"
+            self._save_job(job)
+            self._append_log(job_id, "[队列] 当前 GPU 均被占用，作业已持久化等待")
+            return self.get_job(job_id)
+        return self._start_persisted_job(job_id)
+
+    def _start_persisted_job(self, job_id: str) -> Dict[str, Any]:
+        """启动已经持久化且获得 GPU 租约的队列作业。"""
+        with self._lock:
+            job = self._jobs[job_id]
+            command = list(job["command"])
+        prefix = [sys.executable, "-u", "-m", "rl_training_agent"]
+        if command[:4] != prefix or len(command) < 5 or command[4] not in ("train", "resume"):
+            job["status"] = "failed"
+            job["finished_at"] = utc_now()
+            job["message"] = "持久队列命令未通过安全白名单"
+            self._save_job(job)
+            raise JobValidationError(job["message"])
+        job_dir = self._job_dir(job_id)
         environment = os.environ.copy()
         environment["PYTHONUNBUFFERED"] = "1"
+        if job.get("mode") != "dry-run":
+            environment["CUDA_VISIBLE_DEVICES"] = str(job["gpu_id"])
+            JsonlEventRecorder(job_dir / "events.jsonl").emit(
+                "gpu_sample", {"phase": "job_start", **sample_gpu(int(job["gpu_id"]))})
         try:
             with (job_dir / "training.log").open("a", encoding="utf-8") as output:
                 process = subprocess.Popen(
@@ -222,6 +279,7 @@ class JobManager:
                 self._jobs[job_id] = job
             raise
         job["status"] = "running"
+        job["started_at"] = utc_now()
         job["pid"] = process.pid
         job["message"] = "自动闭环正在运行" if job.get("resume_of") else "训练正在运行"
         with self._lock:
@@ -232,10 +290,29 @@ class JobManager:
         monitor.start()
         return self.get_job(job_id)
 
+    def _dispatch_queued(self) -> None:
+        """按创建时间顺序为等待作业分配空闲 GPU 并启动。"""
+        while True:
+            gpu_id = self._allocate_gpu()
+            if gpu_id is None:
+                return
+            with self._lock:
+                queued = sorted(
+                    (job for job in self._jobs.values()
+                     if job.get("status") == "queued" and job.get("gpu_id") is None),
+                    key=lambda item: item.get("created_at", ""))
+                if not queued:
+                    return
+                job = queued[0]
+                job["gpu_id"] = gpu_id
+                self._save_job(job)
+            self._append_log(job["job_id"], "[队列] 已分配 GPU %s，开始运行" % gpu_id)
+            self._start_persisted_job(job["job_id"])
+
     def start_job(self, payload: Any) -> Dict[str, Any]:
         """创建作业并通过固定参数数组启动现有训练 CLI。"""
         task, robot, mode = validate_job_request(payload, self.settings.allowed_robots)
-        self._ensure_no_active_job()
+        gpu_id = self._allocate_gpu()
         job_id = uuid.uuid4().hex[:12]
         task_id = TrainingOrchestrator._task_id(task, robot)
         now = utc_now()
@@ -247,13 +324,15 @@ class JobManager:
             "mode": mode,
             "status": "queued",
             "created_at": now,
-            "started_at": now,
+            "started_at": None,
             "finished_at": None,
             "return_code": None,
             "message": "训练作业正在启动",
+            "gpu_id": gpu_id,
         }
         command = [sys.executable, "-u", "-m", "rl_training_agent", "train", "--task", task,
-                   "--robot", robot, "--provider", "mock" if mode == "dry-run" else "opencli"]
+                   "--robot", robot, "--provider",
+                   "mock" if mode == "dry-run" else self.settings.provider]
         if mode == "dry-run":
             command.append("--dry-run")
         return self._launch_job_process(job, command, [
@@ -264,7 +343,7 @@ class JobManager:
 
     def resume_job(self, source_job_id: str) -> Dict[str, Any]:
         """从人工审核作业创建恢复作业，复用已有 checkpoint、rollout 和剩余预算。"""
-        self._ensure_no_active_job()
+        gpu_id = self._allocate_gpu()
         with self._lock:
             source = dict(self._jobs.get(source_job_id) or {})
         if not source:
@@ -281,12 +360,13 @@ class JobManager:
         job = {
             "job_id": job_id, "task_id": source["task_id"], "task": source["task"],
             "robot": source["robot"], "mode": mode, "resume_of": source_job_id,
-            "status": "queued", "created_at": now, "started_at": now,
+            "status": "queued", "created_at": now, "started_at": None,
             "finished_at": None, "return_code": None, "message": "正在恢复自动闭环",
+            "gpu_id": gpu_id,
         }
         command = [sys.executable, "-u", "-m", "rl_training_agent", "resume",
                    "--task-id", source["task_id"], "--provider",
-                   "mock" if mode == "dry-run" else "opencli"]
+                   "mock" if mode == "dry-run" else self.settings.provider]
         if mode == "dry-run":
             command.append("--dry-run")
         return self._launch_job_process(job, command, [
@@ -313,6 +393,11 @@ class JobManager:
             self._processes.pop(job_id, None)
             self._save_job(job)
         self._append_log(job_id, "[界面] 训练进程结束，退出码：{}".format(return_code))
+        gpu_id = job.get("gpu_id")
+        if gpu_id is not None and job.get("mode") != "dry-run":
+            JsonlEventRecorder(self._job_dir(job_id) / "events.jsonl").emit(
+                "gpu_sample", {"phase": "job_end", **sample_gpu(int(gpu_id))})
+        self._dispatch_queued()
 
     def stop_job(self, job_id: str) -> Dict[str, Any]:
         """停止由当前界面服务启动且仍在运行的训练进程组。"""
@@ -321,6 +406,12 @@ class JobManager:
             if job is None:
                 raise KeyError(job_id)
             process = self._processes.get(job_id)
+            if job.get("status") == "queued" and process is None:
+                job["status"] = "stopped"
+                job["finished_at"] = utc_now()
+                job["message"] = "等待中的作业已取消"
+                self._save_job(job)
+                return self.get_job(job_id)
             if process is None or process.poll() is not None:
                 raise JobValidationError("该训练作业当前不可停止")
             job["status"] = "stopping"
@@ -407,6 +498,75 @@ class JobManager:
         return bool(experiment_id and (
             self.settings.experiments_path / job["task_id"] / "candidates" /
             str(experiment_id) / "reward_plan.json").is_file())
+    def _current_json_artifact(self, job: Dict[str, Any], relative_path: str
+                               ) -> Optional[Dict[str, Any]]:
+        """读取当前作业启动后生成的 JSON，避免展示同 task_id 的旧轮次产物。"""
+        path = self.settings.experiments_path / job["task_id"] / relative_path
+        if not path.is_file():
+            return None
+        started_at = job.get("started_at")
+        if started_at:
+            modified = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+            if modified < _parse_time(str(started_at)):
+                return None
+        try:
+            payload = read_json(path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _feasibility_for_job(self, job: Dict[str, Any]) -> Dict[str, Any]:
+        """把完整可行性报告压缩为上位机可稳定渲染的分层摘要。"""
+        report = self._current_json_artifact(job, "feasibility_report.json")
+        if report is None:
+            return {"available": False, "status": "PENDING", "viewer_available": False}
+        constraint = report.get("motion_constraint_spec", {})
+        planning = report.get("planning_report", {})
+        whole_body = report.get("whole_body_report", {})
+        physics = report.get("physics_report", {})
+        components = planning.get("components", []) if isinstance(planning, dict) else []
+        component_status = {
+            str(item.get("planner")): str(item.get("status", "UNKNOWN"))
+            for item in components if isinstance(item, dict) and item.get("planner")
+        }
+        motion_type = str(report.get("motion_type") or constraint.get("motion_type") or "UNKNOWN")
+        return {
+            "available": True,
+            "status": str(report.get("status", report.get("overall_status", "UNKNOWN"))),
+            "validation_level": str(report.get("validation_level", "CAPABILITY_ONLY")),
+            "training_admission": report.get("training_admission") or {},
+            "training_readiness": report.get("training_readiness") or {},
+            "feasibility_level": str(report.get("feasibility_level", "LEVEL_0_LANGUAGE")),
+            "motion_type": motion_type,
+            "backend": report.get("backend") or physics.get("backend") or "not_run",
+            "confidence": report.get("confidence", 0.0),
+            "constraint_ready": bool(constraint),
+            "required_planners": list(constraint.get("required_planners", [])),
+            "planner_status": str(planning.get("status", "NOT_RUN")),
+            "component_status": component_status,
+            "whole_body_status": str(whole_body.get("status", "NOT_RUN")),
+            "missing_solvers": list(whole_body.get("missing_solvers", [])),
+            "physics_status": str(physics.get("validation_level", physics.get("status", "NOT_RUN"))),
+            "limitations": list(report.get("limitations", []))[:4],
+            "recommended_next_step": str(report.get("recommended_next_step", "")),
+            "viewer_available": motion_type == "LOCOMOTION" and job.get("robot") == "go2",
+            "duration": constraint.get("duration"),
+        }
+
+    def _memory_for_job(self, job: Dict[str, Any]) -> Dict[str, Any]:
+        """读取当前任务工作记忆和长期记忆晋升结果。"""
+        working = self._current_json_artifact(job, "memory/working_memory.json") or {}
+        promotion = self._current_json_artifact(job, "memory/promotion.json") or {}
+        return {
+            "working_available": bool(working),
+            "working_state": working.get("state"),
+            "loop_round": working.get("loop_round", 0),
+            "reward_version": working.get("reward_version", 0),
+            "promoted": bool(promotion.get("promoted")),
+            "promotion_reason": promotion.get("reason") or promotion.get("gate"),
+            "memory_id": promotion.get("memory_id"),
+        }
+
 
     def get_job(self, job_id: str) -> Dict[str, Any]:
         """返回附带实时状态、进度与阶段历史的界面作业。"""
@@ -448,6 +608,21 @@ class JobManager:
         job["loop_detail"] = loop_detail
         job["can_stop"] = job["status"] in ("running", "stopping") and job_id in self._processes
         job["can_resume"] = self._can_resume_job(job, state)
+        job["review_reason"] = None
+        if job["status"] == "review":
+            task_dir = self.settings.experiments_path / job["task_id"]
+            for result_path in (task_dir / "summary.json", task_dir / "blocking_report.json"):
+                if not result_path.is_file():
+                    continue
+                try:
+                    job["review_reason"] = read_json(result_path).get("reason")
+                except (OSError, ValueError, json.JSONDecodeError):
+                    continue
+                if job["review_reason"]:
+                    break
+            job["review_reason"] = job["review_reason"] or job.get("message")
+        job["feasibility"] = self._feasibility_for_job(job)
+        job["memory_detail"] = self._memory_for_job(job)
         return job
 
     def list_jobs(self, limit: int = 20) -> List[Dict[str, Any]]:
@@ -487,6 +662,179 @@ class JobManager:
         experiments.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
         return experiments[:limit]
 
+    def _playable_artifacts(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """只为真实联合验收成功且 checkpoint/config 完整的实验解析播放产物。"""
+        if not re.fullmatch(r"task-[a-f0-9]{10}", str(task_id)):
+            return None
+        task_dir = ensure_within(self.settings.experiments_path / task_id, self.settings.experiments_path)
+        state_path = task_dir / "state.json"
+        summary_path = task_dir / "summary.json"
+        if not state_path.is_file() or not summary_path.is_file():
+            return None
+        try:
+            state = read_json(state_path)
+            summary = read_json(summary_path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+        if (state.get("state") != "COMPLETED" or summary.get("state") != "COMPLETED" or
+                summary.get("result") != "completed" or summary.get("dry_run") is not False):
+            return None
+        task_spec_path = task_dir / "task_spec.json"
+        try:
+            robot = str(read_json(task_spec_path).get("robot", ""))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+        if robot not in self.settings.allowed_robots:
+            return None
+        checkpoint_value = summary.get("checkpoint") or "final/checkpoint.pt"
+        config_value = summary.get("config") or "final/config.yaml"
+        if not isinstance(checkpoint_value, str) or not isinstance(config_value, str):
+            return None
+        try:
+            checkpoint = ensure_within(task_dir / checkpoint_value, task_dir)
+            config = ensure_within(task_dir / config_value, task_dir)
+        except (TypeError, ValueError):
+            return None
+        if not checkpoint.is_file() or not config.is_file():
+            return None
+        return {"task_id": task_id, "robot": robot, "task_dir": task_dir,
+                "checkpoint": checkpoint, "config": config, "summary": summary}
+
+    def list_playable_experiments(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """列出通过真实训练验收且播放文件齐全的策略。"""
+        playable: List[Dict[str, Any]] = []
+        for experiment in self.list_experiments(limit=10000):
+            artifacts = self._playable_artifacts(experiment["task_id"])
+            if artifacts is None:
+                continue
+            experiment["playable"] = True
+            experiment["selected_experiment"] = artifacts["summary"].get("selected_experiment", "")
+            playable.append(experiment)
+            if len(playable) >= limit:
+                break
+        return playable
+
+    def start_playback(self, task_id: str, seed: int = 1, num_envs: int = 1) -> Dict[str, Any]:
+        """启动已验收策略的仿真 Viewer 播放，不允许 dry-run 或训练并发占用 GPU。"""
+        artifacts = self._playable_artifacts(task_id)
+        if artifacts is None:
+            raise JobValidationError("只能播放真实训练且已通过联合验收的策略；请刷新成功策略列表")
+        if not 1 <= int(num_envs) <= 16:
+            raise JobValidationError("播放并行环境数量必须位于 1 到 16 之间")
+        with self._lock:
+            active_jobs = [job for job in self._jobs.values()
+                           if job.get("status") in ("queued", "running", "stopping")]
+            if active_jobs:
+                raise JobValidationError("训练任务仍在运行，请等待训练结束后再播放策略")
+            if self._playback_process is not None and self._playback_process.poll() is None:
+                raise JobValidationError("已有策略正在播放，请先关闭当前仿真 Viewer")
+        adapter = UnitreeProjectAdapter(self.settings.training_root, self.settings.agent_root,
+                                        self.settings.experiments_path)
+        command = adapter.play_command(artifacts["robot"], artifacts["config"], artifacts["checkpoint"],
+                                       seed=int(seed), num_envs=int(num_envs))
+        environment = os.environ.copy()
+        if self.settings.gpu_ids:
+            environment["CUDA_VISIBLE_DEVICES"] = str(self.settings.gpu_ids[0])
+        log_path = self.root / "playback.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with log_path.open("a", encoding="utf-8") as output:
+                process = subprocess.Popen(command, cwd=str(self.settings.training_root), env=environment,
+                                           stdout=output, stderr=subprocess.STDOUT, shell=False,
+                                           start_new_session=True)
+        except OSError as exc:
+            raise JobValidationError("策略 Viewer 启动失败：{}".format(exc)) from exc
+        with self._lock:
+            self._playback_process = process
+            self._playback_task_id = task_id
+            self._playback_kind = "strategy"
+        return {"task_id": task_id, "robot": artifacts["robot"], "pid": process.pid,
+                "kind": "strategy", "log": relative_display(log_path, self.settings.agent_root)}
+
+    def start_feasibility_view(self, job_id: str) -> Dict[str, Any]:
+        """为当前直线步态可行性报告启动 Isaac Gym 可视化探针。"""
+        job = self.get_job(job_id)
+        feasibility = job.get("feasibility", {})
+        if not feasibility.get("available"):
+            raise JobValidationError("当前作业尚未生成动作可行性报告")
+        if not feasibility.get("viewer_available"):
+            raise JobValidationError("当前仅支持在 Viewer 中观察 Go2 直线行走可行性探针")
+        with self._lock:
+            active_jobs = [item for item in self._jobs.values()
+                           if item.get("status") in ("queued", "running", "stopping")]
+            if active_jobs:
+                raise JobValidationError("训练任务仍在运行，请等待训练结束后再观察可行性探针")
+            if self._playback_process is not None and self._playback_process.poll() is None:
+                raise JobValidationError("已有仿真 Viewer 正在运行，请先关闭当前窗口")
+        try:
+            duration = min(30.0, max(0.1, float(feasibility.get("duration") or 5.0)))
+        except (TypeError, ValueError):
+            duration = 5.0
+        command = [
+            sys.executable, "-u", "-m", "rl_training_agent", "feasibility-view",
+            "--task", str(job["task"]), "--robot", str(job["robot"]),
+            "--seed", "1", "--max-seconds", str(duration),
+        ]
+        environment = os.environ.copy()
+        if self.settings.gpu_ids:
+            environment["CUDA_VISIBLE_DEVICES"] = str(self.settings.gpu_ids[0])
+        log_path = self.root / "feasibility_view.log"
+        try:
+            with log_path.open("a", encoding="utf-8") as output:
+                process = subprocess.Popen(
+                    command, cwd=str(self.settings.agent_root), env=environment,
+                    stdout=output, stderr=subprocess.STDOUT, shell=False,
+                    start_new_session=True)
+        except OSError as exc:
+            raise JobValidationError("可行性 Viewer 启动失败：{}".format(exc)) from exc
+        with self._lock:
+            self._playback_process = process
+            self._playback_task_id = job["task_id"]
+            self._playback_kind = "feasibility"
+        return {"task_id": job["task_id"], "robot": job["robot"], "pid": process.pid,
+                "kind": "feasibility", "log": relative_display(log_path, self.settings.agent_root)}
+
+    def playback_status(self) -> Dict[str, Any]:
+        """返回当前策略 Viewer 是否仍在运行。"""
+        with self._lock:
+            process = self._playback_process
+            running = process is not None and process.poll() is None
+            if not running:
+                self._playback_process = None
+                self._playback_task_id = None
+                self._playback_kind = None
+            return {"running": running, "task_id": self._playback_task_id if running else None,
+                    "pid": process.pid if running else None,
+                    "kind": self._playback_kind if running else None}
+
+    def stop_playback(self) -> Dict[str, Any]:
+        """请求停止当前策略播放进程组，超时后强制结束以释放 GPU。"""
+        with self._lock:
+            process = self._playback_process
+            if process is None or process.poll() is not None:
+                self._playback_process = None
+                self._playback_task_id = None
+                self._playback_kind = None
+                return {"running": False, "task_id": None, "pid": None, "kind": None}
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (AttributeError, ProcessLookupError, PermissionError):
+            process.terminate()
+        threading.Thread(target=self._ensure_playback_stopped, args=(process,), daemon=True).start()
+        return self.playback_status()
+
+    def _ensure_playback_stopped(self, process: subprocess.Popen) -> None:
+        """等待策略播放器退出；失去响应时终止整个 Viewer 进程组。"""
+        try:
+            process.wait(timeout=8)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (AttributeError, ProcessLookupError, PermissionError):
+            process.kill()
+
     def read_log(self, job_id: str, offset: int = 0, limit: int = 65536) -> Dict[str, Any]:
         """从字节偏移量开始增量读取训练日志。"""
         self._job_dir(job_id)
@@ -506,6 +854,19 @@ class JobManager:
     def config_payload(self) -> Dict[str, Any]:
         """返回前端初始化所需的机器人列表和运行能力信息。"""
         robots = [robot for robot in ROBOT_CATALOG if robot["id"] in self.settings.allowed_robots]
+        rag_status = {"enabled": self.settings.rag_enabled, "documents": 0, "chunks": 0}
+        if self.settings.rag_index_file.is_file():
+            try:
+                rag_index = read_json(self.settings.rag_index_file)
+                rag_status.update({
+                    "documents": int(rag_index.get("document_count", 0)),
+                    "chunks": int(rag_index.get("chunk_count", 0)),
+                    "generated_at": rag_index.get("generated_at"),
+                })
+            except (OSError, ValueError, json.JSONDecodeError):
+                rag_status["error"] = "索引无法读取"
+        memory_status = self.memory_status()
+        bailian_status = BailianGLMProvider().health()
         return {
             "robots": robots,
             "default_robot": self.settings.default_robot,
@@ -513,12 +874,32 @@ class JobManager:
                 "training_project_ready": self.settings.training_root.is_dir(),
                 "training_entry_ready": (self.settings.training_root / "legged_gym" / "scripts" / "train.py").is_file(),
                 "scope": "simulation_only",
+                "gpu_ids": self.settings.gpu_ids,
+                "rag": rag_status,
+                "memory": memory_status,
+                "providers": {
+                    "mode": self.settings.provider,
+                    "task_planner": self.settings.task_planner_provider,
+                    "reward_designer": self.settings.reward_designer_provider,
+                    "visual_critic": self.settings.visual_critic_provider,
+                    "diagnosis": self.settings.diagnosis_provider,
+                    "bailian_model": bailian_status["model"],
+                    "bailian_configured": bailian_status["available"],
+                },
             },
             "modes": [
                 {"id": "dry-run", "name": "离线演练", "description": "使用模拟推理与模拟训练，适合先验证完整流程"},
                 {"id": "real", "name": "真实训练", "description": "使用 OpenCLI 与 GPU 仿真执行正式训练"},
             ],
         }
+
+    def memory_status(self) -> Dict[str, Any]:
+        """返回四层记忆库的实时统计，不读取或暴露记忆正文。"""
+        status = LongTermMemoryStore(
+            self.settings.memory_path, self.settings.agent_root,
+            self.settings.memory_max_context_chars).stats()
+        status["enabled"] = self.settings.memory_enabled
+        return status
 
 
 class TrainingUIHandler(BaseHTTPRequestHandler):
@@ -589,7 +970,15 @@ class TrainingUIHandler(BaseHTTPRequestHandler):
             self._send_json(200, self.manager.config_payload())
             return
         if parsed.path == "/api/jobs":
-            self._send_json(200, {"jobs": self.manager.list_jobs(), "experiments": self.manager.list_experiments()})
+            self._send_json(200, {"jobs": self.manager.list_jobs(), "experiments": self.manager.list_experiments(),
+                                  "playable_experiments": self.manager.list_playable_experiments(),
+                                  "playback": self.manager.playback_status()})
+            return
+        if parsed.path == "/api/playback":
+            self._send_json(200, self.manager.playback_status())
+            return
+        if parsed.path == "/api/memory":
+            self._send_json(200, self.manager.memory_status())
             return
         match = re.fullmatch(r"/api/jobs/([a-f0-9]{12})", parsed.path)
         log_match = re.fullmatch(r"/api/jobs/([a-f0-9]{12})/logs", parsed.path)
@@ -608,12 +997,35 @@ class TrainingUIHandler(BaseHTTPRequestHandler):
         self._send_error_json(404, "接口不存在")
 
     def do_POST(self) -> None:
-        """处理创建训练、恢复闭环与停止训练请求。"""
+        """处理创建训练、恢复闭环、停止训练与策略播放请求。"""
         parsed = urlparse(self.path)
         try:
             if parsed.path == "/api/jobs":
                 job = self.manager.start_job(self._read_json_body())
                 self._send_json(201, job)
+                return
+            if parsed.path == "/api/play":
+                payload = self._read_json_body()
+                if not isinstance(payload, dict):
+                    raise JobValidationError("播放请求必须是 JSON 对象")
+                task_id = str(payload.get("task_id", ""))
+                try:
+                    seed = int(payload.get("seed", 1))
+                    num_envs = int(payload.get("num_envs", 1))
+                except (TypeError, ValueError) as exc:
+                    raise JobValidationError("播放随机种子和并行环境数必须是整数") from exc
+                result = self.manager.start_playback(task_id, seed=seed, num_envs=num_envs)
+                self._send_json(201, result)
+                return
+            if parsed.path == "/api/feasibility-view":
+                payload = self._read_json_body()
+                if not isinstance(payload, dict):
+                    raise JobValidationError("可行性 Viewer 请求必须是 JSON 对象")
+                result = self.manager.start_feasibility_view(str(payload.get("job_id", "")))
+                self._send_json(201, result)
+                return
+            if parsed.path == "/api/play/stop":
+                self._send_json(200, self.manager.stop_playback())
                 return
             match = re.fullmatch(r"/api/jobs/([a-f0-9]{12})/stop", parsed.path)
             if match:

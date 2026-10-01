@@ -1,10 +1,10 @@
 # 仓库检查报告
 
-检查日期：2026-07-15（Asia/Shanghai）。
+首次检查日期：2026-07-15；最近完整复检日期：2026-09-22（Asia/Shanghai）。
 
 ## 工作区与运行环境
 
-- 工作区根目录本身不是 Git 仓库；`../unitree_rl_gym` 是独立 Git 仓库，修改前提交为 `276801e`。检查前已经存在未跟踪的 `isaacgym/` 和 `rsl_rl/` 目录。
+- 当前工作区根目录是 Git 仓库；`../unitree_rl_gym` 仍是独立 Git 仓库，修改前提交为 `276801e`。检查前已经存在未跟踪的 `isaacgym/` 和 `rsl_rl/` 目录。
 - 用户指定的 Agent 目录在实现前为空。
 - Conda 环境 `rl_agent`：Python 3.8.20、PyTorch 2.3.1，CUDA 检查结果为可用。
 - 本地 Isaac Gym 从 `isaacgym/_bindings/linux-x86_64/gym_38.so` 加载，目录结构对应 NVIDIA Isaac Gym Preview 4。
@@ -32,3 +32,5 @@
 ## OpenCLI
 
 2026-07-18 的 `opencli doctor` 报告版本 1.8.6、daemon 正常、Chrome 扩展 1.0.22 已连接、profile 已连接。`opencli chatgpt status -f json` 报告 ChatGPT 已连接且已登录。当前 CLI 提供 `chatgpt ask/new/read/send/status`，以及 `browser` 的 state/find/fill/upload/wait/eval/tab/bind/close 等命令。实现中使用 browser 接口完成语义交互；原生图片上传被 Chrome 拒绝时自动切换到分块 DataTransfer。
+
+2026-09-22 复检时 OpenCLI Browser Bridge 健康检查超时。Provider 的 `doctor` 已改为返回结构化不健康结果，不再因超时抛出未处理堆栈；真实训练应在扩展恢复连接并通过图片探针后再启动。

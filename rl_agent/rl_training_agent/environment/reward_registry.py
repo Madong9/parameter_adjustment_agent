@@ -97,9 +97,14 @@ class RewardRegistry:
         weights = self._weights(robot)
         items: List[RewardRegistryItem] = []
         for name, implementation in sorted(methods.items()):
+            # Unitree 只会从 rewards.scales 枚举启用项。仅有 _reward_* 方法、
+            # 但当前机器人继承配置中没有同名 scale 的函数无法被安全启用，
+            # 因此不能宣称为已注册能力。
+            if name not in weights:
+                continue
             if (name.startswith("rear_leg_") or name.startswith("front_leg_")) and robot != "go2":
                 continue
-            weight = weights.get(name, 0.0)
+            weight = weights[name]
             unit_interval = (name.startswith("tracking_") or name.startswith("rear_leg_") or
                              name.startswith("front_leg_") or name == "termination")
             expected = [0.0, 1.0] if unit_interval else [0.0, 100.0]

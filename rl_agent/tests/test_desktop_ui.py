@@ -21,6 +21,16 @@ def test_desktop_command_is_available():
     play = build_parser().parse_args(["play", "--task-id", "task-demo",
                                       "--checkpoint", "experiments/demo/model_1.pt"])
     assert play.command == "play" and play.num_envs == 1
+    feasibility_view = build_parser().parse_args([
+        "feasibility-view", "--task", "Go2 倒退走 0.3m/s 5秒"])
+    assert feasibility_view.command == "feasibility-view"
+    assert feasibility_view.robot == "go2" and feasibility_view.max_seconds == 5.0
+    query = build_parser().parse_args(["rag-query", "--query", "后腿站立", "--robot", "go2"])
+    assert query.command == "rag-query" and query.robot == "go2"
+    memory = build_parser().parse_args(["memory-query", "--query", "稳定行走"])
+    assert memory.command == "memory-query" and memory.robot == "go2"
+    train = build_parser().parse_args(["train", "--task", "稳定行走"])
+    assert train.provider == "multi-agent"
 
 
 def test_desktop_text_helpers_are_stable():

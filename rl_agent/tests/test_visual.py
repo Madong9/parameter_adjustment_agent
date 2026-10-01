@@ -15,6 +15,7 @@ from rl_training_agent.visual.video_metadata import VideoMetadata, read_video_me
 from rl_training_agent.providers.mock_provider import MockLLMReasoningProvider
 from rl_training_agent.metrics.trajectory_metrics import TrajectoryMetrics
 from rl_training_agent.schemas.task import TaskSpec
+from rl_training_agent.schemas.visual import VisualBehaviorReport
 
 
 @pytest.fixture
@@ -106,6 +107,19 @@ def test_synchronized_evidence_covers_commands_contacts_and_continuous_frames(ro
     assert evidence["safety_scan"]["max_forbidden_body_contact_force_n"] == 2.5
     assert 3 in evidence["safety_scan"]["body_collision_frames"]
     assert '"reward_total":' not in content and '"loss":' not in content.lower()
+
+
+def test_visual_report_accepts_notes_as_evidence_text():
+    """验证模型误用 notes 字段时仍保留完整证据并通过结构校验。"""
+    report = VisualBehaviorReport.parse_obj({
+        "visual_success": False, "alignment_score": 0.2, "confidence": 0.8,
+        "summary": "动作未达标", "phase_results": [],
+        "evidence_findings": [{
+            "name": "command_tracking", "status": "uncertain", "source": "trajectory",
+            "evidence_frames": [10], "notes": "目标速度为零，无法验证向前跟踪",
+        }],
+    })
+    assert report.evidence_findings[0].evidence == "目标速度为零，无法验证向前跟踪"
 
 
 def test_trajectory_metrics_use_measured_collision_and_tracking_data(rollout):

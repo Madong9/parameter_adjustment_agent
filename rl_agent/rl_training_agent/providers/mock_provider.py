@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Type, TypeVar
 
 from pydantic import BaseModel
 
+from ..schemas.agent_workflow import TaskIntentSpec
 from ..schemas.decisions import DiagnosisItem, EvidenceItem, TrainingDiagnosis
 from ..schemas.experiments import ConversationHandle, ProviderHealth
 from ..schemas.task import (
     BehaviorRequirement, ForbiddenBehavior, MetricThreshold, TaskPhase, TaskSpec, TrainingBudget,
 )
 from ..schemas.visual import VisualBehaviorReport, VisualPhaseResult
+from ..memory.reward_experience.schema import RewardExperienceNarrative
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
@@ -131,6 +134,43 @@ class MockLLMReasoningProvider:
                 "reward_hacking_risks": ["standing still may exploit stability rewards"],
                 "termination_suggestions": ["forbidden body contact", "orientation limit"]}
 
+    def understand_task(self, instruction: str, robot: str) -> TaskIntentSpec:
+        """以确定性规则生成离线演练使用的结构化任务意图。"""
+        lowered = instruction.lower()
+        velocity_match = re.search(r"(-?\d+(?:\.\d+)?)\s*(?:m/s|米每秒)", lowered)
+        target_velocity = float(velocity_match.group(1)) if velocity_match else None
+        if "后腿" in instruction:
+            action = "rear_leg_stand_walk"
+            required = ["后足持续支撑", "前足离地", "保持目标俯仰角", "按命令移动"]
+        elif any(token in instruction for token in ("前腿站立", "前腿行走", "前足站立")):
+            action = "front_leg_stand_walk"
+            required = ["前足持续支撑", "后足离地", "保持目标俯仰角", "按命令移动"]
+        elif "跳" in instruction or "jump" in lowered:
+            action = "jump"
+            required = ["同步起跳", "空中姿态稳定", "安全落地"]
+        else:
+            action = "forward_locomotion"
+            required = ["跟踪目标速度", "保持身体稳定"]
+        return TaskIntentSpec(
+            original_instruction=instruction,
+            robot=robot,
+            action_name=action,
+            normalized_goal=instruction,
+            target_velocity=target_velocity,
+            required_behaviors=required,
+            forbidden_behaviors=["身体触地", "关节或力矩超限", "奖励投机"],
+            ambiguities=[] if target_velocity is not None else ["用户未提供精确目标速度"],
+            assumptions=[] if target_velocity is not None else ["速度范围由后续课程和环境命令空间约束"],
+            retrieval_keywords=[robot, action, instruction],
+        )
+
+    def generate_motion_prototype(self, intent: TaskIntentSpec):
+        """使用可复现的规则原型模拟语义阶段 Provider。"""
+        from ..feasibility.motion_prototype.generator import MotionPrototypeGenerator
+        prototype = MotionPrototypeGenerator.deterministic(intent)
+        prototype.source = "mock"
+        return prototype
+
     def design_visual_evaluation(self, task: TaskSpec) -> Dict[str, Any]:
         """为任务生成视觉评估输入与事件设计。"""
         return {"events": [phase.name for phase in task.phases], "cameras": ["front", "side", "overview"]}
@@ -152,6 +192,11 @@ class MockLLMReasoningProvider:
                                    interpretation="all deterministic gates passed")],
             decision="complete", confidence=0.95, expected_effects=["dry-run workflow completion"], risks=[],
             checkpoint_strategy="continue_from_current")
+
+    def summarize_reward_experience(self, payload: Dict[str, Any]) -> RewardExperienceNarrative:
+        """返回空白离线归纳；Mock 不能被误当成真实模型或训练结果。"""
+        return RewardExperienceNarrative(
+            limitations=[])
 
     def close(self) -> None:
         """释放 Provider 持有或绑定的浏览器资源。"""

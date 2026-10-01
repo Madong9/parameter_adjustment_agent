@@ -15,12 +15,18 @@ flowchart TB
     subgraph L[本地确定性编排与安全控制]
         ORCH[TrainingOrchestrator<br/>持久化状态机 · 预算 · 幂等恢复]:::local
         SPEC[TaskIntentSpec]:::local
+        FEAS[Task Feasibility Pipeline<br/>MotionConstraintSpec<br/>步态 · CoM · 接触 · 基座 · 末端规划器<br/>Pinocchio IK · 浮动基座 · 逆动力学 · 接触力 · 轨迹优化能力门<br/>动作专用 IsaacGym rollout<br/>缺少后端保持 INCONCLUSIVE · 不训练 PPO]:::local
+        ADMISSION[TrainingAdmissionPolicy<br/>能力与环境证据 · strict 或预算探索<br/>持久化准入预算 · 独立验收合同]:::local
+        HEALTH[独立默认姿态环境检查<br/>隔离 Isaac Gym worker<br/>仅证明仿真基础设施]:::local
         CONTEXT[上下文构建器<br/>环境能力 · 机器人配置 · RAG · 记忆]:::local
         PROMPT[提示词编译器<br/>固定模板 · 版本 · SHA-256]:::local
         BUNDLE[TaskRewardBundle]:::local
         REVIEW[奖励审查与安全编译<br/>奖励注册表 · Schema · 权重 · 指标覆盖]:::local
         NUM[确定性数值评估<br/>任务指标 · 硬约束 · 适用时的反事实测试]:::local
         GATE[本地联合验收与状态决策<br/>完成门槛 · 修订预算 · HUMAN_REVIEW]:::local
+        EVIDENCE[RewardExperienceEvidenceBuilder<br/>只读真实配置 · 训练与评估产物]:::local
+        ELIGIBILITY[ExperienceEligibilityChecker<br/>SUCCESS · VERIFIED_FAILURE · INCONCLUSIVE]:::local
+        VALIDATOR[RewardExperienceValidator<br/>来源哈希 · reward diff · 指标 · 引用 · 措辞]:::local
     end
 
     subgraph A[按职责分工的模型 Agent]
@@ -28,6 +34,7 @@ flowchart TB
         REWARD[奖励设计 Agent<br/>百炼 GLM API]:::model
         VISION[视觉评估 Agent<br/>GPT · OpenCLI 多模态]:::model
         DIAG[训练诊断 Agent<br/>百炼 GLM API]:::model
+        EXPERIENCE[Reward Experience Agent<br/>诊断 Provider · 仅归纳文字经验]:::model
         DOUBAO[豆包对话<br/>网页 Provider 回退]:::model
     end
 
@@ -44,14 +51,22 @@ flowchart TB
         EM[情景记忆<br/>已验证实验记录]:::memory
         SM[语义记忆<br/>多证据支持的通用规律]:::memory
         PM[程序记忆<br/>Prompt · Schema · 流程规则]:::memory
-        PROMOTION[记忆晋升门控<br/>仅保存验收通过且证据完整的经验]:::memory
+        PROMOTION[MemoryCuratorAgent<br/>多随机种子情景记忆门控]:::memory
+        NO_PROMOTION[只保留原始证据<br/>不写入长期记忆]:::review
+        RESULT[保留原有训练终态<br/>经验整理不改变验收结论]:::terminal
     end
 
     UI --> ORCH
-    ORCH --> TASK --> SPEC --> CONTEXT --> PROMPT --> REWARD --> BUNDLE --> REVIEW --> PPO
+    ORCH --> TASK --> SPEC --> FEAS
+    FEAS -- 原样保留候选物理结果 --> ADMISSION
+    FEAS -- 缺少真实运行证据 --> HEALTH --> ADMISSION
+    ADMISSION -- 允许训练或有预算的仿真探索 --> CONTEXT --> PROMPT --> REWARD --> BUNDLE --> REVIEW --> PPO
     ENV --> ORCH
+    ENV --> FEAS
     ENV --> REVIEW
     ENV <--> PPO
+    ADMISSION -- 基础设施或指标缺失 / strict未通过 / Mock生产调用 --> HUMAN
+    ADMISSION -- 明确能力缺失 --> FAILED
     RAG --> CONTEXT
     WM --> CONTEXT
     EM --> CONTEXT
@@ -71,7 +86,20 @@ flowchart TB
     GATE -- 视觉、数值与硬约束均通过 --> DONE[COMPLETED]:::terminal
     GATE -- 需要用户判断 / Provider 故障 / 预算耗尽 --> HUMAN[HUMAN_REVIEW]:::review
     GATE -- 训练或确定性流程失败 --> FAILED[FAILED]:::review
-    DONE --> PROMOTION --> EM --> SM
+    DONE --> EVIDENCE
+    FAILED --> EVIDENCE
+    HUMAN --> EVIDENCE
+    EVIDENCE --> ELIGIBILITY
+    ELIGIBILITY -- SUCCESS / VERIFIED_FAILURE --> EXPERIENCE --> VALIDATOR
+    ELIGIBILITY -- INCONCLUSIVE --> NO_PROMOTION
+    VALIDATOR -- 验证通过 --> PROMOTION
+    VALIDATOR -- 校验失败 --> NO_PROMOTION
+    PROMOTION --> EM --> SM
+    SM --> RESULT
+    NO_PROMOTION --> RESULT
+    DONE --> RESULT
+    FAILED --> RESULT
+    HUMAN --> RESULT
     ORCH --> WM
 
     %% 视觉评估保持独立，不把奖励设计 RAG 或奖励方案作为视觉判断依据。

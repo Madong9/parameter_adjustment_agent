@@ -76,7 +76,12 @@ class RewardPlanReviser:
                     audit.append("奖励项已存在，按更新处理：%s" % change.term)
             index = next((i for i, term in enumerate(plan.terms) if term.name == change.term), None)
             if index is None:
-                raise RewardValidationError("diagnosis requested update for missing reward: %s" % change.term)
+                # 诊断模型可能把“启用一个当前版本未采用、但环境已注册的奖励”表达为
+                # update。此时按注册表默认值创建后再应用修改，语义等同于安全的 upsert；
+                # 未注册名称仍由 _new_term 拒绝，不能借此绕过能力白名单。
+                plan.terms.append(self._new_term(change.term, {}))
+                index = len(plan.terms) - 1
+                audit.append("更新目标不存在，已按注册表新增：%s" % change.term)
             term = plan.terms[index]
             unknown = set(change.changes) - TERM_UPDATE_FIELDS - {"weight_delta", "weight_multiplier"}
             if unknown:

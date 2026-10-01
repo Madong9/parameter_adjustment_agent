@@ -15,12 +15,19 @@ import numpy as np
 from pydantic import BaseModel
 
 from .environment.inspector import EnvironmentInspector
+from .benchmark import BenchmarkRunner
 from .environment.project_adapter import UnitreeProjectAdapter
+from .maintenance.experiment_cleanup import ExperimentCleaner
+from .memory.store import LongTermMemoryStore
 from .orchestration.orchestrator import TrainingOrchestrator
+from .providers.bailian_glm import BailianGLMProvider
 from .providers.opencli_chatgpt import OpenCLIChatGPTWebProvider
 from .providers.errors import ProviderError
+from .providers.registry import ProviderRegistry
+from .rag.knowledge_base import TrainingKnowledgeBase
 from .schemas.task import TaskSpec
 from .settings import load_settings
+from .storage.migrations import ArtifactMigrator
 from .utils.io import atomic_write_text, read_json, write_json
 from .utils.paths import ensure_within
 from .visual.contact_sheet import ContactSheetBuilder
@@ -64,7 +71,11 @@ def doctor() -> Dict[str, Any]:
         checks["torch_error"] = str(exc)
     settings.experiments_path.mkdir(parents=True, exist_ok=True)
     checks["experiment_root_writable"] = os.access(str(settings.experiments_path), os.W_OK)
-    checks["opencli"] = OpenCLIChatGPTWebProvider().doctor().dict()
+    # 生产网页推理采用 ChatGPT -> 豆包主备组合。ChatGPT 不可用但豆包
+    # 健康时不应把整套系统误报为不可生产运行。
+    checks["opencli"] = ProviderRegistry().create(
+        "opencli-doubao", settings, settings.artifacts_path / "provider_doctor").doctor().dict()
+    checks["bailian"] = BailianGLMProvider().health()
     upload_failure = settings.artifacts_path / "opencli_test" / "upload_failure.txt"
     validated_response = settings.artifacts_path / "opencli_test" / "validated_response.json"
     if upload_failure.exists():
@@ -73,9 +84,14 @@ def doctor() -> Dict[str, Any]:
     checks["opencli_real_text_probe_recorded"] = validated_response.exists()
     checks["healthy"] = all(checks[key] for key in
                             ("python_supported", "agent_root_writable", "training_project", "training_entry",
-                             "evaluation_entry", "torch_installed", "isaacgym_installed", "experiment_root_writable"))
-    checks["production_ready"] = (checks["healthy"] and checks["opencli"]["available"] and
-                                  checks["opencli"]["image_upload_supported"])
+                             "evaluation_entry", "torch_installed", "isaacgym_installed", "cuda_available",
+                             "experiment_root_writable"))
+    bailian_required = settings.provider == "multi-agent"
+    checks["production_ready"] = (
+        checks["healthy"] and checks["opencli"]["available"] and
+        checks["opencli"]["image_upload_supported"] and
+        (checks["bailian"]["available"] or not bailian_required)
+    )
     return checks
 
 
@@ -91,16 +107,41 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("doctor")
     inspect = sub.add_parser("inspect-env")
     inspect.add_argument("--robot", default="go2")
+    sub.add_parser("rag-index")
+    rag_query = sub.add_parser("rag-query")
+    rag_query.add_argument("--query", required=True)
+    rag_query.add_argument("--robot")
+    rag_query.add_argument("--top-k", type=int)
+    sub.add_parser("memory-stats")
+    cleanup = sub.add_parser("cleanup-experiments")
+    cleanup.add_argument("--task-id")
+    cleanup.add_argument("--apply", action="store_true")
+    cleanup.add_argument("--videos-only", action="store_true")
+    benchmark = sub.add_parser("benchmark")
+    benchmark.add_argument("--suite", default="config/benchmarks.yaml")
+    benchmark.add_argument("--case")
+    provider_choices = ["multi-agent", "opencli-doubao", "opencli", "doubao", "mock"]
+    visual_provider_choices = ["opencli-doubao", "opencli", "doubao", "mock"]
+    benchmark.add_argument("--provider", choices=provider_choices, default="multi-agent")
+    benchmark.add_argument("--dry-run", action="store_true")
+    migrate = sub.add_parser("migrate-artifacts")
+    migrate.add_argument("--apply", action="store_true")
+    memory_query = sub.add_parser("memory-query")
+    memory_query.add_argument("--query", required=True)
+    memory_query.add_argument("--robot", default="go2")
+    memory_query.add_argument("--top-k", type=int)
     for name in ("plan", "train"):
         command = sub.add_parser(name)
         command.add_argument("--task", required=True)
         command.add_argument("--robot", default="go2")
-        command.add_argument("--provider", choices=["opencli", "mock"], default="opencli")
+        command.add_argument(
+            "--provider", choices=provider_choices, default="multi-agent")
         if name == "train":
             command.add_argument("--dry-run", action="store_true")
     resume = sub.add_parser("resume")
     resume.add_argument("--task-id", required=True)
-    resume.add_argument("--provider", choices=["opencli", "mock"], default="opencli")
+    resume.add_argument(
+        "--provider", choices=provider_choices, default="multi-agent")
     resume.add_argument("--dry-run", action="store_true")
     for name in ("status", "report"):
         command = sub.add_parser(name)
@@ -108,12 +149,17 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate = sub.add_parser("evaluate")
     evaluate.add_argument("--task-id", required=True)
     evaluate.add_argument("--checkpoint", required=True)
-    evaluate.add_argument("--provider", choices=["opencli", "mock"], default="opencli")
+    evaluate.add_argument("--provider", choices=visual_provider_choices, default="opencli-doubao")
     play = sub.add_parser("play")
     play.add_argument("--task-id", required=True)
     play.add_argument("--checkpoint", required=True)
     play.add_argument("--seed", default=1, type=int)
     play.add_argument("--num-envs", default=1, type=int)
+    feasibility_view = sub.add_parser("feasibility-view")
+    feasibility_view.add_argument("--task", required=True)
+    feasibility_view.add_argument("--robot", default="go2")
+    feasibility_view.add_argument("--seed", default=1, type=int)
+    feasibility_view.add_argument("--max-seconds", default=5.0, type=float)
     sub.add_parser("opencli-test")
     ui = sub.add_parser("ui")
     ui.add_argument("--host", default="127.0.0.1")
@@ -124,11 +170,11 @@ def build_parser() -> argparse.ArgumentParser:
     audit = sub.add_parser("visual-audit")
     audit.add_argument("--task-id", required=True)
     audit.add_argument("--rollout", default="final/evaluation_rollout")
-    audit.add_argument("--provider", choices=["opencli", "mock"], default="opencli")
+    audit.add_argument("--provider", choices=visual_provider_choices, default="opencli-doubao")
     visual = sub.add_parser("visual-test")
     visual.add_argument("--video", required=True)
     visual.add_argument("--task", required=True)
-    visual.add_argument("--provider", choices=["opencli", "mock"], default="opencli")
+    visual.add_argument("--provider", choices=visual_provider_choices, default="opencli-doubao")
     return parser
 
 
@@ -155,6 +201,51 @@ def main(argv=None) -> int:
         _json_print({"output": "artifacts/environment_manifest.json", "variables": len(result.reward_variables),
                      "rewards": len(result.rewards), "robots": result.robots})
         return 0
+    if args.command in ("rag-index", "rag-query"):
+        knowledge = TrainingKnowledgeBase.from_settings(settings)
+        stats = knowledge.refresh(force=args.command == "rag-index")
+        if args.command == "rag-index":
+            _json_print(stats)
+            return 0
+        result = knowledge.retrieve(
+            args.query, "manual_query", top_k=args.top_k or settings.rag_top_k,
+            robot=args.robot)
+        _json_print({"index": stats, "result": result.prompt_payload()})
+        return 0
+    if args.command in ("memory-stats", "memory-query"):
+        memory = LongTermMemoryStore(
+            settings.memory_path, settings.agent_root, settings.memory_max_context_chars)
+        if args.command == "memory-stats":
+            _json_print(memory.stats())
+            return 0
+        _json_print(memory.retrieve(
+            args.query, args.robot, top_k=args.top_k or settings.memory_top_k))
+        return 0
+    if args.command == "cleanup-experiments":
+        result = ExperimentCleaner(settings.experiments_path).run(
+            task_id=args.task_id,
+            keep_per_run=settings.checkpoints_per_run,
+            apply=args.apply,
+            cleanup_checkpoints=not args.videos_only,
+            cleanup_videos=True,
+        )
+        _json_print(result)
+        return 0
+    if args.command == "benchmark":
+        if args.dry_run and args.provider != "mock":
+            raise ValueError("benchmark --dry-run must use --provider mock")
+        suite = Path(args.suite)
+        if not suite.is_absolute():
+            suite = settings.agent_root / suite
+        result = BenchmarkRunner(settings, suite).run(
+            args.provider, dry_run=args.dry_run, case_id=args.case)
+        _json_print(result)
+        return 0
+    if args.command == "migrate-artifacts":
+        result = ArtifactMigrator(
+            settings.experiments_path, settings.memory_path).migrate(dry_run=not args.apply)
+        _json_print(result)
+        return 0
     if args.command in ("plan", "train"):
         planned_task_id = TrainingOrchestrator._task_id(args.task, args.robot)
         provider = _provider(settings, args.provider,
@@ -170,7 +261,7 @@ def main(argv=None) -> int:
             _json_print(result)
             return 0
         except ProviderError as exc:
-            print("[Agent] 网页推理服务不可用：{}".format(exc), file=sys.stderr)
+            print("[Agent] 推理服务不可用：{}".format(exc), file=sys.stderr)
             return 2
         finally:
             provider.close()
@@ -194,7 +285,7 @@ def main(argv=None) -> int:
             _json_print(result)
             return 0
         except ProviderError as exc:
-            print("[Agent] 网页推理服务不可用：{}".format(exc), file=sys.stderr)
+            print("[Agent] 推理服务不可用：{}".format(exc), file=sys.stderr)
             return 2
         finally:
             provider.close()
@@ -238,6 +329,52 @@ def main(argv=None) -> int:
         command = adapter.play_command(task["robot"], config_candidates[0], checkpoint,
                                        seed=args.seed, num_envs=args.num_envs)
         return subprocess.call(command, cwd=str(settings.training_root), shell=False)
+    if args.command == "feasibility-view":
+        # 该入口绕过 LLM，只把用户文字编译为受限运动原型，并使用正式物理链路播放。
+        from .feasibility.ik.pinocchio_solver import PinocchioIKSolver
+        from .feasibility.motion_prototype.dynamic_generator import (
+            DynamicMotionPrototypeGenerator,
+        )
+        from .feasibility.motion_prototype.schema import MotionType
+        from .feasibility.robot_models.loader import RobotModelLoader
+        from .feasibility.simulation.isaacgym_dynamic_validator import (
+            IsaacGymDynamicValidator,
+        )
+        from .schemas.agent_workflow import TaskIntentSpec
+
+        if not 0.1 <= float(args.max_seconds) <= 30.0:
+            raise ValueError("--max-seconds 必须位于 0.1 到 30 秒之间")
+        intent = TaskIntentSpec(
+            original_instruction=args.task,
+            robot=args.robot,
+            action_name=args.task,
+            normalized_goal=args.task,
+        )
+        prototype = DynamicMotionPrototypeGenerator.generate(intent)
+        if prototype.motion_type != MotionType.LOCOMOTION:
+            raise ValueError(
+                "当前 Viewer 入口只支持前进/后退 LOCOMOTION；该任务被识别为 %s" %
+                prototype.motion_type.value)
+        if prototype.duration > float(args.max_seconds) + 1.0e-9:
+            raise ValueError(
+                "动作原型时长 %.2f 秒超过 --max-seconds %.2f 秒；请提高显式上限" %
+                (prototype.duration, float(args.max_seconds)))
+        model = RobotModelLoader(settings.training_root).load_robot_model(args.robot)
+        if model.model_status != "AVAILABLE":
+            raise RuntimeError(model.model_error or "机器人物理模型不可用")
+        _json_print({
+            "阶段": "运动原型已生成，即将打开 Isaac Gym Viewer",
+            "提示": "这是训练前开环物理预检，不是已训练策略；按 Esc 或关闭窗口可退出。",
+            "motion_prototype": prototype,
+        })
+        max_steps = max(5, int(float(args.max_seconds) / 0.01) + 1)
+        report = IsaacGymDynamicValidator(
+            settings.training_root, seed=args.seed,
+            max_seconds=float(args.max_seconds), max_steps=max_steps,
+            ik_solver=PinocchioIKSolver(), visualize=True,
+        ).validate(model, prototype)
+        _json_print({"阶段": "可视化预检结束", "report": report})
+        return 0 if report.success is True else 1
     if args.command == "opencli-test":
         output = settings.artifacts_path / "opencli_test"
         output.mkdir(parents=True, exist_ok=True)

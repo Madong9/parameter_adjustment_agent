@@ -27,6 +27,9 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--seconds", type=float, default=10.0)
+    parser.add_argument("--command-x", type=float)
+    parser.add_argument("--command-y", type=float)
+    parser.add_argument("--command-yaw", type=float)
     return parser.parse_args()
 
 
@@ -120,12 +123,19 @@ def main() -> int:
         dtype=torch.long, device=env.device)
     steps = max(1, int(args.seconds / policy_dt))
     rows, reward_rows = [], []
+    override = None if args.command_x is None else (
+        float(args.command_x), float(args.command_y or 0.0), float(args.command_yaw or 0.0))
+    if override is not None:
+        env.commands[0, 0], env.commands[0, 1], env.commands[0, 2] = override
     obs = env.get_observations()
     video_frame = 0
     for step in range(steps):
         with torch.inference_mode():
             actions = policy(obs.detach())
         obs, _, rewards, dones, infos = env.step(actions.detach())
+        if override is not None:
+            env.commands[0, 0], env.commands[0, 1], env.commands[0, 2] = override
+            obs = env.get_observations()
         env.gym.refresh_rigid_body_state_tensor(env.sim)
         if step % video_interval != 0:
             continue
@@ -207,6 +217,7 @@ def main() -> int:
                 "camera_tracking": "base_position_and_yaw", "camera_horizontal_fov_deg": 55.0,
                 "body_collision_force_threshold_n": 0.1,
                 "body_collision_scope": "all_non_foot_rigid_bodies",
+                "command_override": override,
                 "nonfoot_rigid_body_count": int(nonfoot_indices.numel()),
                 "penalized_contact_patterns": list(env.cfg.asset.penalize_contacts_on),
                 "termination_contact_patterns": list(env.cfg.asset.terminate_after_contacts_on)}

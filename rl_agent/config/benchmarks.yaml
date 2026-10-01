@@ -1,0 +1,36 @@
+version: 1
+suite: go2_core_motion_v1
+robot: go2
+environment_commit: 276801e46c5d433564f24658bac64f254b7d2d4b
+seeds: [11, 23, 37]
+repetitions: 2
+cases:
+  - id: forward_walk
+    instruction: 训练机器狗以0.5米每秒稳定向前行走，避免身体触地
+    required_metrics: [tracking_error, fall_rate]
+    thresholds:
+      tracking_error: {operator: "<=", value: 0.25}
+      fall_rate: {operator: "<=", value: 0.05}
+  - id: turn_in_place
+    instruction: 训练机器狗原地稳定向左转向，保持位置并避免摔倒
+    required_metrics: [tracking_error, fall_rate, forbidden_body_contact]
+    thresholds:
+      tracking_error: {operator: "<=", value: 0.25}
+      fall_rate: {operator: "<=", value: 0.05}
+  - id: jump
+    instruction: 训练机器狗原地垂直起跳并稳定落地，避免身体触地
+    required_metrics: [fall_rate, forbidden_body_contact]
+    thresholds:
+      fall_rate: {operator: "<=", value: 0.05}
+  - id: rear_leg_stand
+    instruction: 训练机器狗使用两条后腿稳定站立，前腿持续离地
+    required_metrics: [rear_leg_stand_duration, front_leg_off_ground_ratio, forbidden_body_contact]
+    thresholds:
+      rear_leg_stand_duration: {operator: ">=", value: 2.0}
+      front_leg_off_ground_ratio: {operator: ">=", value: 0.8}
+  - id: rear_leg_walk
+    instruction: 训练机器狗后腿站立并缓慢向前行走，前腿持续离地
+    required_metrics: [rear_leg_walk_completion, rear_leg_walk_velocity_tracking, forbidden_body_contact]
+    thresholds:
+      rear_leg_walk_completion: {operator: ">=", value: 0.7}
+      rear_leg_walk_velocity_tracking: {operator: ">=", value: 0.6}

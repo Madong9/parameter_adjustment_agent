@@ -47,17 +47,23 @@ class UnitreeProjectAdapter:
                 "--checkpoint", checkpoint.stem.replace("model_", "")]
 
     def rollout_command(self, robot: str, config: Path, checkpoint: Path, output_dir: Path,
-                        seed: int, fps: int, seconds: float = 10.0) -> List[str]:
+                        seed: int, fps: int, seconds: float = 10.0,
+                        command_override: Optional[dict] = None) -> List[str]:
         """构造同步录制真实仿真 rollout 的参数数组。"""
         config = ensure_within(config, self.experiment_root)
         checkpoint = ensure_within(checkpoint, self.experiment_root)
         output_dir = ensure_within(output_dir, self.experiment_root)
         script = self.agent_root / "rl_training_agent" / "training" / "real_rollout.py"
-        return [sys.executable, "-u", self._relative_to_training(script), "--task", robot,
+        command = [sys.executable, "-u", self._relative_to_training(script), "--task", robot,
                 "--config", self._relative_to_training(config),
                 "--checkpoint", self._relative_to_training(checkpoint),
                 "--output", self._relative_to_training(output_dir), "--seed", str(seed),
                 "--fps", str(fps), "--seconds", str(seconds)]
+        if command_override is not None:
+            command.extend(["--command-x", str(float(command_override.get("x", 0.0))),
+                            "--command-y", str(float(command_override.get("y", 0.0))),
+                            "--command-yaw", str(float(command_override.get("yaw", 0.0)))])
+        return command
 
     def play_command(self, robot: str, config: Path, checkpoint: Path, seed: int = 1,
                      num_envs: int = 1) -> List[str]:

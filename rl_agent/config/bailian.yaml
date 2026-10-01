@@ -1,0 +1,8 @@
+# 百炼 API Key 只能通过 DASHSCOPE_API_KEY 环境变量提供，禁止写入本文件。
+model: glm-4.7
+base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+api_key_env: DASHSCOPE_API_KEY
+timeout_seconds: 300
+max_retries: 2
+enable_thinking: false
+response_format_json: true

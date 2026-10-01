@@ -81,6 +81,16 @@ def main() -> int:
     print("[播放] 关闭 Viewer 窗口或按 Ctrl+C 退出。", flush=True)
     try:
         while args.max_steps == 0 or step < args.max_steps:
+            viewer = getattr(env, "viewer", None)
+            gym = getattr(env, "gym", None)
+            if viewer is not None and gym is not None:
+                try:
+                    if gym.query_viewer_has_closed(viewer):
+                        print("\n[播放] 仿真 Viewer 已关闭，策略播放结束。", flush=True)
+                        break
+                except (AttributeError, RuntimeError):
+                    # 一些 headless/兼容环境没有 Viewer 查询 API；此时仍允许 Ctrl+C 退出。
+                    pass
             with torch.inference_mode():
                 actions = policy(observations.detach())
             observations, _, _, _, _ = env.step(actions.detach())

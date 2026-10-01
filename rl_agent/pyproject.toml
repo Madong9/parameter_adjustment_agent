@@ -20,6 +20,11 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=7,<9"]
+physics = [
+  "mujoco>=3.2,<4",
+  "pin==2.6.21; python_version < '3.10'",
+  "pin>=3,<4; python_version >= '3.10'",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -29,5 +34,6 @@ include = ["rl_training_agent*"]
 rl_training_agent = ["prompts/*.md", "web/*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "rl_training_agent/memory/reward_experience/tests",
+             "rl_training_agent/feasibility/tests"]
 addopts = "-q"

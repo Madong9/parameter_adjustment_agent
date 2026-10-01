@@ -1,21 +1,53 @@
-# All paths are relative to this Agent directory. They are resolved at runtime.
-training_project: ../unitree_rl_gym
-experiment_root: experiments
-artifact_root: artifacts
-default_robot: go2
-provider: opencli
-num_reward_candidates: 3
-smoke_iterations: 50
-screening_iterations: 300
-trend_iterations: 500
-mid_iterations: 1000
-full_iterations: 1500
-max_total_iterations: 12000
-max_reward_revisions: 3
-evaluation_seeds: [1, 2, 3]
-rollouts_per_seed: 20
-video_fps: 30
-training_timeout_seconds: 86400
-log_stale_seconds: 600
-max_abs_reward_weight: 100.0
-allowed_robots: [go2, h1, h1_2, g1]
+# 本文件是 Agent 主配置；所有项目路径均为相对路径，并在运行时相对 rl_agent 根目录解析。
+training_project: ../unitree_rl_gym  # Unitree RL Gym 训练工程目录。
+experiment_root: experiments  # 按任务保存状态、候选策略、checkpoint 和验收结果的目录。
+artifact_root: artifacts  # 保存上位机作业、RAG 索引、长期记忆和 Provider 记录的公共产物目录。
+default_robot: go2  # 上位机和命令行未指定机器人时使用的默认型号。
+provider: multi-agent  # 总体推理模式：multi-agent 按角色分工，opencli 全部使用 GPT，mock 仅用于离线演练。
+task_planner_provider: opencli-doubao  # 任务理解 Agent：优先使用 ChatGPT 聊天模式，故障时自动回退豆包对话。
+reward_designer_provider: bailian  # 奖励设计 Agent：通过阿里云百炼 API 调用 GLM。
+visual_critic_provider: opencli-doubao  # 视觉评估 Agent：优先使用 ChatGPT 聊天模式，故障时由豆包接管相同附件。
+diagnosis_provider: bailian  # 训练诊断与修订 Agent：通过百炼 API 调用 GLM。
+num_reward_candidates: 3  # 每次奖励设计生成并筛选的候选方案数量。
+smoke_iterations: 50  # 每个候选方案首次冒烟训练的 PPO 迭代数。
+screening_iterations: 300  # 通过冒烟检查后用于候选筛选的迭代数。
+trend_iterations: 500  # 用于判断奖励和 PPO 变化趋势的训练迭代数。
+mid_iterations: 1000  # 中期评估阶段累计达到的训练迭代数。
+full_iterations: 1500  # 单轮完整训练阶段累计达到的迭代数。
+max_total_iterations: 12000  # 一个任务包含所有闭环修订在内的最大 PPO 迭代预算。
+max_reward_revisions: 3  # 验收失败后自动修改奖励方案的最大次数。
+feasibility_admission_mode: budgeted_exploration  # strict 要求探针通过；budgeted_exploration 允许能力和环境就绪的仿真预算探索。
+exploration_max_iterations: 3000  # 所有候选、种子和修订合计的探索 PPO 迭代上限，同时受任务总预算限制。
+exploration_max_revisions: 1  # 探索训练最多自动修订次数；恢复任务不会重置此上限。
+evaluation_seeds: [1, 2, 3]  # 评估阶段使用的随机种子，用于检查策略的可重复性。
+rollouts_per_seed: 1  # 每个随机种子采集一次确定性评估；三个种子仍用于最差/中央/最好视觉聚合，避免重复视频占满磁盘。
+checkpoints_per_run: 1  # 每个训练子运行只保留最新 checkpoint；最终归档策略和各随机种子末次策略不会删除。
+video_fps: 30  # 评估视频和视觉证据的帧率。
+counterfactual_enabled: true  # 是否运行零速度命令反事实测试，用于检测奖励投机。
+counterfactual_zero_command_speed_max: 0.15  # 零速度命令下允许的最大机体漂移速度，单位为米/秒。
+training_timeout_seconds: 86400  # 单个训练子进程的最长运行时间，86400 秒等于 24 小时。
+log_stale_seconds: 600  # 训练日志连续无更新多久后视为可能卡死，单位为秒。
+max_abs_reward_weight: 100.0  # 奖励项权重绝对值的安全上限。
+allowed_robots: [go2, h1, h1_2, g1]  # 上位机和编排器允许选择的机器人白名单。
+gpu_ids: [0]  # 持久化作业队列可分配的 CUDA GPU 编号。
+rag_enabled: true  # 是否在奖励设计和训练诊断前启用本地 RAG 检索。
+rag_index_path: rag/index.json  # RAG 索引相对 artifact_root 的保存路径。
+rag_document_roots:  # 允许建立索引的项目知识文档白名单。
+  - docs/agent/REWARD_DESIGN.md  # 奖励设计规则与项目约束文档。
+  - docs/agent/VISUAL_CRITIC.md  # 视觉评估标准与证据要求文档。
+  - docs/agent/SAFETY.md  # 训练、Provider 和数据处理的安全边界文档。
+rag_top_k: 6  # 每次混合检索返回的最多知识片段数。
+rag_chunk_chars: 1200  # 文档切片的目标字符数。
+rag_chunk_overlap: 120  # 相邻文档切片之间的重叠字符数。
+rag_max_context_chars: 6000  # 每次允许注入模型提示词的 RAG 上下文字符上限。
+rag_bm25_weight: 0.65  # 混合检索中 BM25 关键词匹配分数的权重。
+rag_vector_weight: 0.35  # 混合检索中本地 TF-IDF 向量相似度分数的权重。
+memory_enabled: true  # 是否启用工作、情景、语义和程序四层记忆。
+memory_root: memory  # 长期记忆相对 artifact_root 的保存目录。
+memory_top_k: 4  # 每次为奖励设计或诊断检索的最多长期记忆数。
+memory_max_context_chars: 4000  # 每次允许注入模型提示词的长期记忆字符上限。
+memory_require_multi_seed: true  # 是否要求多随机种子证据一致后才能晋升长期记忆。
+memory_min_semantic_support: 2  # 语义规律从候选升级为有效记忆所需的最少独立证据数。
+memory_max_records: 500  # 允许保持 active 状态的长期记忆最大数量，超出后归档低优先级记录。
+memory_max_age_days: 365  # 活跃长期记忆的最大保留天数，超期后归档但不删除。
+memory_min_confidence: 0.55  # 长期记忆保持 active 状态所需的最低可信度。

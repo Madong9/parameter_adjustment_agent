@@ -57,8 +57,11 @@ class VisualBehaviorReport(BaseModel):
     evidence_findings: List[VisualEvidenceFinding] = Field(default_factory=list)
     uncertain_items: List[str] = Field(default_factory=list)
     requires_human_review: bool = False
+    aggregation_method: str = "single_rollout"
+    evaluated_rollouts: List[str] = Field(default_factory=list)
+    agreement_score: float = 1.0
 
-    @validator("alignment_score", "confidence")
+    @validator("alignment_score", "confidence", "agreement_score")
     def unit_interval(cls, value: float) -> float:
         """校验数值位于零到一的闭区间。"""
         if not 0.0 <= value <= 1.0:

@@ -1,0 +1,11 @@
+pydantic==1.10.26
+PyYAML==6.0.2
+numpy==1.24.4
+matplotlib==3.7.5
+opencv-python-headless==4.13.0.92
+pandas==2.0.3
+pyarrow==17.0.0
+tensorboard==2.14.0
+mujoco==3.2.3
+pin==2.6.21
+pytest==8.3.5

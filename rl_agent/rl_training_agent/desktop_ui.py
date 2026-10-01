@@ -346,7 +346,7 @@ class RLDesktopApp:
         mode_grid.grid(row=5, column=0, sticky="ew")
         mode_grid.grid_columnconfigure((0, 1), weight=1)
         modes = (("dry-run", "离线演练\n模拟全流程 · 无需 GPU"),
-                 ("real", "真实训练\nOpenCLI 推理 · GPU 仿真"))
+                 ("real", "真实训练\nGPT + 百炼 GLM · GPU 仿真"))
         for index, (mode_id, label) in enumerate(modes):
             button = tk.Button(mode_grid, text=label, command=lambda value=mode_id: self._select_mode(value),
                                justify="left", anchor="w", padx=12, pady=8, relief="flat", bd=0,
@@ -409,12 +409,19 @@ class RLDesktopApp:
             text.grid(row=index, column=1, sticky="w", padx=(8, 0), pady=3)
             self.stage_widgets.append({"threshold": threshold, "dot": dot, "text": text})
 
+        self.resume_button = tk.Button(body, text="↻   从当前策略继续闭环", command=self._resume_job,
+                                       bg=COLORS["accent_dark"], fg=COLORS["accent"],
+                                       disabledforeground=COLORS["faint"], activebackground="#29391f",
+                                       activeforeground=COLORS["accent"], relief="solid", bd=1,
+                                       cursor="hand2", font=self.font_small, pady=9, state="disabled")
+        self.resume_button.grid(row=3, column=0, sticky="ew", padx=22, pady=(8, 0))
+
         self.stop_button = tk.Button(body, text="■   安全停止训练", command=self._stop_job,
                                      bg=COLORS["surface"], fg=COLORS["danger"], disabledforeground=COLORS["faint"],
                                      activebackground="#251817", activeforeground=COLORS["danger"],
                                      relief="solid", bd=1, cursor="hand2", font=self.font_small, pady=9,
                                      state="disabled")
-        self.stop_button.grid(row=3, column=0, sticky="ew", padx=22, pady=(8, 20))
+        self.stop_button.grid(row=4, column=0, sticky="ew", padx=22, pady=(8, 20))
 
     def _build_log_panel(self, panel: tk.Frame) -> None:
         """构建支持增量显示、复制、清屏和自动跟随的日志终端。"""
@@ -497,7 +504,8 @@ class RLDesktopApp:
         """选择训练运行方式并刷新按钮样式和安全提示。"""
         self.mode.set(mode_id)
         self._paint_mode_buttons()
-        self.form_message.set("真实训练会调用 OpenCLI 和 GPU 仿真，不会连接实体机器人" if mode_id == "real" else "")
+        self.form_message.set(
+            "真实训练由 GPT 理解动作、百炼 GLM 设计奖励，并启动 GPU 仿真" if mode_id == "real" else "")
 
     def _update_char_count(self, _event: Optional[tk.Event] = None) -> None:
         """统计动作描述字符数并限制输入最大长度。"""
@@ -547,6 +555,25 @@ class RLDesktopApp:
         except (JobValidationError, KeyError) as exc:
             messagebox.showerror("停止失败", str(exc), parent=self.root)
 
+    def _resume_job(self) -> None:
+        """从当前人工复核作业的 checkpoint 和 rollout 恢复自动闭环。"""
+        if not self.current_job_id or not self.current_job or not self.current_job.get("can_resume"):
+            return
+        self.resume_button.configure(state="disabled")
+        try:
+            job = self.manager.resume_job(self.current_job_id)
+        except (JobValidationError, KeyError) as exc:
+            messagebox.showerror("恢复失败", str(exc), parent=self.root)
+            self.resume_button.configure(state="normal")
+            return
+        self.current_job_id = job["job_id"]
+        self.current_job = job
+        self.log_offset = 0
+        self._clear_log()
+        self._render_job(job)
+        self._poll_log()
+        self._refresh_history()
+
     def _render_job(self, job: Dict[str, Any]) -> None:
         """把最新作业信息渲染到状态、进度、事实和阶段控件。"""
         self.current_job = job
@@ -561,9 +588,13 @@ class RLDesktopApp:
         self.task_id_text.set(str(job.get("task_id", "--")))
         self.robot_text.set(str(job.get("robot", "--")).upper())
         self.mode_text.set("真实训练" if job.get("mode") == "real" else "离线演练")
-        self.telemetry_task.configure(text=_shorten(str(job.get("task", "")), 80))
+        telemetry = str(job.get("task", ""))
+        if status == "review" and job.get("review_reason"):
+            telemetry = "复核原因：" + str(job["review_reason"])
+        self.telemetry_task.configure(text=_shorten(telemetry, 120))
         self.progress_dial.set_progress(progress, stage)
         self.stop_button.configure(state="normal" if job.get("can_stop") else "disabled")
+        self.resume_button.configure(state="normal" if job.get("can_resume") else "disabled")
         active = status in ("queued", "running", "stopping")
         self._set_launch_available(not active)
         for item in self.stage_widgets:

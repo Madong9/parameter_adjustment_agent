@@ -99,6 +99,25 @@ def test_checkpoint_discovery_and_resume(tmp_path):
     assert CheckpointManager.latest(tmp_path).name == "model_100.pt"
 
 
+def test_checkpoint_pruning_keeps_latest_per_run_and_protected_file(tmp_path):
+    """验证中间 checkpoint 会按运行目录裁剪，同时保留显式保护的恢复点。"""
+    first = tmp_path / "seed-1"
+    second = tmp_path / "seed-2"
+    first.mkdir()
+    second.mkdir()
+    for directory in (first, second):
+        for value in (50, 100, 150):
+            (directory / ("model_%d.pt" % value)).write_text("x")
+
+    removed = CheckpointManager.prune(
+        tmp_path, keep_per_run=1, protected=[first / "model_50.pt"])
+
+    assert {path.name for path in first.glob("model_*.pt")} == {
+        "model_50.pt", "model_150.pt"}
+    assert {path.name for path in second.glob("model_*.pt")} == {"model_150.pt"}
+    assert len(removed) == 3
+
+
 def test_early_stop_patterns_and_metrics(tmp_path):
     """验证“early stop patterns and metrics”场景的预期行为。"""
     log = tmp_path / "stdout.log"

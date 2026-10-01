@@ -66,11 +66,13 @@ class TrainingController:
         return self._status.get(experiment_id, "unknown")
 
     def run_evaluation_rollouts(self, experiment_id: str, robot: str, config: Path, checkpoint: Path,
-                                output_dir: Path, seed: int, fps: int, seconds: float = 10.0) -> ProcessResult:
+                                output_dir: Path, seed: int, fps: int, seconds: float = 10.0,
+                                command_override: Optional[dict] = None) -> ProcessResult:
         """运行确定性仿真并保存同步评估材料。"""
         latest = self.load_checkpoint(checkpoint)
         output_dir.mkdir(parents=True, exist_ok=True)
-        command = self.adapter.rollout_command(robot, config, latest, output_dir, seed, fps, seconds)
+        command = self.adapter.rollout_command(
+            robot, config, latest, output_dir, seed, fps, seconds, command_override)
         return self.process_manager.run(command, self.adapter.training_root, output_dir,
                                         min(self.timeout_seconds, 3600))
 

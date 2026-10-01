@@ -48,7 +48,76 @@ def test_state_presentation_uses_chinese_stages():
         "progress": 25,
         "stage_label": "生成奖励候选",
     }
+    assert state_presentation("TASK_UNDERSTANDING")["stage_label"] == "GPT 理解动作目标"
+    assert state_presentation("TASK_FEASIBILITY_CHECK")["stage_label"] == "预检动作可行性"
+    assert state_presentation("MEMORY_CURATING")["progress"] == 99
     assert state_presentation("COMPLETED")["progress"] == 100
+
+
+def test_config_payload_exposes_multi_agent_and_memory_status(tmp_path):
+    """验证上位机能够展示分阶段 Provider、RAG 和长期记忆状态。"""
+    payload = JobManager(_settings(tmp_path)).config_payload()
+    providers = payload["system"]["providers"]
+    assert providers["mode"] == "multi-agent"
+    assert providers["task_planner"] == "opencli-doubao"
+    assert providers["reward_designer"] == "bailian"
+    assert payload["system"]["memory"]["records"] == 0
+    assert payload["system"]["rag"]["enabled"]
+
+
+def test_strategy_playback_only_launches_verified_real_success(tmp_path, monkeypatch):
+    """验证上位机只为真实联合验收成功策略启动隔离 Viewer 命令。"""
+    settings = _settings(tmp_path)
+    training_root = tmp_path / "unitree_rl_gym"
+    training_root.mkdir()
+    settings.training_project = str(training_root)
+    manager = JobManager(settings)
+    task_id = "task-a1b2c3d4e5"
+    task_dir = settings.experiments_path / task_id
+    final_dir = task_dir / "final"
+    final_dir.mkdir(parents=True)
+    (final_dir / "checkpoint.pt").write_bytes(b"test checkpoint")
+    (final_dir / "config.yaml").write_text("{}", encoding="utf-8")
+    (task_dir / "state.json").write_text(json.dumps({"state": "COMPLETED", "updated_at": "2026-01-01"}),
+                                          encoding="utf-8")
+    (task_dir / "summary.json").write_text(json.dumps({
+        "state": "COMPLETED", "result": "completed", "dry_run": False,
+        "checkpoint": "final/checkpoint.pt", "config": "final/config.yaml",
+        "selected_experiment": "candidate-01-v01",
+    }), encoding="utf-8")
+    (task_dir / "task_spec.json").write_text(json.dumps({"robot": "go2"}), encoding="utf-8")
+
+    class FakeProcess:
+        """提供不依赖 Isaac Gym 的播放进程桩。"""
+
+        pid = 3456
+
+        def poll(self):
+            """保持进程运行以验证界面状态。"""
+            return None
+
+    captured = {}
+
+    def fake_popen(command, **kwargs):
+        """记录启动参数，确保播放器使用 argv 且不经过 shell。"""
+        captured["command"] = command
+        captured.update(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr("rl_training_agent.web_ui.subprocess.Popen", fake_popen)
+    assert [item["task_id"] for item in manager.list_playable_experiments()] == [task_id]
+    result = manager.start_playback(task_id)
+    assert result["pid"] == 3456
+    assert "--task" in captured["command"] and "go2" in captured["command"]
+    assert captured["shell"] is False
+    assert manager.playback_status()["running"]
+
+    summary = json.loads((task_dir / "summary.json").read_text(encoding="utf-8"))
+    summary["dry_run"] = True
+    (task_dir / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    assert manager.list_playable_experiments() == []
+    with pytest.raises(JobValidationError, match="真实训练"):
+        manager.start_playback(task_id)
 
 
 def test_human_review_is_not_reported_as_completed_training():
@@ -113,6 +182,60 @@ def test_job_exposes_closed_loop_round_and_reward_version(tmp_path):
     assert "奖励 v3" in job["stage_label"]
 
 
+def test_review_job_exposes_reason_and_launches_checkpoint_resume(tmp_path, monkeypatch):
+    """验证上位机显示复核原因，并从当前 checkpoint 启动恢复命令而非重跑任务。"""
+    settings = _settings(tmp_path)
+    manager = JobManager(settings)
+    source_id = "a1b2c3d4e5f6"
+    task_id = "task-resume"
+    started = "2026-01-01T00:00:00+00:00"
+    manager._jobs[source_id] = {
+        "job_id": source_id, "task_id": task_id, "task": "前腿站立行走", "robot": "go2",
+        "mode": "real", "status": "review", "return_code": 0, "created_at": started,
+        "started_at": started, "finished_at": started, "message": "等待人工复核",
+    }
+    task_dir = settings.experiments_path / task_id
+    candidate = task_dir / "candidates" / "candidate-v03"
+    candidate.mkdir(parents=True)
+    (candidate / "reward_plan.json").write_text("{}", encoding="utf-8")
+    (task_dir / "state.json").write_text(json.dumps({
+        "state": "HUMAN_REVIEW", "updated_at": "2026-01-02T00:00:00+00:00",
+        "history": [{"state": "FULL_TRAINING", "at": started}],
+    }), encoding="utf-8")
+    (task_dir / "summary.json").write_text(json.dumps({
+        "selected_experiment": "candidate-v03", "reason": "视觉 Provider 暂时不可用",
+    }), encoding="utf-8")
+    captured = {}
+
+    class RunningProcess:
+        """模拟持续运行的恢复子进程，避免测试期间立刻改变作业终态。"""
+
+        pid = 54321
+
+        def wait(self):
+            """等待测试释放恢复进程。"""
+            time.sleep(0.2)
+            return 0
+
+        def poll(self):
+            """报告恢复进程仍在运行。"""
+            return None
+
+    def fake_popen(command, **kwargs):
+        """捕获上位机生成的恢复命令。"""
+        captured["command"] = command
+        return RunningProcess()
+
+    monkeypatch.setattr("rl_training_agent.web_ui.subprocess.Popen", fake_popen)
+    source = manager.get_job(source_id)
+    assert source["can_resume"]
+    assert source["review_reason"] == "视觉 Provider 暂时不可用"
+    resumed = manager.resume_job(source_id)
+    assert resumed["resume_of"] == source_id
+    assert "resume" in captured["command"] and "train" not in captured["command"]
+    assert captured["command"][captured["command"].index("--task-id") + 1] == task_id
+
+
 def test_training_iteration_advances_stage_progress_across_full_seeds():
     """验证完整训练的种子和内部迭代会共同推进上位机总进度。"""
     detail = {"run_name": "candidate-01-v01-seed-2", "percent": 50.0}
@@ -168,6 +291,7 @@ def test_http_server_serves_ui_and_rejects_invalid_job(tmp_path):
         with urlopen(base_url + "/", timeout=3) as response:
             page = response.read().decode("utf-8")
         assert "强化学习上位机" in page
+        assert "动作可行性" in page and "四层记忆" in page
         request = Request(
             base_url + "/api/jobs",
             data=json.dumps({"task": "跑", "robot": "go2", "mode": "dry-run"}).encode("utf-8"),
@@ -183,13 +307,111 @@ def test_http_server_serves_ui_and_rejects_invalid_job(tmp_path):
         thread.join(timeout=3)
 
 
-def test_job_manager_prevents_concurrent_training(tmp_path):
-    """验证上位机拒绝并行启动多个可能争抢 GPU 的训练作业。"""
+def test_job_manager_persists_job_when_gpu_pool_is_full(tmp_path):
+    """验证 GPU 池占满时新作业进入持久等待队列，而不是争抢设备。"""
     manager = JobManager(_settings(tmp_path))
     manager._jobs["012345abcdef"] = {
         "job_id": "012345abcdef",
         "status": "running",
         "created_at": "2026-01-01T00:00:00+00:00",
     }
-    with pytest.raises(JobValidationError, match="已有训练作业"):
-        manager.start_job({"task": "训练机器狗稳定向前行走", "robot": "go2", "mode": "dry-run"})
+    job = manager.start_job({"task": "训练机器狗稳定向前行走", "robot": "go2", "mode": "dry-run"})
+    assert job["status"] == "queued" and job["gpu_id"] is None
+    persisted = settings_path = manager.root / job["job_id"] / "job.json"
+    assert persisted.is_file() and json.loads(settings_path.read_text())["command"]
+
+
+def test_job_exposes_feasibility_and_memory_summaries(tmp_path):
+    """验证上位机只返回当前作业的分层可行性摘要与记忆晋升状态。"""
+    settings = _settings(tmp_path)
+    manager = JobManager(settings)
+    job_id = "abc123abc123"
+    task_id = "task-feasible"
+    manager._jobs[job_id] = {
+        "job_id": job_id, "task_id": task_id, "task": "Go2 倒退走 0.3m/s",
+        "robot": "go2", "mode": "real", "status": "completed", "return_code": 0,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "finished_at": "2026-01-01T00:01:00+00:00", "message": "流程结束",
+    }
+    task_dir = settings.experiments_path / task_id
+    (task_dir / "memory").mkdir(parents=True)
+    (task_dir / "feasibility_report.json").write_text(json.dumps({
+        "status": "PHYSICS_VALIDATED", "validation_level": "DYNAMIC_PHYSICS_VALIDATED",
+        "feasibility_level": "LEVEL_5_PHYSICS", "motion_type": "LOCOMOTION",
+        "confidence": 0.9, "motion_constraint_spec": {
+            "motion_type": "LOCOMOTION", "duration": 5.0,
+            "required_planners": ["gait", "com"],
+        },
+        "planning_report": {"status": "READY_FOR_SOLVER", "components": [
+            {"planner": "gait", "status": "GENERATED"},
+            {"planner": "com", "status": "GENERATED"},
+        ]},
+        "whole_body_report": {"status": "READY_FOR_PHYSICS", "missing_solvers": []},
+        "training_admission": {"decision": "ALLOW_TRAINING", "scope": "simulation_only"},
+        "physics_report": {"backend": "isaacgym", "validation_level": "DYNAMIC_PHYSICS_VALIDATED"},
+    }), encoding="utf-8")
+    (task_dir / "memory" / "working_memory.json").write_text(json.dumps({
+        "state": "MEMORY_CURATING", "loop_round": 2, "reward_version": 3,
+    }), encoding="utf-8")
+    (task_dir / "memory" / "promotion.json").write_text(json.dumps({
+        "promoted": True, "memory_id": "memory-demo", "reason": "联合验收通过",
+    }), encoding="utf-8")
+
+    job = manager.get_job(job_id)
+    assert job["feasibility"]["validation_level"] == "DYNAMIC_PHYSICS_VALIDATED"
+    assert job["feasibility"]["component_status"]["gait"] == "GENERATED"
+    assert job["feasibility"]["viewer_available"]
+    assert job["feasibility"]["training_admission"]["decision"] == "ALLOW_TRAINING"
+    assert job["memory_detail"] == {
+        "working_available": True, "working_state": "MEMORY_CURATING",
+        "loop_round": 2, "reward_version": 3, "promoted": True,
+        "promotion_reason": "联合验收通过", "memory_id": "memory-demo",
+    }
+
+
+def test_feasibility_view_uses_safe_cli_command(tmp_path, monkeypatch):
+    """验证可行性观察窗口只通过固定 argv 启动，并与策略 Viewer 共用互斥状态。"""
+    settings = _settings(tmp_path)
+    manager = JobManager(settings)
+    job_id = "def456def456"
+    task_id = "task-viewable"
+    manager._jobs[job_id] = {
+        "job_id": job_id, "task_id": task_id, "task": "Go2 倒退走 0.3m/s",
+        "robot": "go2", "mode": "real", "status": "completed", "return_code": 0,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "finished_at": "2026-01-01T00:01:00+00:00", "message": "流程结束",
+    }
+    task_dir = settings.experiments_path / task_id
+    task_dir.mkdir(parents=True)
+    (task_dir / "feasibility_report.json").write_text(json.dumps({
+        "status": "CAPABILITY_SUPPORTED", "validation_level": "CAPABILITY_ONLY",
+        "motion_type": "LOCOMOTION", "motion_constraint_spec": {
+            "motion_type": "LOCOMOTION", "duration": 4.0,
+        },
+    }), encoding="utf-8")
+
+    class FakeProcess:
+        """模拟持续运行的可行性 Viewer。"""
+        pid = 6789
+
+        def poll(self):
+            """报告 Viewer 仍在运行。"""
+            return None
+
+    captured = {}
+
+    def fake_popen(command, **kwargs):
+        """记录安全启动参数。"""
+        captured["command"] = command
+        captured.update(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr("rl_training_agent.web_ui.subprocess.Popen", fake_popen)
+    result = manager.start_feasibility_view(job_id)
+    assert result["kind"] == "feasibility" and result["pid"] == 6789
+    assert "feasibility-view" in captured["command"]
+    assert captured["command"][captured["command"].index("--max-seconds") + 1] == "4.0"
+    assert captured["shell"] is False
+    assert manager.playback_status()["kind"] == "feasibility"

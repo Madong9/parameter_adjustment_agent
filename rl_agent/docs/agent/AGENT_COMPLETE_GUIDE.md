@@ -58,16 +58,19 @@
 | --- | --- | --- | --- | --- |
 | 协调器 | `TrainingOrchestrator` | 用户请求、状态、预算和证据 | 状态转换、实验、恢复点 | 唯一流程控制者 |
 | 任务理解 Agent | GPT / OpenCLI | 动作原文、机器人 | `TaskIntentSpec` | 不生成训练命令 |
+| Task Feasibility Pipeline | 本地规则 + 语义阶段 Provider + Pinocchio + Unitree Isaac Gym | TaskIntent、精简环境清单、Go2 PPO 机器人配置 | `CompleteFeasibilityReport` | 复用 PPO 环境做短时 sanity check；动态动作覆盖不足或 Mock 均不放行 |
 | 上下文构建器 | 本地代码 | 能力清单、RAG、记忆 | 限长上下文快照 | 会删除源码绝对路径 |
 | 提示词编译器 | 本地固定模板 | TaskIntent、上下文 | 版本化提示词和 SHA-256 | 模型不能修改模板版本 |
 | 奖励设计 Agent | 百炼 GLM | 编译提示词 | `TaskRewardBundle` | 只能使用结构化 JSON |
-| 奖励审查 Agent | 本地代码 | 任务、候选、注册表 | `RewardReviewReport` | 不直接修正候选 |
+| 奖励审查 Agent | 本地代码 | 任务、逐个候选、注册表 | 逐候选 `RewardReviewReport` | 隔离失败候选，合格候选继续；不直接修正 |
 | 奖励编译器 | 本地代码 | 已审核 `RewardPlan` | 独立训练配置和 diff | 只允许注册奖励 |
 | PPO 训练器 | Unitree RL Gym | 配置、种子、预算 | checkpoint、日志、指标 | 受限命令参数数组 |
 | 数值评估器 | 本地代码 | 多 rollout 轨迹和指标 | `EvaluationResult` 数值门 | 最终安全裁决的一部分 |
 | 视觉评估 Agent | GPT / OpenCLI | TaskSpec、同步视觉材料 | `VisualBehaviorReport` | 不读取奖励设计 RAG |
 | 诊断与修订 Agent | 百炼 GLM | 数值、视觉、PPO、预算、历史 | `TrainingDiagnosis` | 修改必须再次本地校验 |
-| 记忆整理 Agent | 本地代码 | 最终实验和证据 | 情景记忆或拒绝原因 | dry-run/人工审核不得晋升 |
+| Reward Experience Agent | `diagnosis_provider`（默认百炼 GLM）+ 本地代码 | 资格门控通过的精简证据包 | `RewardExperienceNarrative` | 只归纳文字，不改 reward/metric |
+| Memory Validator | 本地代码 | Reward Experience、原始文件和 SHA-256 | 通过/拒绝 | 复核奖励差异、指标、任务和 evidence ID |
+| 记忆整理 Agent | 本地代码 | 通过 Validator 的经验和多种子结果 | 情景记忆或拒绝原因 | dry-run/INCONCLUSIVE 不得晋升 |
 | 语义整理 Agent | 本地代码 | 多条情景记忆 | 候选或活跃规律 | 需要独立证据阈值 |
 | 程序记忆 Agent | 本地代码 | Prompt、Schema、规则 | 程序快照 | 不保存自由对话 |
 
@@ -78,6 +81,7 @@
 奖励设计      -> 百炼 GLM
 视觉评估      -> GPT / OpenCLI
 训练诊断      -> 百炼 GLM
+奖励经验归纳  -> `diagnosis_provider`（默认百炼 GLM）
 安全与完成判定 -> 本地确定性代码
 ```
 
@@ -95,10 +99,12 @@
 
 1. 任务理解 Agent 将原文转换为 `TaskIntentSpec`。
 2. 本地协调器重新写回用户原始指令和机器人，防止模型改写任务身份。
-3. RAG 检索项目文档和白名单历史实验。
-4. 长期记忆检索活跃情景记忆和活跃语义规律。
-5. `ContextBuilder` 合并环境、机器人、RAG 和记忆，生成紧凑上下文。
-6. 上下文声明历史内容只是只读证据，不能覆盖当前安全规则和 Schema。
+3. `FeasibilityPipeline` 用本地机器人/环境资产检查能力，并生成不含关节角的高层动作原型。
+4. 真实 Pinocchio 根据脚端笛卡尔目标求 IK；`IsaacGymFeasibilityValidator` 加载 Unitree task_registry 的真实 Go2 PPO 环境，以其 URDF、控制器、action scale、decimation 和 PhysX 配置做短时 rollout。只创建环境，不创建 PPO runner、不训练策略。
+5. 报告同时记录 `LEVEL_0_LANGUAGE` 至 `LEVEL_6_OPTIONAL_RL_PROBE` 证据层级和逐阶段 backend/指标/来源。只有覆盖目标动作的真实物理验证通过才可能继续；能力不足、Mock、`CONDITIONAL`、`INCONCLUSIVE`、模型缺失或真实物理探针失败均进入 `HUMAN_REVIEW`。只有能力清单明确确认 `UNSUPPORTED` 才进入 `FAILED`。报告保存为 `feasibility_report.json`，状态事件写入 `events.jsonl`。
+6. RAG 检索项目文档和白名单历史实验，长期记忆检索活跃情景记忆和语义规律。
+7. `ContextBuilder` 合并环境、机器人、RAG 和记忆，生成紧凑上下文。
+8. 上下文声明历史内容只是只读证据，不能覆盖当前安全规则和 Schema。
 
 ### 5.3 奖励设计与训练前审查
 
@@ -188,6 +194,7 @@ Schema 位于 `rl_training_agent/schemas/`。模型回复必须先通过 Schema�
 RECEIVED
 ENVIRONMENT_INSPECTED
 TASK_UNDERSTANDING
+TASK_FEASIBILITY_CHECK
 RAG_RETRIEVING
 CONTEXT_BUILDING
 PROMPT_COMPILING
@@ -198,6 +205,8 @@ REWARD_CANDIDATES_CREATED
 CONFIGS_COMPILED
 VALIDATED
 ```
+
+可行性状态依动作类别经过 `MOTION_PROTOTYPE_GENERATING`，再进入 `STATIC_MOTION_VALIDATION` 或 `DYNAMIC_MOTION_VALIDATION`。只有覆盖用户目标的真实物理验证才能进入 `RAG_RETRIEVING`/`CONTEXT_BUILDING`；能力证据不足、Mock、动作类型未覆盖、`PHYSICS_FAILED` 或需要澄清进入 `HUMAN_REVIEW`；只有确定性能力检查明确 `UNSUPPORTED` 进入 `FAILED`。dry-run 可用 Mock 演练，但不会调用真实奖励设计/PPO。当前动态后端仅对 Go2 线速度任务运行开环关节探针；`FootTrajectory` 尚未逐帧经 IK 接入仿真，因此探针即使通过仍是 `CONDITIONAL`，不能自动放行训练。跳跃/特技只生成阶段骨架，单腿/倒立候选搜索尚未执行；转向和操控不能借用 trot validator。动态任务在奖励配置编译后另行写入 `training_readiness.json`；需要真实动态验证、编译奖励配置和确定性评估指标同时存在。可行性阶段状态操作使用 run-scoped `operation_id`，并写入 JSONL。详细限制见 [`TASK_FEASIBILITY.md`](TASK_FEASIBILITY.md)。
 
 ### 7.2 训练与评估阶段
 
@@ -259,7 +268,7 @@ RAG 是项目资料和原始历史实验的检索层，不等同于长期记忆�
 | 层级 | 保存内容 | 保存位置 | 晋升规则 |
 | --- | --- | --- | --- |
 | 工作记忆 | 当前状态、轮次、奖励版本、预算、最新评估和诊断 | 任务目录 | 随当前任务持续更新 |
-| 情景记忆 | 某机器人某动作的一次验证实验 | `artifacts/memory/records/` | 成功联合验收或明确失败模式，且多种子一致 |
+| 情景记忆 | 某机器人某动作的一次验证实验与 `RewardExperience` | `artifacts/memory/records/` | 真实 PPO、确定性资格门控、Validator 和多种子一致 |
 | 语义记忆 | 跨任务通用规律 | `artifacts/memory/semantic/` | 独立任务证据达到阈值 |
 | 程序记忆 | Prompt、Schema、校验和诊断策略 | `artifacts/memory/procedural/` | 每个程序版本确定性快照 |
 
@@ -271,6 +280,8 @@ RAG 是项目资料和原始历史实验的检索层，不等同于长期记忆�
 - 单随机种子；
 - 缺少最终任务、奖励、闭环或评估文件；
 - 没有确定性证据的普通失败。
+
+训练终态判定之后，先由 `RewardExperienceEvidenceBuilder` 从任务、父子奖励配置、训练 manifest、checkpoint 路径、数值文件和视觉报告生成带哈希的精简证据包。`ExperienceEligibilityChecker` 将结局分类为 `SUCCESS`、`VERIFIED_FAILURE` 或 `INCONCLUSIVE`；只有前两者才调用 `Reward Experience Agent`。模型仅返回观察事实、假设、同期行为变化、局部模式和限制，奖励差异与指标始终由本地文件确定。`RewardExperienceValidator` 复核文件哈希、逐项 reward diff、评估内容、任务身份、证据引用和明显因果/泛化措辞；通过后才交给既有 `MemoryCuratorAgent`。详见 [`REWARD_EXPERIENCE.md`](REWARD_EXPERIENCE.md)。
 
 遗忘不会删除证据。低可信、过期或超容量记录被标记为 `archived`，保存归档原因，不再参与检索。
 

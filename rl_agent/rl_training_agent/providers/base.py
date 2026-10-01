@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Protocol, Type, TypeVar
 
 from pydantic import BaseModel
 
+from ..schemas.agent_workflow import TaskIntentSpec
+from ..feasibility.motion_prototype.schema import MotionPrototype
 from ..schemas.decisions import TrainingDiagnosis
 from ..schemas.experiments import ConversationHandle, ProviderHealth
 from ..schemas.rewards import RewardPlan
@@ -36,6 +38,15 @@ class LLMReasoningProvider(Protocol):
     def design_task_and_rewards(self, instruction: str, robot: str, capabilities: Dict[str, Any]) -> Dict[str, Any]:
         """依据任务描述和环境能力生成任务规格与奖励候选。"""
         ...
+    def understand_task(self, instruction: str, robot: str) -> TaskIntentSpec:
+        """把自然语言动作输入转换为结构化任务意图。"""
+        ...
+    def generate_motion_prototype(self, intent: TaskIntentSpec) -> MotionPrototype:
+        """生成不含关节角的高层动作阶段语义。"""
+        ...
+    def design_task_bundle(self, compiled_prompt: str) -> Dict[str, Any]:
+        """执行本地固定模板编译后的奖励设计请求。"""
+        ...
     def design_visual_evaluation(self, task: TaskSpec) -> Dict[str, Any]:
         """为任务生成视觉评估输入与事件设计。"""
         ...
@@ -45,7 +56,9 @@ class LLMReasoningProvider(Protocol):
     def diagnose_training(self, payload: Dict[str, Any]) -> TrainingDiagnosis:
         """融合视觉、物理和 PPO 证据生成训练诊断。"""
         ...
+    def summarize_reward_experience(self, payload: Dict[str, Any]) -> Any:
+        """从精简证据中生成带证据引用的奖励经验文字叙述。"""
+        ...
     def close(self) -> None:
         """释放 Provider 持有或绑定的浏览器资源。"""
         ...
-

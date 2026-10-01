@@ -71,7 +71,7 @@
               <span>离线演练</span><small>模拟完整流程 · 无需 GPU</small>
             </button>
             <button type="button" data-mode="real" role="radio" aria-checked="false">
-              <span>真实训练</span><small>OpenCLI 推理 · GPU 仿真</small>
+              <span>真实训练</span><small>GPT + 百炼 GLM · GPU 仿真</small>
             </button>
           </div>
           <div class="safety-note" id="modeNote">
@@ -122,6 +122,7 @@
               <div data-threshold="89"><i></i><span>视觉评估</span></div>
               <div data-threshold="100"><i></i><span>训练完成</span></div>
             </div>
+            <div class="review-reason hidden" id="reviewReason" role="status"></div>
             <div class="training-controls">
               <button class="resume-button hidden" id="resumeButton" type="button" disabled>
                 <i aria-hidden="true">↻</i><span>从当前策略继续闭环</span>
@@ -131,6 +132,41 @@
               </button>
             </div>
           </div>
+        </article>
+      </section>
+
+      <section class="insight-grid" aria-label="智能体内部状态">
+        <article class="panel insight-panel" id="feasibilityPanel">
+          <div class="panel-heading">
+            <div><span class="step-number">PHY</span><h2>动作可行性</h2></div>
+            <span class="insight-badge pending" id="feasibilityStatus">等待报告</span>
+          </div>
+          <p class="insight-lead" id="feasibilitySummary">下发任务后，将显示从动作约束、确定性规划、全身求解到物理验证的证据等级。</p>
+          <div class="evidence-ladder" aria-label="可行性证据链">
+            <div><span>动作类型</span><b id="feasibilityMotion">—</b></div>
+            <div><span>约束规格</span><b id="feasibilityConstraint">—</b></div>
+            <div><span>确定性规划</span><b id="feasibilityPlanning">—</b></div>
+            <div><span>全身求解</span><b id="feasibilityWholeBody">—</b></div>
+            <div><span>物理验证</span><b id="feasibilityPhysics">—</b></div>
+          </div>
+          <div class="component-chips" id="feasibilityComponents"></div>
+          <p class="insight-note" id="feasibilityReason">这里显示的是训练前可行性证据，不代表机器人已经学会动作。</p>
+          <button class="viewer-button" id="feasibilityViewButton" type="button" disabled>在 Isaac Gym 中观察检验</button>
+        </article>
+
+        <article class="panel insight-panel" id="memoryPanel">
+          <div class="panel-heading">
+            <div><span class="step-number">MEM</span><h2>四层记忆</h2></div>
+            <span class="insight-badge pending" id="memoryEnabled">读取中</span>
+          </div>
+          <p class="insight-lead">只把通过证据门控的成功经验或已验证失败写入长期记忆；超时、格式错误和证据不足不会晋升。</p>
+          <div class="memory-grid">
+            <div><span>工作记忆</span><b id="memoryWorking">等待任务</b><small>当前闭环状态与奖励版本</small></div>
+            <div><span>情景记忆</span><b id="memoryEpisodic">0</b><small>通过门控的单次实验</small></div>
+            <div><span>语义记忆</span><b id="memorySemantic">0</b><small>跨实验验证的规律</small></div>
+            <div><span>程序记忆</span><b id="memoryProcedural">未生成</b><small>流程、Schema 与策略快照</small></div>
+          </div>
+          <p class="insight-note" id="memoryPromotion">当前任务尚无长期记忆晋升结论。</p>
         </article>
       </section>
 
@@ -161,6 +197,14 @@
           <div class="history-list" id="historyList">
             <div class="history-loading">正在读取实验记录…</div>
           </div>
+          <div class="playback-controls">
+            <label class="sr-only" for="playStrategySelect">选择已成功训练的策略</label>
+            <select id="playStrategySelect" aria-label="选择已成功训练的策略">
+              <option value="">暂无可播放的成功策略</option>
+            </select>
+            <button type="button" id="playStrategyButton" disabled>▶ 播放策略</button>
+          </div>
+          <p class="playback-note" id="playbackNote">仅显示已通过联合验收的真实训练策略；播放将在仿真 Viewer 中运行。</p>
         </article>
       </section>
     </main>

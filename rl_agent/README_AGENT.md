@@ -1,6 +1,8 @@
 # 自然语言四足机器人强化学习训练 Agent
 
-本项目把自然语言动作要求转换为可验证的强化学习实验：GPT/OpenCLI 任务理解 Agent 先在“聊天”模式输出 `TaskIntentSpec`，GPT 不可用时由豆包“对话”模式自动接管。本地上下文构建器合并机器人环境、RAG 和四层记忆，再由固定模板编译提示词并调用百炼 GLM 奖励设计 Agent。候选经过独立奖励审查和本地安全编译后进入 PPO 训练，最后由确定性数值评估与 GPT/豆包多模态视觉评估联合验收。未通过时由 GLM 诊断和修订，完成后只有经过严格门控的成功经验或明确失败模式才能进入长期记忆。
+本项目把自然语言动作要求转换为可审计的强化学习实验：GPT/OpenCLI 任务理解 Agent 先输出 `TaskIntentSpec`，训练前 `Task Feasibility Pipeline` 按能力、运动学、静态几何/动力学、轨迹和物理证据分层。报告明确区分真实 backend、Pinocchio 与 Mock；缺失数据为 `UNKNOWN/INCONCLUSIVE`。Go2 预检复用 PPO 注册环境和 URDF，不依赖转换 MJCF，不创建 PPO runner、不训练策略。动态原型包含 gait 与 `FootTrajectory`；Go2 直线行走链会逐策略步采样足端目标，经 Pinocchio 多脚 IK 和轨迹限位检查生成 joint reference，再进入 Isaac Gym position-action rollout。只有覆盖目标时长且速度、稳定性、接触、关节和力矩检查全部通过，才会报告真实动态物理通过。单腿/倒立、跳跃/特技、转向和操控按各自能力报告，不复用错误验证器。训练准入与探针证据独立：默认允许能力和仿真环境已确认的任务进行有限预算探索，探针失败仍保持 `PHYSICS_FAILED`；缺失必要能力或真实环境证据不会放行。本地上下文构建器合并动作约束、探针风险、准入预算、环境、RAG 和四层记忆，再调用百炼 GLM 设计奖励，独立审查/编译后进入 PPO 训练，最后由数值与视觉评估联合验收。
+
+训练准入配置在 `config/agent.yaml`：`feasibility_admission_mode: budgeted_exploration` 默认最多允许探索 `3000` 次累计 PPO 迭代、`1` 次奖励修订；改为 `strict` 则必须目标物理探针通过。实际额度取任务预算和本地上限的较小值，恢复不会重置额度。上位机分别显示物理结果与准入决定；详见 [训练前动作预检与准入](docs/agent/TASK_FEASIBILITY.md)。这不是自动降低验收标准，也不代表已学会动作。
 
 当前主要操作入口是本地桌面上位机。所有项目配置均使用相对路径，项目目录整体移动或上传后无需修改主机路径。
 
@@ -11,6 +13,8 @@
 新版图同时提供可编辑的 Mermaid 源文件：`docs/agent/images/rl-agent-architecture-v2.mmd`。完整的模块、协议、状态机、闭环、产物、安全边界和后续路线图见 `docs/agent/AGENT_COMPLETE_GUIDE.md`。
 
 该系统采用自研的确定性状态机编排多 Agent 闭环，没有依赖 LangGraph、CrewAI 等 Agent 编排框架。GPT 负责动作理解和独立视觉评价，百炼 GLM 负责奖励设计与训练诊断；本地协调器负责上下文构建、提示词编译、奖励审查、安全校验、训练执行、确定性验收、四层记忆治理、状态持久化和断点恢复。各模型 Agent 按步骤串行协作，通过结构化 JSON 交接；PPO 和最终安全判定由本地流程控制。
+
+训练前动作可行性预检的模块、状态门控、依赖降级和当前真实能力限制见 [`docs/agent/TASK_FEASIBILITY.md`](docs/agent/TASK_FEASIBILITY.md)。
 
 ## 快速启动
 
@@ -56,9 +60,10 @@ DASHSCOPE_API_KEY="你的百炼 API Key"
 1. 输入希望训练的动作、速度、地形和禁止行为。
 2. 选择与训练配置对应的机器人。
 3. 选择“离线演练”或“真实训练”，点击“下发训练任务”。
-4. 在“学习遥测”查看任务理解、经验检索、GLM 奖励设计、奖励审查、训练、评估和记忆整理阶段，在“运行日志”查看实时信息。
-5. 只有状态为“训练完成”时，才表示视觉目标、任务物理指标与硬安全约束全部通过。
-6. “等待人工复核”会显示具体原因。如果已有可恢复 checkpoint，点击“从当前策略继续闭环”即可复用既有奖励版本、checkpoint 和已采集 rollout，不会从头重复初始训练。
+4. 在“学习遥测”查看任务理解、可行性预检、经验检索、奖励设计、训练、评估和记忆整理阶段，在“动作可行性”查看约束→规划→全身求解→物理证据链。
+5. 在“四层记忆”查看当前任务工作记忆、晋升原因，以及全局情景/语义/程序记忆状态。
+6. 只有状态为“训练完成”时，才表示视觉目标、任务物理指标与硬安全约束全部通过。
+7. “等待人工复核”会显示具体原因。如果已有可恢复 checkpoint，点击“从当前策略继续闭环”即可复用既有奖励版本、checkpoint 和已采集 rollout，不会从头重复初始训练。
 
 状态含义：
 
@@ -78,6 +83,18 @@ python -m rl_training_agent play \
 ```
 
 `task-id` 可从上位机“实验编号”读取。`play` 会自动使用 checkpoint 同目录中的编译配置。路径必须位于该任务目录内，并使用相对于 `rl_agent` 的路径。
+
+查看训练前动态可行性检验过程（不是播放已训练策略）：
+
+```bash
+python -m rl_training_agent feasibility-view \
+  --task "Go2 倒退走 0.3m/s 5秒" \
+  --robot go2 \
+  --max-seconds 5
+```
+
+该命令会打开 Isaac Gym Viewer，并在结束后输出确定性指标；当前只支持 Go2 前进/后退动作。完整边界见 [`docs/agent/TASK_FEASIBILITY.md`](docs/agent/TASK_FEASIBILITY.md)。
+
 
 ## 清理实验磁盘空间
 
@@ -168,7 +185,7 @@ rl_agent/
 │   ├── web/                      # 上位机 HTML、CSS 与 JavaScript
 │   ├── orchestration/            # 训练状态机、预算与自动闭环编排
 │   ├── agents/                   # 上下文构建、固定提示词编译和奖励审查 Agent
-│   ├── memory/                   # 四层记忆、严格晋升、语义升级和可审计遗忘
+│   ├── memory/                   # 四层记忆、奖励经验归纳、严格晋升、语义升级和遗忘
 │   ├── rag/                      # 中文分词、BM25 索引和训练经验检索
 │   ├── providers/                # OpenCLI/GPT、百炼 GLM、Mock 和角色路由
 │   ├── environment/              # Unitree 环境扫描与能力清单
@@ -193,7 +210,7 @@ rl_agent/
 
 本地 RAG 索引默认位于 `artifacts/rag/index.json`。它只索引配置中列出的奖励设计、视觉评估、安全文档和白名单实验产物，不扫描 checkpoint、视频、日志或原始 Provider 对话。设计阶段与诊断阶段的每次命中都会写入当前实验目录，便于追溯；视觉评论阶段保持独立，不接收奖励设计经验，避免评价被奖励定义锚定。
 
-记忆分为四层：当前任务的工作记忆写入 `experiments/<task-id>/memory/working_memory.json`；经过验证的情景记忆写入 `artifacts/memory/records/`；由至少两条独立任务证据升级的语义规律写入 `artifacts/memory/semantic/`；提示词、Schema、校验规则和诊断策略写入 `artifacts/memory/procedural/`。低可信、过期或超容量的情景记忆只会标记为 `archived`，不会物理删除。详细门控见 `docs/agent/MULTI_AGENT_MEMORY.md`。
+记忆分为四层：当前任务的工作记忆写入 `experiments/<task-id>/memory/working_memory.json`；经过证据包、Reward Experience Agent、Validator 和多种子门控的情景记忆写入 `artifacts/memory/records/`；由至少两条独立任务证据升级的语义规律写入 `artifacts/memory/semantic/`；提示词、Schema、校验规则和诊断策略写入 `artifacts/memory/procedural/`。经验证据及 `INCONCLUSIVE` 拒绝原因保存在各 experiment 子目录；不会把 Provider 故障和训练中断当作奖励经验。详细流程见 `docs/agent/REWARD_EXPERIENCE.md` 和 `docs/agent/MULTI_AGENT_MEMORY.md`。
 
 Agent 只执行白名单参数组成的训练、评估与播放命令，子进程使用 `shell=False`；生成奖励必须通过字段、权重、符号、物理量和任务指标覆盖检查。当前系统仅负责仿真训练，不具备实体机器人连接、下发或急停能力。
 
@@ -205,6 +222,7 @@ Agent 只执行白名单参数组成的训练、评估与播放命令，子进�
 - `docs/agent/PLATFORM_HARDENING.md`：P0 基准、视觉聚合、状态恢复、Provider 注册表及平台强化实现；
 - `docs/agent/ARCHITECTURE.md`：自动闭环和模块关系；
 - `docs/agent/MULTI_AGENT_MEMORY.md`：多 Agent 分工、百炼接入和记忆生命周期；
+- `docs/agent/REWARD_EXPERIENCE.md`：奖励经验 Agent、证据 Schema、资格门控和 Validator；
 - `docs/agent/RAG.md`：本地训练经验索引、检索注入和安全边界；
 - `docs/agent/DESKTOP_UI.md`：桌面上位机使用；
 - `docs/agent/WEB_UI.md`：本地服务、状态、日志与安全；

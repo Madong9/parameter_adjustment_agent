@@ -2,10 +2,21 @@ session: rl-training-agent
 profile: ""
 bind_existing_tab: true
 chatgpt_url: https://chatgpt.com/
-connect_timeout: 10
+connect_timeout: 20
+auto_launch_browser: true
+bridge_browser_executable: ""
 command_timeout: 30
-submit_timeout: 20
+submit_timeout: 45
 response_timeout: 300
 prompt_attachment_threshold: 4000
+visual_image_attachment_limit: 2
 max_retries: 2
 owned_session: false
+force_chat_mode: true
+# 旧的“仅上传文件并返回链接”兼容路径关闭；真正的豆包推理由 opencli-doubao Provider 接管。
+use_doubao_on_quota: false
+doubao_session: rl-training-agent-doubao
+doubao_url: https://www.doubao.com/chat/
+doubao_upload_input_selector: '[data-testid="upload-file-input"]'
+doubao_result_selector: '[data-testid="receive_message"] [data-testid="message_text_content"]'
+doubao_max_wait: 300

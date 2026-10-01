@@ -5,7 +5,9 @@ import pytest
 
 from rl_training_agent.environment.inspector import EnvironmentInspector
 from rl_training_agent.rewards.compiler import RewardCompiler
+from rl_training_agent.rewards.reviser import RewardPlanReviser
 from rl_training_agent.rewards.validator import RewardCodeValidator, RewardPlanValidator, RewardValidationError
+from rl_training_agent.schemas.decisions import DiagnosisItem, RewardChange, TrainingDiagnosis
 from rl_training_agent.schemas.rewards import CurriculumStage, RewardPlan, RewardTerm
 from rl_training_agent.settings import load_settings
 from rl_training_agent.utils.io import write_json
@@ -32,6 +34,8 @@ def test_registry_parses_actual_project():
             "front_leg_stand", "front_leg_walk"} <= names
     tracking = next(item for item in manifest.rewards if item.name == "tracking_lin_vel")
     assert tracking.default_weight == 1.0
+    assert "dof_vel_limits" not in names
+    assert "stumble" not in names
 
 
 def test_missing_reward_and_large_weight():
@@ -67,6 +71,43 @@ def test_positive_reward_cannot_be_compiled_as_penalty():
     manifest = EnvironmentInspector(load_settings().training_root).inspect("go2")
     with pytest.raises(RewardValidationError, match="unsafe negative sign"):
         RewardPlanValidator(manifest.rewards).validate(plan([term("tracking_lin_vel", -1.0)]))
+
+
+def test_update_missing_registered_reward_is_safely_added():
+    """验证诊断更新未启用的注册奖励时会先新增，而不会错误转入人工审核。"""
+    manifest = EnvironmentInspector(load_settings().training_root).inspect("go2")
+    parent = plan([term("tracking_lin_vel", 1.0)])
+    diagnosis = TrainingDiagnosis(
+        diagnosis=[DiagnosisItem(category="足端打滑", finding="动作变化过快")],
+        evidence=[], decision="revise_reward", confidence=0.9,
+        reward_changes=[RewardChange(
+            term="action_rate", action="update", changes={"weight": -0.5},
+            rationale="抑制高频关节动作")],
+        checkpoint_strategy="continue_from_current")
+
+    revised, audit = RewardPlanReviser(manifest.rewards).revise(parent, diagnosis)
+
+    action_rate = next(item for item in revised.terms if item.name == "action_rate")
+    registered = next(item for item in manifest.rewards if item.name == "action_rate")
+    assert action_rate.weight == -0.5
+    assert action_rate.implementation == registered.implementation
+    assert any("按注册表新增：action_rate" in item for item in audit)
+
+
+def test_update_missing_unregistered_reward_is_still_rejected():
+    """验证 upsert 兼容逻辑不会允许诊断绕过奖励能力注册表。"""
+    manifest = EnvironmentInspector(load_settings().training_root).inspect("go2")
+    diagnosis = TrainingDiagnosis(
+        diagnosis=[DiagnosisItem(category="测试", finding="请求未知奖励")],
+        evidence=[], decision="revise_reward", confidence=0.9,
+        reward_changes=[RewardChange(
+            term="invented_reward", action="update", changes={"weight": -0.5},
+            rationale="测试白名单")],
+        checkpoint_strategy="continue_from_current")
+
+    with pytest.raises(RewardValidationError, match="unregistered reward"):
+        RewardPlanReviser(manifest.rewards).revise(
+            plan([term("tracking_lin_vel", 1.0)]), diagnosis)
 
 
 def test_curriculum_boundaries_must_be_nonnegative_and_ordered():
