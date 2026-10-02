@@ -120,6 +120,8 @@ python -m rl_training_agent ui --no-browser
 
 安装 OpenCLI Chrome 扩展并连接 OpenCLI，在 Chrome 中打开 `https://chatgpt.com/` 并完成登录。默认使用绑定模式：绑定前请将目标 ChatGPT 标签页切换到前台。若希望 Agent 自行管理标签页，可在 `config/opencli.yaml` 中设置 `bind_existing_tab: false` 和 `owned_session: true`。不要在仓库中保存 Cookie、令牌或 API Key。
 
+ChatGPT 初始回复等待为 `response_timeout: 300` 秒。若已确认提交的本轮用户消息仍在思考或分析附件，程序每次续等 60 秒，总等待受 `response_generation_timeout: 900` 秒限制；停止生成后仍需确认完整、稳定的回复。可以用 `OPENCLI_RESPONSE_GENERATION_TIMEOUT` 覆盖总上限。旧回复、未提交请求和无生成状态的页面不会获得续等。豆包出现验证关键字时会核对可见验证控件；真正的安全验证仍需在浏览器中完成后再继续。
+
 ```bash
 opencli list
 opencli doctor

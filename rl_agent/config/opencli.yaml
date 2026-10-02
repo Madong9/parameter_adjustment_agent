@@ -8,6 +8,8 @@ bridge_browser_executable: ""
 command_timeout: 30
 submit_timeout: 45
 response_timeout: 300
+# 已提交的本轮请求仍在思考/分析附件时续等；总等待不超过 15 分钟。
+response_generation_timeout: 900
 prompt_attachment_threshold: 4000
 visual_image_attachment_limit: 2
 max_retries: 2

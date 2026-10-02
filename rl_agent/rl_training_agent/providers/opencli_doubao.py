@@ -47,7 +47,25 @@ class OpenCLIDoubaoWebProvider(OpenCLIChatGPTWebProvider):
         state = self._browser(["state"])
         lowered = state.lower()
         if any(item in lowered for item in ("验证码", "安全验证", "verify", "captcha")):
-            raise ProviderNeedsHuman("豆包页面需要完成安全验证。")
+            # state 包含隐藏节点、脚本属性和历史标题；单个关键字不能证明
+            # 当前页面被验证弹窗阻断。只确认可见验证控件，无法检查时保守停止。
+            check = self._parse_eval_result(self._browser(["eval", """
+(() => {
+  const visible = node => !!node.getClientRects().length &&
+    getComputedStyle(node).visibility !== 'hidden' &&
+    getComputedStyle(node).display !== 'none';
+  const candidates = document.querySelectorAll(
+    '[role="dialog"], iframe, [id*="captcha"], [class*="captcha"], [id*="verify"], [class*="verify"]');
+  const blocked = Array.from(candidates).some(node => visible(node) &&
+    /验证码|安全验证|verify you are human|captcha/i.test(
+      (node.innerText || '') + ' ' + (node.getAttribute('src') || '') + ' ' +
+      (node.getAttribute('aria-label') || '')));
+  const editor = document.querySelector('[data-testid="chat_input_input"] [contenteditable="true"]');
+  return JSON.stringify({blocked, ready: !!editor && visible(editor)});
+})()
+"""], allow_failure=True))
+            if not isinstance(check, dict) or check.get("blocked") or not check.get("ready"):
+                raise ProviderNeedsHuman("豆包页面需要完成安全验证，请在浏览器完成验证后重试。")
         if "登录" in state and "chat_input" not in state and "新对话" not in state:
             raise ProviderNeedsHuman("豆包登录已失效，请在浏览器中重新登录。")
         self._assert_expected_page()

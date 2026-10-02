@@ -131,3 +131,54 @@ def test_profile_is_forwarded_to_opencli():
     command = commands[0]
     assert command[command.index("--profile") + 1] == "robot"
     assert "browser" in command and provider.settings.session in command
+
+
+@pytest.mark.parametrize("active_user,finish,expected", [
+    ("u2", 390, "success"),
+    ("u1", 390, "timeout"),
+    ("u2", 2000, "timeout"),
+])
+def test_long_visual_analysis_has_bounded_request_scoped_wait(monkeypatch, active_user, finish, expected):
+    provider = OpenCLIChatGPTWebProvider(settings=OpenCLISettings(
+        response_timeout=300, response_generation_timeout=900))
+    provider._confirmed_user_id = "u2"
+    clock = [0]
+    monkeypatch.setattr("time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("time.sleep", lambda _: clock.__setitem__(0, clock[0] + 10))
+    monkeypatch.setattr(provider, "_state", lambda: "ready")
+    monkeypatch.setattr(provider, "_is_generating", lambda: clock[0] < finish)
+
+    def response():
+        provider._last_message_snapshot = {
+            "latest_user_id": active_user, "generating": clock[0] < finish,
+            "assistant_user_id": "u2", "latest_assistant_id": "a2"}
+        return '{"ok":true}' if clock[0] >= finish else ""
+
+    monkeypatch.setattr(provider, "_latest_assistant", response)
+    if expected == "success":
+        assert provider._wait_for_response("") == '{"ok":true}'
+        assert 390 <= clock[0] < 900
+    else:
+        with pytest.raises(ProviderTimeout, match="request_confirmed=True"):
+            provider._wait_for_response("")
+        assert clock[0] == (900 if active_user == "u2" else 300)
+
+
+@pytest.mark.parametrize("check,blocked", [
+    ({"blocked": False, "ready": True}, False),
+    ({"blocked": True, "ready": True}, True),
+    ({"blocked": False, "ready": False}, True),
+    (None, True),
+])
+def test_doubao_verification_requires_visible_challenge(monkeypatch, check, blocked):
+    import json
+    from rl_training_agent.providers.errors import ProviderNeedsHuman
+    provider = OpenCLIDoubaoWebProvider()
+    monkeypatch.setattr(provider, "_assert_expected_page", lambda: None)
+    monkeypatch.setattr(provider, "_browser", lambda args, **kwargs:
+                        "history title: 安全验证 captcha; chat_input" if args == ["state"] else json.dumps(check))
+    if blocked:
+        with pytest.raises(ProviderNeedsHuman, match="完成安全验证"):
+            provider._state()
+    else:
+        assert "chat_input" in provider._state()

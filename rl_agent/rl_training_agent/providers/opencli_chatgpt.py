@@ -715,7 +715,10 @@ class OpenCLIChatGPTWebProvider:
 
     def _wait_for_response(self, previous: str) -> str:
         """等待助手回复稳定，并防止把流式 JSON 的前缀误判为完整结果。"""
-        deadline = time.monotonic() + self.settings.response_timeout
+        started = time.monotonic()
+        deadline = started + self.settings.response_timeout
+        hard_deadline = started + max(self.settings.response_timeout,
+                                      self.settings.response_generation_timeout)
         last = ""
         stable_count = 0
         while time.monotonic() < deadline:
@@ -723,6 +726,11 @@ class OpenCLIChatGPTWebProvider:
             current = self._latest_assistant()
             self._raise_for_usage_limit(current)
             snapshot = self._last_message_snapshot
+            # 视觉附件分析可能超过初始五分钟。仅为已确认提交的本轮请求
+            # 续等，不重发，也不让上一轮的生成状态延长本轮等待。
+            if (snapshot.get("generating") and self._confirmed_user_id and
+                    snapshot.get("latest_user_id") == self._confirmed_user_id):
+                deadline = min(hard_deadline, max(deadline, time.monotonic() + 60))
             new_message = (current != previous or bool(
                 snapshot.get("latest_assistant_id") and
                 snapshot.get("latest_assistant_id") != self._submission_baseline.get("latest_assistant_id")))
@@ -743,7 +751,14 @@ class OpenCLIChatGPTWebProvider:
                     if stable_count >= 8:
                         return current
             time.sleep(1.0)
-        raise ProviderTimeout("ChatGPT response did not complete before timeout")
+        raise ProviderTimeout(
+            "ChatGPT response did not complete before timeout; "
+            "initial_limit=%ss, generation_limit=%ss, generating=%s, "
+            "assistant_count=%s, request_confirmed=%s" % (
+                self.settings.response_timeout, self.settings.response_generation_timeout,
+                self._last_message_snapshot.get("generating", False),
+                self._last_message_snapshot.get("assistant_count", 0),
+                bool(self._confirmed_user_id)))
 
     @classmethod
     def _response_contains_complete_json(cls, response: str) -> bool:

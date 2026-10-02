@@ -200,6 +200,7 @@ class OpenCLISettings(BaseModel):
     command_timeout: int = 30
     submit_timeout: int = 45
     response_timeout: int = 300
+    response_generation_timeout: int = 900
     prompt_attachment_threshold: int = 4000
     visual_image_attachment_limit: int = 2
     max_retries: int = 2
@@ -300,6 +301,7 @@ def load_opencli_settings(path: Path = AGENT_ROOT / "config" / "opencli.yaml") -
         "OPENCLI_BRIDGE_BROWSER_EXECUTABLE": "bridge_browser_executable",
         "OPENCLI_SUBMIT_TIMEOUT": "submit_timeout",
         "OPENCLI_RESPONSE_TIMEOUT": "response_timeout", "OPENCLI_MAX_RETRIES": "max_retries",
+        "OPENCLI_RESPONSE_GENERATION_TIMEOUT": "response_generation_timeout",
         "OPENCLI_PROMPT_ATTACHMENT_THRESHOLD": "prompt_attachment_threshold",
         "OPENCLI_VISUAL_IMAGE_ATTACHMENT_LIMIT": "visual_image_attachment_limit",
         "OPENCLI_FORCE_CHAT_MODE": "force_chat_mode",
