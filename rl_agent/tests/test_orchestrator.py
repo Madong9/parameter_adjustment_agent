@@ -26,13 +26,20 @@ def test_end_to_end_dry_run(tmp_path):
                            "artifact_root": str(tmp_path / "artifacts"), "full_iterations": 300,
                            "screening_iterations": 30, "smoke_iterations": 5,
                            "max_total_iterations": 1000})
-    result = TrainingOrchestrator(settings, MockLLMReasoningProvider(3)).train(
+    orchestrator = TrainingOrchestrator(settings, MockLLMReasoningProvider(3))
+    result = orchestrator.train(
         "测试机器狗稳定向前行走", "go2", dry_run=True)
     task_dir = settings.experiments_path / result["task_id"]
     assert result["state"] == "COMPLETED"
     assert (task_dir / "final" / "checkpoint.pt").is_file()
     rollout = task_dir / result["rollout"]
-    for name in ("front.mp4", "side.mp4", "overview.mp4", "trajectory.parquet", "rewards.parquet",
+    assert not list(task_dir.rglob("*.mp4"))
+    assert result["video_cleanup"]["status"] == "completed"
+    assert result["video_cleanup"]["video_files"] > 0
+    assert (task_dir / "video_cleanup.json").is_file()
+    assert (task_dir / "memory" / "promotion.json").is_file()
+    assert orchestrator.resume(result["task_id"], dry_run=True)["video_cleanup"] == result["video_cleanup"]
+    for name in ("trajectory.parquet", "rewards.parquet",
                  "metadata.json", "events.json", "contact_sheet_clean.png", "contact_sheet_annotated.png",
                  "contact_sheet_multiview.png", "behavior_evidence.json", "visual_attachment_manifest.json",
                  "visual_report.json", "numeric_summary.json"):

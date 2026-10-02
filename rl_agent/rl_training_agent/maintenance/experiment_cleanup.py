@@ -25,6 +25,33 @@ class ExperimentCleaner:
             raise ValueError("task_id 格式非法")
         return ensure_within(self.experiment_root / task_id, self.experiment_root)
 
+    def cleanup_completed_videos(self, task_id: str) -> Dict[str, Any]:
+        """联合验收完成且经验整理落盘后，删除该任务的视频，保留其余证据。"""
+        scope = self._scope(task_id)
+        if (self.experiment_root / task_id).is_symlink():
+            raise ValueError("不能清理符号链接任务目录")
+        summary = read_json(scope / "summary.json")
+        state = read_json(scope / "state.json")
+        if summary.get("state") != "COMPLETED" or state.get("state") != "COMPLETED":
+            return {"status": "skipped", "reason": "任务尚未成功完成"}
+        extensions = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".mpeg", ".mpg"}
+        removed = []
+        errors = []
+        reclaimed = 0
+        for path in sorted(scope.rglob("*")):
+            if path.suffix.lower() not in extensions or path.is_symlink() or not path.is_file():
+                continue
+            try:
+                ensure_within(path, scope)
+                size = path.stat().st_size
+                path.unlink()
+                reclaimed += size
+                removed.append(path.relative_to(scope).as_posix())
+            except (OSError, ValueError) as exc:
+                errors.append({"path": path.relative_to(scope).as_posix(), "error": str(exc)})
+        return {"status": "partial" if errors else "completed", "video_files": len(removed),
+                "reclaim_bytes": reclaimed, "removed": removed, "errors": errors}
+
     @staticmethod
     def _selected_rollouts(metrics_path: Path) -> Set[str]:
         """从数值排序中还原最差、中央和最好三个视觉样本。"""

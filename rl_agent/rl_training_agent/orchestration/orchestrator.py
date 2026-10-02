@@ -33,6 +33,7 @@ from ..memory.curator import MemoryCuratorAgent
 from ..memory.consolidator import SemanticMemoryConsolidatorAgent
 from ..memory.procedural import ProceduralMemoryAgent
 from ..memory.store import LongTermMemoryStore
+from ..maintenance.experiment_cleanup import ExperimentCleaner
 from ..memory.reward_experience.agent import RewardExperienceAgent
 from ..memory.reward_experience.eligibility import ExperienceEligibilityChecker
 from ..memory.reward_experience.evidence_builder import RewardExperienceEvidenceBuilder
@@ -623,7 +624,9 @@ class TrainingOrchestrator:
         task_dir = self.store.task_dir(task_id)
         state = PersistentStateMachine(task_dir / "state.json")
         if state.record.state == AgentState.COMPLETED:
-            return read_json(task_dir / "summary.json")
+            summary = read_json(task_dir / "summary.json")
+            self._cleanup_completed_videos(task_dir, summary)
+            return summary
         recovered = self._recover_interrupted_finalization(task_dir, state, dry_run)
         if recovered is not None:
             return recovered
@@ -2002,7 +2005,29 @@ class TrainingOrchestrator:
         self._write_working_memory(
             task_dir, state, budget=budget, selected=selected,
             outcome=outcome, loop_round=len(loop_records))
+        if completed:
+            self._cleanup_completed_videos(task_dir, summary)
         return summary
+
+    def _cleanup_completed_videos(self, task_dir: Path, summary: Dict[str, Any]) -> None:
+        """在经验和终态保存后清理视频；清理失败不推翻已完成的训练。"""
+        try:
+            result = ExperimentCleaner(task_dir.parent).cleanup_completed_videos(task_dir.name)
+        except (OSError, ValueError) as exc:
+            result = {"status": "failed", "error": str(exc)}
+        # 单独保存每次清理结果，保留首次删除清单供审计及重复恢复。
+        audit_path = task_dir / "video_cleanup.json"
+        if audit_path.is_file():
+            previous = read_json(audit_path)
+            if result.get("status") == "completed" and not result.get("video_files") and previous.get("status") == "completed":
+                result = previous
+            else:
+                result["removed"] = sorted(set(previous.get("removed", []) + result.get("removed", [])))
+                result["video_files"] = len(result["removed"])
+                result["reclaim_bytes"] = previous.get("reclaim_bytes", 0) + result.get("reclaim_bytes", 0)
+        write_json(audit_path, result)
+        summary["video_cleanup"] = result
+        write_json(task_dir / "summary.json", summary)
 
     def _evaluate(self, task: TaskSpec, task_dir: Path, state: PersistentStateMachine,
                   selected: Dict[str, Any], dry_run: bool, budget: BudgetTracker,

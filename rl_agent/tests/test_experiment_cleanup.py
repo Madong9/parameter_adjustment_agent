@@ -1,6 +1,44 @@
 import json
+import pytest
 
 from rl_training_agent.maintenance.experiment_cleanup import ExperimentCleaner
+
+
+@pytest.mark.parametrize("state", ["COMPLETED", "HUMAN_REVIEW", "FAILED", "FULL_TRAINING"])
+def test_success_cleanup_preserves_learning_data_and_other_tasks(tmp_path, state):
+    task = tmp_path / "task-action"
+    video = _write(task / "candidates" / "old" / "rollouts" / "front.mp4")
+    selected = _write(task / "candidates" / "selected" / "rollouts" / "side.MP4")
+    probe = _write(task / "feasibility" / "probe.webm")
+    other = _write(tmp_path / "task-other" / "front.mp4")
+    retained = [_write(task / name) for name in (
+        "final/checkpoint.pt", "final/config.yaml", "final/reward_plan.json",
+        "memory/reward_experience/evidence.json", "trajectory.parquet", "rewards.parquet",
+        "contact_sheet_annotated.png", "visual_report.json", "metadata.json")]
+    for name in ("summary.json", "state.json"):
+        (task / name).write_text(json.dumps({"state": state}))
+    link = task / "external.mp4"
+    link.symlink_to(other)
+    cleaner = ExperimentCleaner(tmp_path)
+    result = cleaner.cleanup_completed_videos(task.name)
+    assert all(path.is_file() for path in retained)
+    assert other.is_file() and link.is_symlink()
+    if state == "COMPLETED":
+        assert result["video_files"] == 3 and result["reclaim_bytes"] == 48
+        assert not any(path.exists() for path in (video, selected, probe))
+        assert cleaner.cleanup_completed_videos(task.name)["video_files"] == 0
+    else:
+        assert result["status"] == "skipped"
+        assert all(path.is_file() for path in (video, selected, probe))
+
+
+def test_success_cleanup_requires_matching_persisted_terminal_state(tmp_path):
+    task = tmp_path / "task-action"
+    video = _write(task / "front.mp4")
+    (task / "summary.json").write_text(json.dumps({"state": "COMPLETED"}))
+    (task / "state.json").write_text(json.dumps({"state": "MEMORY_CURATING"}))
+    assert ExperimentCleaner(tmp_path).cleanup_completed_videos(task.name)["status"] == "skipped"
+    assert video.is_file()
 
 
 def _write(path, size=16):
