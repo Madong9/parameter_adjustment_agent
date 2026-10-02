@@ -12,6 +12,7 @@ import unicodedata
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Type, TypeVar
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, ValidationError
 
@@ -29,6 +30,7 @@ from ..memory.reward_experience.schema import RewardExperienceNarrative
 from ..settings import OpenCLISettings, load_opencli_settings
 from ..utils.io import atomic_write_text, json_safe
 from .errors import ProviderError, ProviderNeedsHuman, ProviderResponseError, ProviderTimeout
+from .chatgpt_dom import CHATGPT_SNAPSHOT_SCRIPT
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 Runner = Callable[[Sequence[str], int], subprocess.CompletedProcess]
@@ -114,10 +116,14 @@ class OpenCLIChatGPTWebProvider:
         self.record_dir = record_dir
         self._opened = False
         self._request_index = 0
+        self._submission_baseline: Dict[str, Any] = {}
+        self._confirmed_user_id = ""
+        self._last_message_snapshot: Dict[str, Any] = {}
 
     def _run(self, args: Sequence[str], timeout: Optional[int] = None, allow_failure: bool = False) -> str:
         """执行受限子流程并返回结构化结果。"""
-        command = ["opencli"] + list(args)
+        profile_args = ["--profile", self.settings.profile] if self.settings.profile else []
+        command = ["opencli"] + profile_args + list(args)
         try:
             result = self.runner(command, timeout or self.settings.command_timeout)
         except subprocess.TimeoutExpired as exc:
@@ -145,7 +151,57 @@ class OpenCLIChatGPTWebProvider:
             raise ProviderNeedsHuman("ChatGPT page requires CAPTCHA verification")
         if any(item in lowered for item in ("log in", "sign up", "登录", "注册")) and "message chatgpt" not in lowered:
             raise ProviderNeedsHuman("ChatGPT login has expired")
+        self._assert_expected_page()
         return state
+
+    @staticmethod
+    def _url_matches_expected(current_url: str, expected_url: str) -> bool:
+        """只接受与配置地址同域的 HTTP(S) 页面，拒绝 about:blank 和错误站点。"""
+        current = urlparse(str(current_url).strip())
+        expected = urlparse(str(expected_url).strip())
+        current_host = (current.hostname or "").lower()
+        expected_host = (expected.hostname or "").lower()
+        return bool(
+            current.scheme in ("http", "https") and expected_host and
+            (current_host == expected_host or current_host.endswith("." + expected_host))
+        )
+
+    def _current_page_url(self) -> str:
+        """读取当前会话真实 URL；OpenCLI 无法读取时返回空串交由调用方处理。"""
+        output = self._browser(
+            ["eval", "JSON.stringify(location.href || '')"], allow_failure=True)
+        parsed = self._parse_eval_result(output)
+        if isinstance(parsed, str):
+            return parsed.strip()
+        if isinstance(parsed, dict):
+            return str(parsed.get("url", "")).strip()
+        return ""
+
+    def _assert_expected_page(self) -> None:
+        """要求实际 URL 可读且属于目标站点，避免错误网页或读取失败被放行。"""
+        current_url = self._current_page_url()
+        if not current_url:
+            raise ProviderError("无法读取 OpenCLI 会话地址，请检查浏览器扩展连接。")
+        if current_url and not self._url_matches_expected(
+                current_url, self.settings.chatgpt_url):
+            expected_host = urlparse(self.settings.chatgpt_url).hostname or "目标站点"
+            raise ProviderNeedsHuman(
+                "OpenCLI 会话没有停留在 %s，当前页面为 %s；请确认浏览器标签页可正常访问目标站点。" %
+                (expected_host, current_url[:300]))
+
+    def _open_expected_page(self, url: str, label: str) -> None:
+        """导航至指定 Provider 页面，并在继续 DOM 操作前确认真实地址已生效。"""
+        self._browser(["open", url], timeout=self.settings.connect_timeout)
+        deadline = time.monotonic() + self.settings.connect_timeout
+        last_url = ""
+        while time.monotonic() < deadline:
+            last_url = self._current_page_url()
+            if self._url_matches_expected(last_url, url):
+                return
+            time.sleep(0.25)
+        raise ProviderNeedsHuman(
+            "%s 页面在 %s 秒内未成功打开；当前页面为 %s。请检查网络、登录状态和浏览器扩展后重试。" %
+            (label, self.settings.connect_timeout, last_url or "无法读取"))
 
     @staticmethod
     def _raise_for_usage_limit(text: str) -> None:
@@ -273,8 +329,10 @@ class OpenCLIChatGPTWebProvider:
                     "确认没有验证码或登录弹窗，然后重新下发任务。"
                 ) from exc
         else:
-            self._browser(["open", self.settings.chatgpt_url])
             self.settings.owned_session = True
+        # bind 只建立会话映射，并不保证被绑定标签页就是 ChatGPT。始终显式
+        # 导航并核对 URL，防止 about:blank 被旧版 state 误判为聊天页。
+        self._open_expected_page(self.settings.chatgpt_url, "ChatGPT")
         self._state()
         self._ensure_chat_mode()
         self._opened = True
@@ -283,11 +341,8 @@ class OpenCLIChatGPTWebProvider:
         """创建新会话并返回可持久化的会话句柄。"""
         if not self._opened:
             self.open_or_bind()
-        if self.settings.owned_session:
-            self._browser(["open", self.settings.chatgpt_url])
-        else:
-            # 在已绑定标签页打开根地址，以创建新的网页会话。
-            self._browser(["open", self.settings.chatgpt_url])
+        # 打开根地址会创建全新网页会话，同时强制验证没有落到空白页。
+        self._open_expected_page(self.settings.chatgpt_url, "ChatGPT")
         self._state()
         self._ensure_chat_mode()
         return ConversationHandle(conversation_id=uuid.uuid4().hex, title_hint=title_hint,
@@ -458,53 +513,17 @@ class OpenCLIChatGPTWebProvider:
                     parsed.get("actual_normalized_length") == parsed.get("expected_normalized_length"))
 
     def _latest_assistant(self) -> str:
-        """提取页面中最新一条助手消息。"""
-        script = "JSON.stringify(Array.from(document.querySelectorAll('[data-message-author-role=assistant]')).map(e=>e.innerText).filter(Boolean).slice(-1)[0]||'')"
-        output = self._browser(["eval", script], allow_failure=True)
-        parsed = _json_from_output(output)
-        value = _extract_value(parsed)
-        if value:
-            nested = _json_from_output(value)
-            return nested if isinstance(nested, str) else value
-        return ""
+        """通过共用的新旧 DOM 解析器读取助手正文，并保留消息身份。"""
+        self._last_message_snapshot = self._submission_snapshot()
+        return str(self._last_message_snapshot.get("latest_assistant", ""))
 
     def _latest_user(self) -> str:
-        """提取页面中最新一条已经提交的用户消息。"""
-        script = "JSON.stringify(Array.from(document.querySelectorAll('[data-message-author-role=user]')).map(e=>e.innerText).filter(Boolean).slice(-1)[0]||'')"
-        output = self._browser(["eval", script], allow_failure=True)
-        parsed = _json_from_output(output)
-        value = _extract_value(parsed)
-        if value:
-            nested = _json_from_output(value)
-            return nested if isinstance(nested, str) else value
-        return ""
+        """通过共用解析器读取已提交用户消息，避免与回复读取使用不同选择器。"""
+        return str(self._submission_snapshot().get("latest_user", ""))
 
     def _submission_snapshot(self) -> Dict[str, Any]:
         """一次读取最新用户消息和编辑器状态，避免高频 state 调用干扰页面时序。"""
-        script = """
-(() => {
-  const users = Array.from(document.querySelectorAll('[data-message-author-role=user]'))
-    .map(element => element.innerText || '').filter(Boolean);
-  const assistants = Array.from(document.querySelectorAll('[data-message-author-role=assistant]'))
-    .map(element => element.innerText || '').filter(Boolean);
-  const composer = document.querySelector(
-    '#prompt-textarea, [data-testid="prompt-textarea"], [contenteditable="true"][role="textbox"]');
-  const composerText = composer
-    ? (composer.isContentEditable ? (composer.innerText || composer.textContent || '')
-      : String(composer.value || '')) : '';
-  return JSON.stringify({
-    latest_user: users.slice(-1)[0] || '',
-    user_count: users.length,
-    latest_assistant: assistants.slice(-1)[0] || '',
-    assistant_count: assistants.length,
-    composer_found: Boolean(composer),
-    composer_text: composerText,
-    url: location.href,
-    generating: Boolean(document.querySelector('button[data-testid="stop-button"]'))
-  });
-})()
-"""
-        output = self._browser(["eval", script], allow_failure=True)
+        output = self._browser(["eval", CHATGPT_SNAPSHOT_SCRIPT], allow_failure=True)
         parsed = self._parse_eval_result(output)
         return parsed if isinstance(parsed, dict) else {}
 
@@ -598,22 +617,24 @@ class OpenCLIChatGPTWebProvider:
             if re.fullmatch(r"(?:%s\s*)+" % safe_attachment, attachment_prefix,
                             flags=re.IGNORECASE):
                 return True
-        if (
-            len(prompt_normalized) > 200 and
-            actual_normalized.startswith(prompt_normalized[:120]) and
-            actual_normalized.endswith(prompt_normalized[-120:])
-        ):
-            return True
-        # ChatGPT 偶发会在长消息 DOM 中增加一个不可见或排版字符。
-        # 只对长文本、长度差极小且全文相似度足够高的新消息放行，
-        # 避免把截断、旧消息或其他页面文字误认为已提交。
-        length_tolerance = max(8, int(len(prompt_normalized) * 0.01))
-        if (len(prompt_normalized) >= 500 and
-                abs(len(actual_normalized) - len(prompt_normalized)) <= length_tolerance):
-            similarity = difflib.SequenceMatcher(
-                None, actual_normalized, prompt_normalized, autojunk=False).ratio()
-            return similarity >= 0.995
         return False
+
+    def _submission_confirmed(self, snapshot: Dict[str, Any], previous_user: str,
+                              prompt: str) -> bool:
+        """仅在本次新用户消息完整匹配时确认提交；清空草稿不代表服务端接收。"""
+        latest = str(snapshot.get("latest_user", ""))
+        if not self._matches_submitted_prompt(latest, prompt):
+            return False
+        baseline = self._submission_baseline
+        if baseline:
+            new_id = snapshot.get("latest_user_id")
+            fresh = (bool(new_id and new_id != baseline.get("latest_user_id")) or
+                     int(snapshot.get("user_count", 0)) > int(baseline.get("user_count", 0)))
+        else:
+            fresh = latest != previous_user
+        if fresh:
+            self._confirmed_user_id = str(snapshot.get("latest_user_id", ""))
+        return bool(fresh)
 
     def _click_send_button(self) -> None:
         """等待 ChatGPT 发送按钮可用并显式点击，避免依赖输入框焦点。"""
@@ -657,22 +678,14 @@ class OpenCLIChatGPTWebProvider:
         while time.monotonic() < deadline:
             snapshot = self._submission_snapshot()
             latest = str(snapshot.get("latest_user", ""))
-            if latest != previous_user and self._matches_submitted_prompt(latest, prompt):
-                return
-            # _fill_prompt 在点击前已严格验证全文。点击后编辑器被清空，
-            # 说明 React 已接收提交；用户消息 DOM 在新会话中可能延迟十余秒才出现。
-            if (snapshot.get("composer_found") and
-                    not self._normalize_submitted_text(str(snapshot.get("composer_text", "")))):
+            if self._submission_confirmed(snapshot, previous_user, prompt):
                 return
             time.sleep(0.5)
         # 边界时刻检查页面健康状态并再读取一次。
         self._state()
         snapshot = self._submission_snapshot()
         latest = str(snapshot.get("latest_user", ""))
-        if latest != previous_user and self._matches_submitted_prompt(latest, prompt):
-            return
-        if (snapshot.get("composer_found") and
-                not self._normalize_submitted_text(str(snapshot.get("composer_text", "")))):
+        if self._submission_confirmed(snapshot, previous_user, prompt):
             return
         latest_normalized = self._normalize_submitted_text(latest)
         prompt_normalized = self._normalize_submitted_text(prompt)
@@ -694,7 +707,13 @@ class OpenCLIChatGPTWebProvider:
             self._state()
             current = self._latest_assistant()
             self._raise_for_usage_limit(current)
-            if current and current != previous:
+            snapshot = self._last_message_snapshot
+            new_message = (current != previous or bool(
+                snapshot.get("latest_assistant_id") and
+                snapshot.get("latest_assistant_id") != self._submission_baseline.get("latest_assistant_id")))
+            belongs_to_request = (not self._confirmed_user_id or
+                                  snapshot.get("assistant_user_id") == self._confirmed_user_id)
+            if current and new_message and belongs_to_request:
                 if current == last:
                     stable_count += 1
                 else:
@@ -730,7 +749,7 @@ class OpenCLIChatGPTWebProvider:
   if (document.querySelector('button[data-testid="stop-button"]')) return JSON.stringify(true);
   return JSON.stringify(Array.from(document.querySelectorAll('button')).some(button => {
     const label = button.getAttribute('aria-label') || '';
-    return /Stop generating|Stop responding|停止生成|停止回答|Thinking|正在思考/.test(label);
+    return /Stop generating|Stop responding|停止生成|停止回答|Thinking|正在思考|^(?:停止|Stop)$/i.test(label.trim());
   }));
 })()
 """
@@ -740,8 +759,11 @@ class OpenCLIChatGPTWebProvider:
     def send_text(self, prompt: str, conversation: ConversationHandle,
                   submission_timeout: Optional[int] = None) -> str:
         """向指定网页会话发送文本并返回最新助手回复。"""
-        previous_assistant = self._latest_assistant()
-        previous_user = self._latest_user()
+        self._submission_baseline = self._submission_snapshot()
+        self._confirmed_user_id = ""
+        self._last_message_snapshot = {}
+        previous_assistant = str(self._submission_baseline.get("latest_assistant", ""))
+        previous_user = str(self._submission_baseline.get("latest_user", ""))
         error: Optional[Exception] = None
         for _ in range(self.settings.max_retries + 1):
             try:

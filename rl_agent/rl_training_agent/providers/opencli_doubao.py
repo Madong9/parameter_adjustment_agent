@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from pathlib import Path
@@ -49,6 +50,7 @@ class OpenCLIDoubaoWebProvider(OpenCLIChatGPTWebProvider):
             raise ProviderNeedsHuman("豆包页面需要完成安全验证。")
         if "登录" in state and "chat_input" not in state and "新对话" not in state:
             raise ProviderNeedsHuman("豆包登录已失效，请在浏览器中重新登录。")
+        self._assert_expected_page()
         return state
 
     def doctor(self) -> ProviderHealth:
@@ -80,7 +82,7 @@ class OpenCLIDoubaoWebProvider(OpenCLIChatGPTWebProvider):
     def open_or_bind(self) -> None:
         """打开独立豆包标签页并强制使用普通“对话”模式。"""
         self._ensure_bridge_connected()
-        self._browser(["open", self.settings.doubao_url])
+        self._open_expected_page(self.settings.doubao_url, "豆包")
         self._state()
         self._ensure_dialogue_mode()
         self._opened = True
@@ -90,7 +92,7 @@ class OpenCLIDoubaoWebProvider(OpenCLIChatGPTWebProvider):
         if not self._opened:
             self.open_or_bind()
         else:
-            self._browser(["open", self.settings.doubao_url])
+            self._open_expected_page(self.settings.doubao_url, "豆包")
             self._state()
             self._ensure_dialogue_mode()
         return ConversationHandle(
@@ -134,9 +136,42 @@ class OpenCLIDoubaoWebProvider(OpenCLIChatGPTWebProvider):
         output = self._browser(["fill", self.INPUT_SELECTOR, prompt], allow_failure=True)
         parsed = _json_from_output(output)
         if not (isinstance(parsed, dict) and parsed.get("filled")):
-            raise ProviderError("豆包输入框没有确认完整提示词：%s" % output[-2000:])
+            raise ProviderError("豆包输入框没有确认提示词写入：%s" %
+                                self._safe_fill_diagnostic(parsed, prompt))
+        # match_level 只描述元素定位。使用 actual 全文与原文比较；仅容忍
+        # ProseMirror 的段落空白差异，不能接受首尾相同但中间缺失的内容。
+        if self._fill_result_matches_prompt(parsed, prompt):
+            return
         if not self._verify_doubao_composer(prompt):
-            raise ProviderError("豆包输入框已写入，但页面内全文校验失败：%s" % output[-2000:])
+            raise ProviderError("豆包输入框已写入，但全文校验失败：%s" %
+                                self._safe_fill_diagnostic(parsed, prompt))
+
+    @staticmethod
+    def _fill_result_matches_prompt(result: Any, prompt: str) -> bool:
+        """核验 OpenCLI fill 回传的全文，禁止仅凭 filled 标记放行。"""
+        if not isinstance(result, dict) or not result.get("filled"):
+            return False
+        actual = result.get("actual")
+        if not isinstance(actual, str):
+            return False
+        expected_normalized = re.sub(r"\s+", " ", prompt).strip()
+        return bool(expected_normalized and
+                    re.sub(r"\s+", " ", actual).strip() == expected_normalized)
+
+    @staticmethod
+    def _safe_fill_diagnostic(result: Any, prompt: str) -> str:
+        """仅输出长度和匹配元数据，避免把完整任务提示词复制到错误日志。"""
+        data = result if isinstance(result, dict) else {}
+        actual = data.get("actual")
+        diagnostic = {
+            "filled": bool(data.get("filled")),
+            "verified": bool(data.get("verified")),
+            "matches_n": data.get("matches_n"),
+            "match_level": data.get("match_level"),
+            "actual_length": len(actual) if isinstance(actual, str) else data.get("actual_length"),
+            "expected_length": len(prompt),
+        }
+        return json.dumps(diagnostic, ensure_ascii=False, separators=(",", ":"))
 
     def _verify_doubao_composer(self, prompt: str) -> bool:
         """使用 ProseMirror 的 textContent 验证豆包编辑器内容没有截断或重复。"""
@@ -190,7 +225,8 @@ class OpenCLIDoubaoWebProvider(OpenCLIChatGPTWebProvider):
 
     def _latest_assistant(self) -> str:
         """读取豆包最新一条助手消息正文。"""
-        return self._latest_text(self.ASSISTANT_SELECTOR)
+        self._last_message_snapshot = self._submission_snapshot()
+        return str(self._last_message_snapshot.get("latest_assistant", ""))
 
     def _latest_user(self) -> str:
         """读取豆包最新一条已提交用户消息正文。"""
@@ -200,13 +236,23 @@ class OpenCLIDoubaoWebProvider(OpenCLIChatGPTWebProvider):
         """一次读取豆包用户消息、助手消息、输入框和生成状态。"""
         script = """
 (() => {
-  const users = Array.from(document.querySelectorAll('%s')).map(e=>e.innerText||'').filter(Boolean);
-  const assistants = Array.from(document.querySelectorAll('%s')).map(e=>e.innerText||'').filter(Boolean);
+  const userNodes = Array.from(document.querySelectorAll('%s')).filter(e=>(e.innerText||'').trim());
+  const assistantNodes = Array.from(document.querySelectorAll('%s')).filter(e=>(e.innerText||'').trim());
+  const users = userNodes.map(e=>e.innerText);
+  const assistants = assistantNodes.map(e=>e.innerText);
   const composer = document.querySelector('%s');
   const latestReceive = Array.from(document.querySelectorAll('[data-testid="receive_message"]')).slice(-1)[0];
   return JSON.stringify({
     latest_user: users.slice(-1)[0] || '', user_count: users.length,
+    latest_user_id: users.length ? 'doubao-user-' + users.length : '',
     latest_assistant: assistants.slice(-1)[0] || '', assistant_count: assistants.length,
+    latest_assistant_id: assistants.length ? 'doubao-assistant-' + assistants.length : '',
+    assistant_user_id: latestReceive ? (() => {
+      const latestAssistant = assistantNodes.slice(-1)[0];
+      if (!latestAssistant) return '';
+      const preceding = userNodes.filter(node => Boolean(node.compareDocumentPosition(latestAssistant) & 4));
+      return preceding.length ? 'doubao-user-' + preceding.length : '';
+    })() : '',
     composer_found: Boolean(composer),
     composer_text: composer ? (composer.textContent || composer.innerText || '') : '',
     url: location.href,

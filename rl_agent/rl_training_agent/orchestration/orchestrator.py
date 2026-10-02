@@ -61,6 +61,7 @@ from ..training.checkpoint_manager import CheckpointManager
 from ..training.controller import TrainingController
 from ..utils.io import atomic_write_text, read_json, utc_now, write_json
 from ..utils.paths import relative_display
+from ..utils.task_semantics import is_front_leg_support_text
 from ..visual.evaluation_pipeline import VisualEvaluationPipeline
 from ..visual.ensemble import ConservativeVisualAggregator
 from ..visual.rollout_recorder import DryRunRolloutRecorder
@@ -153,11 +154,9 @@ class TrainingOrchestrator:
     @staticmethod
     def _is_front_leg_support_task(task: TaskSpec) -> bool:
         """判断原始指令是否明确要求以前腿支撑站立或行走。"""
-        instruction = task.original_instruction
-        mentions_front = "前腿" in instruction or "前脚" in instruction or "前足" in instruction
-        support_action = "站立" in instruction or "走路" in instruction or "行走" in instruction
-        explicitly_lifted = "抬起前腿" in instruction or "前腿离地" in instruction or "前足离地" in instruction
-        return mentions_front and support_action and not explicitly_lifted
+        # 用户原始指令是任务身份的唯一真值，不能让模型生成的规范化描述
+        # 通过错误加入“前腿离地”等文字反向覆盖用户意图。
+        return is_front_leg_support_text((task.original_instruction,))
 
     @staticmethod
     def _normalize_task_for_instruction(task: TaskSpec) -> List[str]:
@@ -245,7 +244,12 @@ class TrainingOrchestrator:
                             [-0.35, -0.25] if float(value) < 0 else [0.25, 0.35])
                         adjustments.append("将后腿行走命令移出 Unitree 速度死区")
         if TrainingOrchestrator._is_front_leg_support_task(task):
-            conflicting = {"tracking_lin_vel", "orientation", "landing_stability"}
+            # front_leg_walk 已经将速度奖励门控在前足支撑姿态内。普通速度奖励
+            # 及模型虚构的阶段后缀别名会诱导四足行走，必须在审查前确定性移除。
+            conflicting = {
+                "tracking_lin_vel", "tracking_lin_vel_stand", "tracking_lin_vel_walk",
+                "orientation", "landing_stability",
+            }
             removed = [item.name for item in plan.terms if item.name in conflicting]
             plan.terms = [item for item in plan.terms if item.name not in conflicting]
             for name in removed:
@@ -268,15 +272,33 @@ class TrainingOrchestrator:
                     adjustments.append("规范前腿支撑目标参数：%s" % term.name)
             for stage in plan.curriculum:
                 token = stage.name.lower()
+                changes = stage.parameter_changes
+                # 模型偶发把命令放入嵌套 commands；运行时只接受白名单顶层键。
+                # 前面已经从用户目标编译了确定性命令，因此移除不可执行的副本。
+                if isinstance(changes.get("commands"), dict):
+                    changes.pop("commands", None)
+                    adjustments.append("移除不可执行的嵌套课程命令：%s" % stage.name)
+                reward_scales = changes.get("reward_scales")
+                if isinstance(reward_scales, dict):
+                    removed_scales = sorted(set(reward_scales).intersection(conflicting))
+                    for name in removed_scales:
+                        reward_scales.pop(name, None)
+                        adjustments.append("移除课程中的前腿冲突奖励缩放：%s" % name)
                 if "stand" in token or "站" in stage.name:
-                    stage.parameter_changes["command_scale"] = 0.0
+                    changes.update({
+                        "command_scale": 0.0,
+                        "lin_vel_x": [0.0, 0.0],
+                        "lin_vel_y": [0.0, 0.0],
+                        "ang_vel_yaw": [0.0, 0.0],
+                        "heading": [0.0, 0.0],
+                    })
                 if "walk" in token or "行走" in stage.name:
-                    value = stage.parameter_changes.get("lin_vel_x")
+                    value = changes.get("lin_vel_x")
                     if value is None:
-                        stage.parameter_changes["lin_vel_x"] = [0.25, 0.35]
+                        changes["lin_vel_x"] = [0.25, 0.35]
                         adjustments.append("为前腿行走阶段补充非零前向命令")
                     elif isinstance(value, (int, float)) and abs(float(value)) <= 0.2:
-                        stage.parameter_changes["lin_vel_x"] = (
+                        changes["lin_vel_x"] = (
                             [-0.35, -0.25] if float(value) < 0 else [0.25, 0.35])
                         adjustments.append("将前腿行走命令移出 Unitree 速度死区")
             if "front_leg_stand" not in names:
@@ -690,18 +712,43 @@ class TrainingOrchestrator:
         state.transition(AgentState.ENVIRONMENT_INSPECTED)
 
         state.transition(AgentState.TASK_UNDERSTANDING, {"agent_role": "task_planner"})
-        if hasattr(self.provider, "understand_task"):
-            intent = self._provider_call(
-                task_dir, "task_planner", "understand_task",
-                lambda: self.provider.understand_task(instruction, robot))
-        else:
-            intent = TaskIntentSpec(
-                original_instruction=instruction, robot=robot,
-                action_name="custom_motion", normalized_goal=instruction,
-                required_behaviors=[instruction],
-                forbidden_behaviors=["身体触地", "关节或力矩超限"],
-                retrieval_keywords=[robot, instruction],
+        try:
+            if hasattr(self.provider, "understand_task"):
+                intent = self._provider_call(
+                    task_dir, "task_planner", "understand_task",
+                    lambda: self.provider.understand_task(instruction, robot))
+            else:
+                intent = TaskIntentSpec(
+                    original_instruction=instruction, robot=robot,
+                    action_name="custom_motion", normalized_goal=instruction,
+                    required_behaviors=[instruction],
+                    forbidden_behaviors=["身体触地", "关节或力矩超限"],
+                    retrieval_keywords=[robot, instruction],
+                )
+        except ProviderError as exc:
+            # 推理服务异常不能伪装成“仍在检查动作可行性”。持久化真实阶段和
+            # 可恢复终态，让上位机结束轮询，并允许用户修复页面后重新下发。
+            detail = re.sub(r"\s+", " ", str(exc)).strip()
+            if len(detail) > 1000:
+                detail = detail[:997] + "..."
+            reason = "任务理解 Provider 不可用：%s" % (detail or exc.__class__.__name__)
+            report = {
+                "task_id": task_id,
+                "state": AgentState.HUMAN_REVIEW.value,
+                "result": "human_review",
+                "stage": AgentState.TASK_UNDERSTANDING.value,
+                "recoverable": True,
+                "reason": reason,
+            }
+            write_json(task_dir / "blocking_report.json", report)
+            state.transition(
+                AgentState.HUMAN_REVIEW,
+                {"reason": reason, "provider_stage": "task_planner"},
+                operation_id="task-understanding-provider-failure:" + run_id,
             )
+            self._write_working_memory(task_dir, state)
+            print("[任务理解] %s" % reason, flush=True)
+            return report
         # 用户输入和上位机选择是任务身份的唯一来源，模型不得改写机器人或原始指令。
         intent.original_instruction = instruction
         intent.robot = robot

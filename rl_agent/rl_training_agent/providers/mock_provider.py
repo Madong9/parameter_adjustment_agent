@@ -16,6 +16,7 @@ from ..schemas.task import (
 )
 from ..schemas.visual import VisualBehaviorReport, VisualPhaseResult
 from ..memory.reward_experience.schema import RewardExperienceNarrative
+from ..utils.task_semantics import is_front_leg_support_text
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
@@ -142,7 +143,7 @@ class MockLLMReasoningProvider:
         if "后腿" in instruction:
             action = "rear_leg_stand_walk"
             required = ["后足持续支撑", "前足离地", "保持目标俯仰角", "按命令移动"]
-        elif any(token in instruction for token in ("前腿站立", "前腿行走", "前足站立")):
+        elif is_front_leg_support_text((instruction,)):
             action = "front_leg_stand_walk"
             required = ["前足持续支撑", "后足离地", "保持目标俯仰角", "按命令移动"]
         elif "跳" in instruction or "jump" in lowered:

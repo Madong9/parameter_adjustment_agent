@@ -168,6 +168,19 @@ python -m rl_training_agent report --task-id task-xxxxxxxxxx
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 ```
 
+在已激活的 `rl_agent` 环境中，可用独立会话排查 ChatGPT 通信。默认只读；
+`--send --rounds 2` 会新建聊天并连续发送两次相同的无敏感信息 JSON 自检提示，
+验证提交确认和回复归属，不启动训练：
+
+```bash
+python scripts/opencli_direct_debug.py /tmp/rl-opencli-check --session rl-opencli-check
+python scripts/opencli_direct_debug.py /tmp/rl-opencli-check --session rl-opencli-check --send --rounds 2
+```
+
+提交成功要求新的用户消息全文匹配；输入框清空或点击成功均不能单独证明提交。
+回复读取兼容新旧消息 DOM，要求回复属于本次用户消息，且生成结束、正文稳定。
+无法确认提交时不会重复点击。诊断目录包含页面和对话正文，请留在本地。
+
 ## 项目目录
 
 ```text

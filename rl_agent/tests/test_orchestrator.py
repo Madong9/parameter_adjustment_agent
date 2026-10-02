@@ -4,6 +4,7 @@ import pytest
 
 from rl_training_agent.environment.inspector import EnvironmentInspector
 from rl_training_agent.environment.metric_registry import normalize_task_metrics
+from rl_training_agent.agents.reward_reviewer import RewardReviewAgent
 from rl_training_agent.orchestration.budget import BudgetTracker
 from rl_training_agent.orchestration.orchestrator import TrainingOrchestrator
 from rl_training_agent.orchestration.state_machine import AgentState, PersistentStateMachine
@@ -11,7 +12,8 @@ from rl_training_agent.providers.mock_provider import MockLLMReasoningProvider
 from rl_training_agent.providers.errors import ProviderTimeout
 from rl_training_agent.rewards.validator import RewardValidationError
 from rl_training_agent.schemas.decisions import DiagnosisItem, EvidenceItem, RewardChange, TrainingDiagnosis
-from rl_training_agent.schemas.rewards import RewardPlan
+from rl_training_agent.schemas.agent_workflow import TaskIntentSpec
+from rl_training_agent.schemas.rewards import CurriculumStage, RewardPlan
 from rl_training_agent.schemas.task import TaskSpec
 from rl_training_agent.schemas.visual import VisualBehaviorReport
 from rl_training_agent.settings import Settings, load_settings
@@ -68,6 +70,35 @@ def test_real_dynamic_run_stops_before_reward_design_when_probe_is_not_validated
     assert feasibility["dynamic_report"] is not None
     assert not provider.reward_design_called
     assert not (task_dir / "design_response.json").exists()
+
+
+def test_task_understanding_provider_failure_is_persisted_as_human_review(tmp_path):
+    """验证任务理解故障会结束上位机轮询，并记录真实失败阶段。"""
+    class BrokenTaskProvider(MockLLMReasoningProvider):
+        """模拟主 Provider 与备用 Provider 均不可用。"""
+
+        def understand_task(self, instruction, robot):
+            """在任务理解阶段报告网页推理超时。"""
+            raise ProviderTimeout("网页会话未导航到目标页面")
+
+    base = load_settings()
+    settings = Settings(**{
+        **base.dict(),
+        "experiment_root": str(tmp_path / "experiments"),
+        "artifact_root": str(tmp_path / "artifacts"),
+    })
+    result = TrainingOrchestrator(settings, BrokenTaskProvider(1)).train(
+        "Go2 前腿倒立前进", "go2", dry_run=True)
+    task_dir = settings.experiments_path / result["task_id"]
+    persisted = json.loads((task_dir / "state.json").read_text(encoding="utf-8"))
+    blocking = json.loads((task_dir / "blocking_report.json").read_text(encoding="utf-8"))
+
+    assert result["state"] == "HUMAN_REVIEW"
+    assert result["stage"] == "TASK_UNDERSTANDING"
+    assert result["recoverable"] is True
+    assert persisted["state"] == "HUMAN_REVIEW"
+    assert blocking == result
+    assert not (task_dir / "feasibility_report.json").exists()
 
 
 def test_orchestrator_trains_only_candidates_approved_by_reviewer(tmp_path):
@@ -337,6 +368,74 @@ def test_front_leg_support_instruction_corrects_task_and_injects_gated_rewards()
     assert {"front_leg_stand", "front_leg_walk"} <= names
     assert "tracking_lin_vel" not in names
     assert task_adjustments and any("补充前腿" in item for item in plan_adjustments)
+
+
+def test_front_leg_inverted_forward_aliases_are_safely_normalized_before_review():
+    """验证“前腿倒立前进”能移除虚构速度别名并保留可训练候选。"""
+    settings = load_settings()
+    manifest = EnvironmentInspector(settings.training_root).inspect("go2")
+    design = MockLLMReasoningProvider(1).design_task_and_rewards(
+        "向前行走", "go2", manifest.dict())
+    task = TaskSpec.parse_obj(design["task_spec"])
+    task.original_instruction = "机器狗两个前腿倒立前进，速度0.5m/s"
+    task.normalized_description = "Go2 使用两个前足支撑并向前移动"
+    plan = RewardPlan.parse_obj(design["reward_plans"][0])
+    tracking = next(item for item in plan.terms if item.name == "tracking_lin_vel")
+    plan.terms = [item for item in plan.terms if item.name != "tracking_lin_vel"]
+    stand_alias = tracking.copy(deep=True)
+    stand_alias.name = "tracking_lin_vel_stand"
+    stand_alias.active_phases = ["front_stand"]
+    stand_alias.weight = 0.0
+    walk_alias = tracking.copy(deep=True)
+    walk_alias.name = "tracking_lin_vel_walk"
+    walk_alias.active_phases = ["front_walk"]
+    plan.terms.extend([stand_alias, walk_alias])
+    plan.curriculum = [
+        CurriculumStage(
+            name="front_stand", start_iteration=0, end_iteration=100,
+            parameter_changes={
+                "commands": {"lin_vel_x": 0.0},
+                "reward_scales": {"tracking_lin_vel_stand": 0.0},
+            },
+        ),
+        CurriculumStage(
+            name="front_walk", start_iteration=100, end_iteration=200,
+            parameter_changes={
+                "commands": {"lin_vel_x": 0.5},
+                "reward_scales": {"tracking_lin_vel_walk": 0.5},
+            },
+        ),
+    ]
+
+    adjustments = TrainingOrchestrator._normalize_plan_for_task(task, plan)
+    names = {item.name for item in plan.terms}
+    intent = TaskIntentSpec(
+        original_instruction=task.original_instruction,
+        robot="go2", action_name="前腿倒立前进",
+        normalized_goal=task.normalized_description,
+    )
+    review = RewardReviewAgent().review(
+        intent, task, [plan], manifest.dict(), ["可能退化为四足行走"])
+
+    assert TrainingOrchestrator._is_front_leg_support_task(task)
+    assert {"front_leg_stand", "front_leg_walk"} <= names
+    assert not names.intersection({
+        "tracking_lin_vel", "tracking_lin_vel_stand", "tracking_lin_vel_walk", "orientation"})
+    assert plan.curriculum[0].parameter_changes["lin_vel_x"] == [0.0, 0.0]
+    assert plan.curriculum[1].parameter_changes["lin_vel_x"] == [0.5, 0.5]
+    assert "commands" not in plan.curriculum[0].parameter_changes
+    assert "tracking_lin_vel_stand" not in plan.curriculum[0].parameter_changes["reward_scales"]
+    assert review.approved and review.passed_candidate_indexes == [1]
+    assert any("tracking_lin_vel_walk" in item for item in adjustments)
+
+
+def test_front_leg_lift_request_is_not_misclassified_as_front_support():
+    """验证明确要求抬起前腿时不会被“前进”等词误判为前足支撑。"""
+    design = MockLLMReasoningProvider(1).design_task_and_rewards("向前行走", "go2", {})
+    task = TaskSpec.parse_obj(design["task_spec"])
+    task.original_instruction = "机器狗抬起前腿，用后腿向前移动"
+    task.normalized_description = task.original_instruction
+    assert not TrainingOrchestrator._is_front_leg_support_task(task)
 
 
 def test_backward_speed_is_compiled_into_command_stage_and_tracking_reward():

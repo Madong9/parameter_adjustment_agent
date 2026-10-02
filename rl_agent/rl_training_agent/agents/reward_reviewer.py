@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Sequence, Set
 from ..schemas.agent_workflow import RewardCandidateReview, RewardReviewReport, TaskIntentSpec
 from ..schemas.rewards import RewardPlan
 from ..schemas.task import TaskSpec
+from ..utils.task_semantics import is_front_leg_support_text
 
 
 class RewardReviewAgent:
@@ -20,10 +21,7 @@ class RewardReviewAgent:
     @staticmethod
     def _front_leg_task(intent: TaskIntentSpec) -> bool:
         """判断动作是否明确要求前腿支撑而非抬起前腿。"""
-        text = intent.original_instruction
-        support = any(token in text for token in ("站立", "行走", "走路"))
-        lifted = any(token in text for token in ("抬起前腿", "前腿离地", "前足离地"))
-        return any(token in text for token in ("前腿", "前脚", "前足")) and support and not lifted
+        return is_front_leg_support_text((intent.original_instruction,))
 
     def review(self, intent: TaskIntentSpec, task: TaskSpec, plans: Sequence[RewardPlan],
                capabilities: Dict[str, Any], global_risks: Sequence[str]) -> RewardReviewReport:

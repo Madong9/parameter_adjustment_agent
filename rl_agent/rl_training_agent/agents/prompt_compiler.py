@@ -12,7 +12,7 @@ from ..utils.io import sha256_text
 class RewardPromptCompiler:
     """使用仓库内固定模板生成可哈希、可审计的模型请求。"""
 
-    VERSION = "reward-design-v2"
+    VERSION = "reward-design-v3"
 
     def __init__(self, template_path: Path):
         """保存提示词模板路径。"""

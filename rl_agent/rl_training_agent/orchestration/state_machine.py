@@ -56,7 +56,9 @@ class StateRecord(BaseModel):
 ALLOWED_TRANSITIONS = {
     AgentState.RECEIVED: {AgentState.ENVIRONMENT_INSPECTED},
     AgentState.ENVIRONMENT_INSPECTED: {AgentState.TASK_UNDERSTANDING},
-    AgentState.TASK_UNDERSTANDING: {AgentState.TASK_FEASIBILITY_CHECK},
+    AgentState.TASK_UNDERSTANDING: {
+        AgentState.TASK_FEASIBILITY_CHECK, AgentState.HUMAN_REVIEW, AgentState.FAILED,
+    },
     AgentState.TASK_FEASIBILITY_CHECK: {
         AgentState.RAG_RETRIEVING, AgentState.CONTEXT_BUILDING,
         AgentState.MOTION_PROTOTYPE_GENERATING,

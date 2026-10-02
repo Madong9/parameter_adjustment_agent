@@ -35,6 +35,16 @@ def result(stdout="", stderr="", code=0):
     return subprocess.CompletedProcess([], code, stdout, stderr)
 
 
+def chatgpt_page(runner):
+    """为模拟浏览器显式提供合法页面地址，不放宽生产 URL 校验。"""
+    def wrapped(args, timeout):
+        """地址查询返回测试页，其余命令交给场景模拟器。"""
+        if "eval" in args and args[-1] == "JSON.stringify(location.href || '')":
+            return result(json.dumps("https://chatgpt.com/"))
+        return runner(args, timeout)
+    return wrapped
+
+
 def test_doctor_normal(monkeypatch):
     """验证“doctor normal”场景的预期行为。"""
     monkeypatch.setattr("shutil.which", lambda _: "/bin/opencli")
@@ -191,6 +201,37 @@ def test_bridge_disconnect_reports_actionable_chinese_error(monkeypatch):
         provider._ensure_bridge_connected()
 
 
+def test_open_expected_page_waits_until_chatgpt_url_is_real(monkeypatch):
+    """验证页面先为 about:blank 时会等待真实导航完成，而不是立即开始填词。"""
+    observed_urls = iter(["about:blank", "https://chatgpt.com/"])
+
+    def runner(args, timeout):
+        """模拟 open 返回后页面 URL 延迟更新。"""
+        if "eval" in args and "location.href" in args[-1]:
+            return result(json.dumps(next(observed_urls)))
+        return result("{}")
+
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    provider = OpenCLIChatGPTWebProvider(
+        settings=OpenCLISettings(connect_timeout=2), runner=runner)
+    provider._open_expected_page("https://chatgpt.com/", "ChatGPT")
+
+
+def test_state_rejects_about_blank_instead_of_waiting_for_response_timeout():
+    """验证绑定到空白页时立即返回可恢复错误，而不是等待完整模型超时。"""
+    def runner(args, timeout):
+        """返回看似正常的 state，但暴露真实空白页地址。"""
+        if "state" in args:
+            return result("ready")
+        if "eval" in args and "location.href" in args[-1]:
+            return result(json.dumps("about:blank"))
+        return result("{}")
+
+    provider = OpenCLIChatGPTWebProvider(runner=runner)
+    with pytest.raises(ProviderNeedsHuman, match="没有停留在"):
+        provider._state()
+
+
 def test_chatgpt_work_mode_is_switched_to_chat_mode(monkeypatch):
     """验证检测到工作模式时会点击稳定的聊天模式开关并确认状态。"""
     active = {"chat": False}
@@ -264,7 +305,7 @@ def test_doubao_json_reply_is_preserved_as_text():
     """验证豆包正文自身是合法 JSON 时不会被二次解析并丢成空字符串。"""
     provider = OpenCLIDoubaoWebProvider(
         settings=OpenCLISettings(doubao_session="doubao-test"),
-        runner=lambda args, timeout: result(json.dumps('{"ok":true}')))
+        runner=lambda args, timeout: result(json.dumps({"latest_assistant": '{"ok":true}'})))
     assert provider._latest_assistant() == '{"ok":true}'
 
 
@@ -275,6 +316,8 @@ def test_doubao_composer_is_cleared_before_verified_fill(monkeypatch):
     def runner(args, timeout):
         """模拟豆包页面状态、模式检查、填入和页面内全文校验。"""
         calls.append(args)
+        if "eval" in args and args[-1] == "JSON.stringify(location.href || '')":
+            return result(json.dumps("https://www.doubao.com/chat/"))
         if "state" in args:
             return result("chat_input 新对话")
         if "fill" in args:
@@ -290,6 +333,62 @@ def test_doubao_composer_is_cleared_before_verified_fill(monkeypatch):
     provider._fill_prompt("完整提示")
     assert any(call[-1] == "Control+a" for call in calls if "keys" in call)
     assert any(call[-1] == "Backspace" for call in calls if "keys" in call)
+
+
+def test_doubao_accepts_opencli_exact_fill_when_editor_node_is_replaced():
+    """验证 OpenCLI 已严格全文匹配时不被瞬时 ProseMirror 节点替换误判。"""
+    prompt = "机器狗两个前腿倒立前进，速度0.5m/s"
+    calls = []
+
+    def runner(args, timeout):
+        """模拟本次故障现场：fill 精确匹配，但二次 DOM 节点不可见。"""
+        calls.append(args)
+        if "state" in args:
+            return result("chat_input 新对话")
+        if "eval" in args and "location.href" in args[-1]:
+            return result(json.dumps("https://www.doubao.com/chat/"))
+        if "eval" in args:
+            return result('{"ok":true,"changed":false}')
+        if "fill" in args:
+            return result(json.dumps({
+                "filled": True, "verified": False, "matches_n": 1,
+                "match_level": "exact", "actual": prompt,
+            }, ensure_ascii=False))
+        return result('{"clicked":true}')
+
+    provider = OpenCLIDoubaoWebProvider(
+        settings=OpenCLISettings(doubao_session="doubao-test"), runner=runner)
+    provider._fill_prompt(prompt)
+    assert not any("actual_length" in call[-1] for call in calls if "eval" in call)
+
+
+def test_doubao_fill_failure_does_not_echo_prompt_in_error():
+    """验证填词失败日志只包含长度元数据，不泄露完整任务上下文。"""
+    prompt = "不应出现在错误中的机密任务提示"
+
+    def runner(args, timeout):
+        """模拟写入了不一致内容且页面二次验证失败。"""
+        if "state" in args:
+            return result("chat_input 新对话")
+        if "eval" in args and "location.href" in args[-1]:
+            return result(json.dumps("https://www.doubao.com/chat/"))
+        if "eval" in args and "actual_length" in args[-1]:
+            return result('{"found":false,"matches":false}')
+        if "eval" in args:
+            return result('{"ok":true,"changed":false}')
+        if "fill" in args:
+            return result(json.dumps({
+                "filled": True, "verified": False, "matches_n": 1,
+                "match_level": "partial", "actual": "错误内容",
+            }, ensure_ascii=False))
+        return result('{"clicked":true}')
+
+    provider = OpenCLIDoubaoWebProvider(
+        settings=OpenCLISettings(doubao_session="doubao-test"), runner=runner)
+    with pytest.raises(ProviderError) as error:
+        provider._fill_prompt(prompt)
+    assert prompt not in str(error.value)
+    assert "expected_length" in str(error.value)
 
 
 def test_bind_timeout_is_converted_to_human_recovery_instruction(monkeypatch):
@@ -315,6 +414,7 @@ def test_command_failure_keeps_stdout_and_stderr():
 def test_fill_uses_semantic_locator_and_verifies():
     """验证“fill uses semantic locator and verifies”场景的预期行为。"""
     calls = []
+    @chatgpt_page
     def runner(args, timeout):
         """执行 runner 对应的业务逻辑并返回结果。"""
         calls.append(args)
@@ -337,6 +437,7 @@ def test_fill_accepts_prosemirror_whitespace_after_full_verification():
     """验证富文本编辑器只增加段落空白时仍能通过严格规范化全文校验。"""
     calls = []
 
+    @chatgpt_page
     def runner(args, timeout):
         """模拟 OpenCLI 精确校验失败但页面内规范化全文一致。"""
         calls.append(args)
@@ -390,6 +491,7 @@ def test_submit_explicitly_clicks_enabled_send_button(monkeypatch):
     """验证提交动作显式点击已启用的发送按钮而不是模拟 Enter。"""
     calls = []
 
+    @chatgpt_page
     def runner(args, timeout):
         """返回发送按钮查找和点击所需的模拟 OpenCLI 响应。"""
         calls.append(args)
@@ -431,6 +533,8 @@ def test_send_verifies_submission_before_waiting_for_reply(monkeypatch):
     provider = OpenCLIChatGPTWebProvider(settings=OpenCLISettings(max_retries=1))
     events = []
     conversation = ConversationHandle(conversation_id="verified", title_hint="verified")
+    monkeypatch.setattr(provider, "_submission_snapshot", lambda: {
+        "latest_user": "old user", "latest_assistant": "old assistant"})
     monkeypatch.setattr(provider, "_latest_assistant", lambda: "old assistant")
     monkeypatch.setattr(provider, "_latest_user", lambda: "old user")
     monkeypatch.setattr(provider, "_fill_prompt", lambda prompt: events.append(("fill", prompt)))
@@ -445,14 +549,18 @@ def test_send_verifies_submission_before_waiting_for_reply(monkeypatch):
     assert [event[0] for event in events] == ["fill", "click", "verify", "wait", "record"]
 
 
-def test_submission_accepts_cleared_composer_before_delayed_message_dom(monkeypatch):
-    """验证新会话已清空编辑器时，不因用户消息 DOM 延迟而误报。"""
+def test_submission_rejects_cleared_composer_without_user_message(monkeypatch):
+    """验证编辑器清空但消息没有出现时，不能伪造提交成功。"""
     provider = OpenCLIChatGPTWebProvider(settings=OpenCLISettings(submit_timeout=1))
+    clock = iter([0.0, 2.0, 3.0])
+    monkeypatch.setattr("time.monotonic", lambda: next(clock))
+    monkeypatch.setattr(provider, "_state", lambda: "ready")
     monkeypatch.setattr(provider, "_submission_snapshot", lambda: {
         "latest_user": "", "composer_found": True, "composer_text": "",
         "url": "https://chatgpt.com/c/example", "generating": False,
     })
-    provider._wait_for_submission("", "请返回严格 JSON")
+    with pytest.raises(ProviderTimeout):
+        provider._wait_for_submission("", "请返回严格 JSON")
 
 
 def test_submission_does_not_accept_prompt_still_in_composer(monkeypatch):
@@ -567,14 +675,14 @@ def test_submitted_prompt_allows_rendered_markdown_but_rejects_truncation():
     assert not OpenCLIChatGPTWebProvider._matches_submitted_prompt(rendered[:-8], prompt)
 
 
-def test_submitted_prompt_accepts_unicode_format_and_single_dom_character():
-    """验证长提示词的零宽字符和单个 DOM 排版差异不会造成误报。"""
+def test_submitted_prompt_accepts_formatting_but_not_inserted_content():
+    """允许零宽排版字符，但不能用相似度忽略正文中的新增字符。"""
     prompt = ("请根据机器人环境能力生成严格 JSON，不得省略字段。" * 60)
     with_format_characters = "\u200b" + prompt[:500] + "\ufeff" + prompt[500:]
     assert OpenCLIChatGPTWebProvider._matches_submitted_prompt(
         with_format_characters, prompt)
     with_dom_marker = prompt[:700] + "↵" + prompt[700:]
-    assert OpenCLIChatGPTWebProvider._matches_submitted_prompt(with_dom_marker, prompt)
+    assert not OpenCLIChatGPTWebProvider._matches_submitted_prompt(with_dom_marker, prompt)
 
 
 def test_submitted_prompt_rejects_different_long_message():
@@ -600,6 +708,7 @@ def test_file_upload(monkeypatch, tmp_path):
     uploaded = []
     file = tmp_path / "image.png"
     file.write_bytes(b"png")
+    @chatgpt_page
     def runner(args, timeout):
         """执行 runner 对应的业务逻辑并返回结果。"""
         if "state" in args:
@@ -625,6 +734,7 @@ def test_image_upload_falls_back_to_chunked_data_transfer(monkeypatch, tmp_path)
     image.write_bytes(b"image-bytes" * 12000)
     eval_scripts = []
 
+    @chatgpt_page
     def runner(args, timeout):
         """模拟 set-file-input 返回 Not allowed 以及页面分块上传成功。"""
         if "state" in args:
@@ -670,6 +780,7 @@ def test_image_upload_does_not_hide_unrecoverable_error(tmp_path):
     image = tmp_path / "frame.png"
     image.write_bytes(b"png")
 
+    @chatgpt_page
     def runner(args, timeout):
         """模拟浏览器上传命令的不可恢复服务错误。"""
         if "state" in args:
@@ -695,6 +806,7 @@ def test_mixed_visual_request_uploads_document_and_images_separately(monkeypatch
     image.write_bytes(b"png")
     uploads = []
 
+    @chatgpt_page
     def runner(args, timeout):
         """分别模拟页面文档附件和 OpenCLI 图片附件上传成功。"""
         if "state" in args:
@@ -734,6 +846,7 @@ def test_document_upload_uses_in_page_file_object(monkeypatch, tmp_path):
     document = tmp_path / "requirements.md"
     document.write_text("训练要求", encoding="utf-8")
 
+    @chatgpt_page
     def runner(args, timeout):
         """模拟页面确认通过 JavaScript File 对象附加的需求文档。"""
         calls.append(args)
@@ -798,6 +911,7 @@ def test_long_schema_repair_is_also_sent_as_document(monkeypatch, tmp_path):
 def test_dom_change_falls_back_to_unnamed_textbox():
     """验证“dom change falls back to unnamed textbox”场景的预期行为。"""
     find_count = 0
+    @chatgpt_page
     def runner(args, timeout):
         """执行 runner 对应的业务逻辑并返回结果。"""
         nonlocal find_count
