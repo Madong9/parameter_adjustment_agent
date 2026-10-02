@@ -17,10 +17,12 @@ class DeterministicEvaluator:
         """用任务阈值检查一项确定性指标。"""
         value = metrics.get(threshold.name, float("nan"))
         scores = {"tracking_lin_vel", "front_leg_walk_velocity_tracking",
-                  "rear_leg_walk_velocity_tracking", "walking_speed_tracking", "orientation"}
+                  "rear_leg_walk_velocity_tracking", "walking_speed_tracking", "orientation", "landing_stability"}
         incompatible = (threshold.name in scores and threshold.unit not in ("", "1", "score", "ratio"))
         incompatible |= (threshold.name in {"front_leg_forward_speed", "rear_leg_forward_speed"}
                          and threshold.unit != "m/s")
+        physical_units = {"final_roll_angle": "rad", "max_roll_velocity": "rad/s", "feet_air_time": "s"}
+        incompatible |= (threshold.name in physical_units and threshold.unit != physical_units[threshold.name])
         passed = not incompatible and math.isfinite(value) and OPERATORS[threshold.operator](value, threshold.value)
         unit = "1" if threshold.name in scores else threshold.unit
         return MetricSummary(name=threshold.name, value=value, unit=unit, passed=passed)

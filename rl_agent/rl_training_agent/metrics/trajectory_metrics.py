@@ -21,6 +21,17 @@ class TrajectoryMetrics:
             metrics["jump_height"] = float(trajectory["base_z"].max() - trajectory["base_z"].iloc[0])
         if "roll" in trajectory:
             metrics["max_abs_roll"] = float(trajectory["roll"].abs().max())
+            # 欧拉角在 +/-pi 处回绕；完整侧翻必须依据展开后的净旋转，
+            # 不能用最大姿态角代替，也不能把来回摆动的路程累计成一圈。
+            angles = trajectory["roll"].to_numpy(dtype=float)
+            if np.isfinite(angles).all() and not trajectory.get(
+                    "termination_reason", pd.Series("", index=trajectory.index)).eq("reset").any():
+                unwrapped = np.unwrap(angles)
+                metrics["final_roll_angle"] = float(abs(unwrapped[-1] - unwrapped[0]))
+        if "base_wx" in trajectory:
+            rates = trajectory["base_wx"].to_numpy(dtype=float)
+            if np.isfinite(rates).all():
+                metrics["max_roll_velocity"] = float(np.abs(rates).max())
         if "pitch" in trajectory:
             metrics["max_abs_pitch"] = float(trajectory["pitch"].abs().max())
             metrics["body_pitch_within_limit"] = metrics["max_abs_pitch"]
@@ -59,6 +70,23 @@ class TrajectoryMetrics:
             metrics["front_leg_stand_duration"] = longest_duration(front_stand)
             metrics["stable_stand_duration"] = max(
                 metrics["rear_leg_stand_duration"], metrics["front_leg_stand_duration"])
+            if len(contact_columns) == 4 and "roll" in trajectory and "pitch" in trajectory:
+                all_contact = trajectory[contact_columns].astype(bool).all(axis=1)
+                airborne = ~trajectory[contact_columns].astype(bool).any(axis=1)
+                metrics["feet_air_time"] = float(airborne.sum() * dt)
+                # 落地验收只看最后一次腾空后的恢复窗口，初始站立不贡献分数。
+                flight = np.flatnonzero(airborne.to_numpy())
+                recovery_start = int(flight[-1]) + 1 if len(flight) else len(trajectory)
+                recovery = all_contact.iloc[recovery_start:].astype(float) * np.exp(
+                    -4.0 * (trajectory["roll"].iloc[recovery_start:] ** 2 +
+                            trajectory["pitch"].iloc[recovery_start:] ** 2))
+                metrics["landing_stability"] = float(recovery.mean()) if len(recovery) else 0.0
+                if len(flight):
+                    metrics["stable_stand_duration"] = longest_duration(
+                        (all_contact & upright).iloc[recovery_start:])
+                else:
+                    metrics["stable_stand_duration"] = max(
+                        metrics["stable_stand_duration"], longest_duration(all_contact & upright))
             forward = heading_forward_velocity(trajectory)
             for prefix, mask in (("front_leg", front_stand), ("rear_leg", rear_stand)):
                 values = forward[mask.to_numpy(dtype=bool)]

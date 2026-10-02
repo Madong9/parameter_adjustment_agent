@@ -17,6 +17,8 @@ EXPLICIT_ALIASES = {
     "stand_duration": "stable_stand_duration",
     "body_pitch": "body_pitch_within_limit",
     "body_roll": "roll_limit",
+    "roll_rotation": "final_roll_angle",
+    "roll_angular_velocity": "max_roll_velocity",
 }
 
 
@@ -38,7 +40,7 @@ def canonical_metric_name(name: str, supported: Iterable[str]) -> str:
         return "forbidden_body_contact" if "forbidden_body_contact" in supported_names else normalized
     if "pitch" in normalized:
         return "body_pitch_within_limit" if "body_pitch_within_limit" in supported_names else "pitch_limit"
-    if "roll" in normalized:
+    if "roll" in normalized and not any(word in normalized for word in ("velocity", "speed", "rotation", "final", "angular")):
         return "roll_limit" if "roll_limit" in supported_names else normalized
     side = "front" if "front" in normalized else "rear" if "rear" in normalized else ""
     if "stand" in normalized and ("duration" in normalized or "time" in normalized):

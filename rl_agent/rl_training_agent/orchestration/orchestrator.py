@@ -1013,7 +1013,7 @@ class TrainingOrchestrator:
         if unsupported:
             report = {"task_id": task_id, "state": AgentState.HUMAN_REVIEW.value,
                       "unsupported_requirements": unsupported,
-                      "reason": "required physical quantities are neither available nor derivable"}
+                      "reason": "任务所需物理量或验收指标尚不支持：%s" % "、".join(unsupported)}
             write_json(task_dir / "blocking_report.json", report)
             state.transition(AgentState.HUMAN_REVIEW)
             self._write_working_memory(task_dir, state)

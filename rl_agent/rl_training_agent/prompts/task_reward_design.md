@@ -15,3 +15,5 @@
 倒立前进的速度目标是地面水平航向速度，TaskSpec 和 RewardPlan 的 velocity_frame 必须为 heading。实际速度验收使用 front_leg_forward_speed，单位 m/s；front_leg_walk_velocity_tracking 是无量纲跟踪得分，不能标为 m/s。TaskPhase.scope=training 表示学习课程，scope=execution 表示用户明确要求的动作内阶段。未要求“先站立再行走”时，不得将学习阶段作为测试动作必须重演的顺序。
 
 只返回严格 JSON，顶层字段必须包含 `task_spec`、`reward_plans`、`reward_hacking_risks` 和 `termination_suggestions`。按照配置数量生成候选：候选 A 强调任务完成，候选 B 强调稳定性，候选 C 强调阶段化课程学习。不要输出 Python，也不要在 JSON 外添加解释。
+
+侧向翻转验收使用 final_roll_angle（展开 roll 后的净旋转绝对值，rad）、max_roll_velocity（机体纵轴角速度绝对值峰值，rad/s），不能使用 roll_limit 代替。feet_air_time 在验收中表示四足同时离地的总持续时间，单位 s，并非训练奖励累计值。landing_stability 是最后一次腾空后恢复窗口内的四足接触乘以 exp(-4*(roll²+pitch²)) 的均值，无腾空或无落地时得分为 0；stable_stand_duration 在存在腾空时只计算最后落地后的连续四足支撑且姿态安全的时长。验收指标必须在 ENVIRONMENT_MANIFEST.evaluation_metrics 中，不能仅因同名训练奖励存在就视为可验收。
