@@ -31,6 +31,7 @@ class TaskPhase(BaseModel):
     description: str
     entry_condition: str = ""
     exit_condition: str = ""
+    scope: Literal["execution", "training"] = "execution"
 
 
 class TrainingBudget(BaseModel):
@@ -52,6 +53,7 @@ class TaskSpec(BaseModel):
     task_name: str
     original_instruction: str
     normalized_description: str
+    velocity_frame: Literal["body", "heading"] = "body"
     initial_state: str
     required_behaviors: List[BehaviorRequirement]
     forbidden_behaviors: List[ForbiddenBehavior]

@@ -164,6 +164,21 @@ class TrainingOrchestrator:
         adjustments: List[str] = []
         if not TrainingOrchestrator._is_front_leg_support_task(task):
             return adjustments
+        # 用户描述地面前进速度，不能用倒立机体 x 分量或奖励得分代替。
+        if task.velocity_frame != "heading":
+            task.velocity_frame = "heading"
+            adjustments.append("前腿倒立速度验收统一为水平航向坐标，单位 m/s")
+        for metric in task.success_metrics:
+            if metric.name == "front_leg_walk_velocity_tracking" and metric.unit == "m/s":
+                metric.name = "front_leg_forward_speed"
+                adjustments.append("把误标为 m/s 的跟踪得分改为实际水平前进速度，保留阈值")
+        # 未明确要求动作内先站后走时，模型生成的学习阶段仅用于训练课程。
+        sequential = any(token in task.original_instruction for token in ("先", "然后", "再走", "再前进"))
+        if not sequential:
+            for phase in task.phases:
+                if phase.name in ("front_stand", "front_walk") and phase.scope != "training":
+                    phase.scope = "training"
+                    adjustments.append("将模型生成的站立/行走学习阶段标记为训练课程")
         for behavior in task.required_behaviors:
             if behavior.name == "front_leg_lifted_posture" or "前腿离地" in behavior.description:
                 behavior.name = "front_leg_support_posture"
@@ -178,6 +193,11 @@ class TrainingOrchestrator:
     def _normalize_plan_for_task(task: TaskSpec, plan: RewardPlan) -> List[str]:
         """继承任务验收指标，并移除后腿任务中会诱导爬行的冲突奖励。"""
         adjustments: List[str] = []
+        plan.velocity_frame = task.velocity_frame
+        for metric in plan.success_metrics:
+            if (task.velocity_frame == "heading" and metric.name == "front_leg_walk_velocity_tracking"
+                    and metric.unit == "m/s"):
+                metric.name = "front_leg_forward_speed"
         existing_metrics = {item.name for item in plan.success_metrics}
         for metric in task.success_metrics:
             if metric.required and metric.name not in existing_metrics:
@@ -195,15 +215,23 @@ class TrainingOrchestrator:
                 ))
                 adjustments.append("补充覆盖全程的确定性任务命令阶段")
             for stage in stages:
+                token = stage.name.lower()
+                standing = "stand" in token or "站" in stage.name
                 scale = stage.parameter_changes.get("command_scale", 1.0)
                 factor = max(0.0, float(scale)) if isinstance(scale, (int, float)) else 1.0
-                stage_target = command_target * factor
+                stage_target = 0.0 if standing else command_target * factor
                 stage.parameter_changes.update({
-                    "lin_vel_x": [stage_target, stage_target],
                     "lin_vel_y": [0.0, 0.0],
                     "ang_vel_yaw": [0.0, 0.0],
                     "heading": [0.0, 0.0],
                 })
+                requested = stage.parameter_changes.get("lin_vel_x")
+                values = list(requested) if isinstance(requested, (list, tuple)) else [requested]
+                legitimate_ramp = (values and all(isinstance(v, (int, float)) and
+                    0 <= v * command_target <= command_target ** 2 for v in values)
+                    and any(v != 0 for v in values))
+                if standing or not legitimate_ramp:
+                    stage.parameter_changes["lin_vel_x"] = [stage_target, stage_target]
             adjustments.append("按任务方向固定 lin_vel_x 命令：%.3f m/s" % command_target)
             tracking_required = any(
                 item.required and item.name == "tracking_lin_vel" for item in task.success_metrics)
@@ -275,7 +303,7 @@ class TrainingOrchestrator:
                 changes = stage.parameter_changes
                 # 模型偶发把命令放入嵌套 commands；运行时只接受白名单顶层键。
                 # 前面已经从用户目标编译了确定性命令，因此移除不可执行的副本。
-                if isinstance(changes.get("commands"), dict):
+                if "commands" in changes:
                     changes.pop("commands", None)
                     adjustments.append("移除不可执行的嵌套课程命令：%s" % stage.name)
                 reward_scales = changes.get("reward_scales")
@@ -301,6 +329,29 @@ class TrainingOrchestrator:
                         changes["lin_vel_x"] = (
                             [-0.35, -0.25] if float(value) < 0 else [0.25, 0.35])
                         adjustments.append("将前腿行走命令移出 Unitree 速度死区")
+            # 保证学习型站立阶段确实在训练时执行，而非由评估帧0推测。
+            if (all(any(p.scope == "training" and p.name == name for p in task.phases)
+                    for name in ("front_stand", "front_walk"))
+                    and not any("stand" in s.name.lower() or "站" in s.name for s in plan.curriculum)):
+                horizon = max(2, max((s.end_iteration + 1 for s in plan.curriculum), default=1000))
+                split = max(1, horizon // 5)
+                walking = sorted(plan.curriculum, key=lambda s: s.start_iteration)
+                if not walking:
+                    walking = [CurriculumStage(name="front_walk", start_iteration=0, end_iteration=horizon - 1,
+                        parameter_changes={"lin_vel_x": [command_target or 0.3, command_target or 0.3],
+                                           "lin_vel_y": [0.0, 0.0], "ang_vel_yaw": [0.0, 0.0],
+                                           "heading": [0.0, 0.0]})]
+                original = [(s.start_iteration, s.end_iteration) for s in walking]
+                for stage, (start, end) in zip(walking, original):
+                    stage.start_iteration = min(horizon - 1, split + start * (horizon - split) // horizon)
+                    stage.end_iteration = min(horizon - 1, max(stage.start_iteration,
+                        split + (end + 1) * (horizon - split) // horizon - 1))
+                if len(walking) == 1:
+                    walking[0].name = "front_walk"
+                plan.curriculum = [CurriculumStage(name="front_stand", start_iteration=0, end_iteration=split - 1,
+                        parameter_changes={"lin_vel_x": [0.0, 0.0], "lin_vel_y": [0.0, 0.0],
+                                           "ang_vel_yaw": [0.0, 0.0], "heading": [0.0, 0.0]})] + walking
+                adjustments.append("补充前腿站立到行走的连续训练课程")
             if "front_leg_stand" not in names:
                 plan.terms.append(RewardTerm(
                     name="front_leg_stand", implementation="registry:front_leg_stand",
@@ -327,7 +378,7 @@ class TrainingOrchestrator:
 
     @staticmethod
     def _explicit_locomotion_command(task: TaskSpec) -> Optional[float]:
-        """从明确包含方向和速度单位的任务描述中提取机体坐标 x 速度目标。"""
+        """从包含方向和速度单位的描述提取目标，坐标系由 task.velocity_frame 决定。"""
         speed_pattern = r"([0-9]+(?:\.[0-9]+)?)\s*(?:m\s*/\s*s|米\s*/\s*秒|米每秒)"
         backward_tokens = ("倒退", "倒着", "后退", "向后", "往后", "backward", "reverse")
         forward_tokens = ("向前", "前进", "forward")
@@ -670,6 +721,7 @@ class TrainingOrchestrator:
             "required_observations": list(task.required_observations),
             "required_sensors": list(task.required_sensors),
             "visual_evaluation_requirements": list(task.visual_evaluation_requirements),
+            "velocity_frame": task.velocity_frame,
         }
 
     @staticmethod
@@ -687,7 +739,11 @@ class TrainingOrchestrator:
         }
         if any(contract.get(key) != value for key, value in expected.items()):
             raise RuntimeError("验收合同不一致：改变目标/阈值应重新建立任务，不能复用旧运行")
-        if contract.get("task_identity") != TrainingOrchestrator._task_acceptance_identity(task):
+        identity = dict(contract.get("task_identity") or {})
+        identity.setdefault("velocity_frame", "body")
+        identity["phases"] = [dict(p, scope=p.get("scope", "execution"))
+                              for p in identity.get("phases", [])]
+        if identity != TrainingOrchestrator._task_acceptance_identity(task):
             raise RuntimeError("验收合同不一致：改变任务动作或行为要求应重新建立任务")
 
     def _run(self, instruction: str, robot: str, dry_run: bool, stop_after_plan: bool) -> Dict[str, Any]:
@@ -1357,7 +1413,7 @@ class TrainingOrchestrator:
                 "max_base_speed": max_speed, "fall_rate": fall_rate,
                 "speed_threshold": self.settings.counterfactual_zero_command_speed_max}
 
-    def _cached_round_rollout(self, round_root: Path) -> Optional[tuple]:
+    def _cached_round_rollout(self, round_root: Path, task: Optional[TaskSpec] = None) -> Optional[tuple]:
         """读取已完整采集的轮次，供 Provider 故障恢复时跳过昂贵的重复仿真。"""
         metrics_path = round_root / "rollout_metrics.json"
         if not metrics_path.is_file():
@@ -1368,6 +1424,12 @@ class TrainingOrchestrator:
             item_dir = round_root / str(item.get("rollout"))
             item["dir"] = item_dir
             item["media"] = self._media_for_rollout(item_dir)
+            if not item["media"]["trajectory"].is_file():
+                return None
+            # 可复用原始轨迹，不能复用旧验收口径计算的派生指标。
+            item["metrics"] = TrajectoryMetrics().compute(pd.read_parquet(item["media"]["trajectory"]))
+            if task is not None:
+                item["score"] = self._rollout_score(task, item["metrics"])
         representative_name = payload.get("representative_rollout")
         if not representative_name and records:
             representative_name = records[len(records) // 2].get("rollout")
@@ -1386,7 +1448,7 @@ class TrainingOrchestrator:
         state.transition(AgentState.ROLLOUT_COLLECTING, {"loop_round": round_index})
         round_root = selected["dir"] / "rollouts" / ("round_%02d" % round_index)
         if reuse_existing:
-            cached = self._cached_round_rollout(round_root)
+            cached = self._cached_round_rollout(round_root, task)
             if cached is not None:
                 return cached
         if dry_run:
@@ -1499,6 +1561,7 @@ class TrainingOrchestrator:
         """执行一轮 rollout、视觉评论、数值验收和结构化诊断。"""
         rollout_dir, media, rollout_records = self._collect_round_rollout(
             task, selected, dry_run, round_index, state, reuse_existing_rollout)
+        evaluation_key = hashlib.sha256(("acceptance-v2:" + task.json(sort_keys=True)).encode()).hexdigest()
         state.transition(AgentState.VISUAL_EVALUATING, {"loop_round": round_index})
         visual_records = ConservativeVisualAggregator.select(rollout_records)
         visual_reports = []
@@ -1512,7 +1575,9 @@ class TrainingOrchestrator:
                 if item_dir == rollout_dir:
                     representative_artifacts = item_artifacts
                 cached_report = item_dir / "visual_report_individual.json"
-                if cached_report.is_file():
+                cache_key_path = item_dir / "visual_evaluation_key.json"
+                if (cached_report.is_file() and cache_key_path.is_file() and
+                        read_json(cache_key_path).get("key") == evaluation_key):
                     report = VisualBehaviorReport.parse_obj(read_json(cached_report))
                 else:
                     report = self._provider_call(
@@ -1520,6 +1585,7 @@ class TrainingOrchestrator:
                         lambda: self.provider.critique_visual_behavior(
                             task, item_artifacts.visual_files))
                     write_json(cached_report, report)
+                    write_json(cache_key_path, {"key": evaluation_key})
                     atomic_write_text(item_dir / "visual_raw_response.txt",
                                       report.json(indent=2, ensure_ascii=False) + "\n")
                 visual_reports.append(report)
@@ -1591,7 +1657,9 @@ class TrainingOrchestrator:
         payload["long_term_memory"] = memory_context
         try:
             diagnosis_path = rollout_dir / "diagnosis.json"
-            if diagnosis_path.is_file():
+            diagnosis_key_path = rollout_dir / "diagnosis_evaluation_key.json"
+            if (diagnosis_path.is_file() and diagnosis_key_path.is_file() and
+                    read_json(diagnosis_key_path).get("key") == evaluation_key):
                 diagnosis = TrainingDiagnosis.parse_obj(read_json(diagnosis_path))
             else:
                 diagnosis = self._provider_call(
@@ -1622,6 +1690,7 @@ class TrainingOrchestrator:
             diagnosis.checkpoint_strategy = "restart_from_scratch"
             diagnosis.expected_effects.append("从随机初始化重新探索，摆脱持续四足支撑局部最优")
         write_json(rollout_dir / "diagnosis.json", diagnosis)
+        write_json(diagnosis_key_path, {"key": evaluation_key})
         write_json(rollout_dir / "decision.json", {
             "decision": diagnosis.decision, "checkpoint_strategy": diagnosis.checkpoint_strategy,
             "reward_changes": [item.dict() for item in diagnosis.reward_changes],
@@ -2008,7 +2077,12 @@ class TrainingOrchestrator:
             if budget.used_revisions >= budget.max_revisions or budget.used_iterations >= budget.max_iterations:
                 return self._finalize_loop(task, task_dir, state, selected, outcome, budget,
                                            loop_records, AgentState.HUMAN_REVIEW,
-                                           "自动闭环预算耗尽，目标仍未通过验收", dry_run)
+                                           "自动闭环预算耗尽，目标仍未通过验收；迭代 %s/%s，修订 %s/%s；"
+                                           "任务指标通过=%s，视觉通过=%s，硬约束通过=%s；待处理=%s" % (
+                                               budget.used_iterations, budget.max_iterations,
+                                               budget.used_revisions, budget.max_revisions,
+                                               evaluation.task_metrics_passed, evaluation.visual_alignment_passed,
+                                               evaluation.hard_constraints_passed, diagnosis.decision), dry_run)
             try:
                 selected = self._train_revision(
                     task, task_dir, state, selected, diagnosis, round_index, dry_run, budget)

@@ -71,6 +71,7 @@ class EnvironmentInspector:
                 "stable_stand_duration", "walking_speed_tracking", "body_pitch_within_limit",
                 "front_leg_stand_duration", "front_leg_walk_completion",
                 "front_leg_walk_velocity_tracking", "rear_leg_off_ground_ratio",
+                "front_leg_forward_speed", "rear_leg_forward_speed",
             ])
 
     def write(self, path: Path, robot: str = "go2") -> CapabilityManifest:

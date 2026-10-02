@@ -28,6 +28,7 @@ class RewardCompiler:
             "reward_version": plan.version, "parent_version": plan.parent_version,
             "robot": self.manifest.robot,
             "rewards": {
+                "velocity_frame": plan.velocity_frame,
                 "scales": scales,
                 # 保留阶段和参数元数据，真实训练包装器据此动态启停奖励并应用目标参数。
                 "terms": [item.dict() for item in plan.terms],

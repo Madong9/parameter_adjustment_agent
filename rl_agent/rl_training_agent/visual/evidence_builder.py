@@ -8,6 +8,7 @@ import pandas as pd
 
 from ..schemas.task import TaskSpec
 from ..utils.io import write_json
+from ..metrics.velocity import heading_forward_velocity
 from .frame_sampler import FrameSampler
 
 
@@ -196,6 +197,9 @@ class SynchronizedEvidenceBuilder:
                                    for value in trajectory["command"]], dtype=float)
         target_x = command_matrix[:, 0]
         measured_x = trajectory["base_vx"].astype(float).to_numpy()
+        forward_x = heading_forward_velocity(trajectory)
+        acceptance_x = forward_x if task.velocity_frame == "heading" else measured_x
+        front_forward = forward_x[front_support_stand.to_numpy(dtype=bool)]
         event_map = self._event_map(events)
         centers = sorted(set(int(event["frame"]) for event in events))
         window_indices = FrameSampler.event_indices(len(trajectory), centers, radius=3)
@@ -203,7 +207,7 @@ class SynchronizedEvidenceBuilder:
             positions = np.linspace(0, len(window_indices) - 1, 64, dtype=int)
             window_indices = sorted({window_indices[int(position)] for position in positions})
         evidence = {
-            "evidence_version": 1,
+            "evidence_version": 2,
             "scope": "同步物理行为证据；不包含 reward、PPO、loss 或训练分数",
             "task": {
                 "task_id": task.task_id,
@@ -211,6 +215,15 @@ class SynchronizedEvidenceBuilder:
                 "required_behaviors": [item.dict() for item in task.required_behaviors],
                 "forbidden_behaviors": [item.dict() for item in task.forbidden_behaviors],
                 "visual_requirements": task.visual_evaluation_requirements,
+                "velocity_frame": task.velocity_frame,
+                "success_metrics": [m.dict() for m in task.success_metrics],
+                "phases": [p.dict() for p in task.phases],
+            },
+            "phase_context": {
+                "evaluation_mode": "final_policy_rollout",
+                "training_phases": [p.name for p in task.phases if p.scope == "training"],
+                "execution_phases": [p.name for p in task.phases if p.scope == "execution"],
+                "note": "训练学习阶段不要求在测试录像中重演；仅 execution 阶段要求动作内顺序。不能由评估帧0的命令推断训练课程未执行。",
             },
             "coverage": {
                 "frame_count": int(len(trajectory)),
@@ -220,6 +233,20 @@ class SynchronizedEvidenceBuilder:
                 "all_frames_scanned_for_upright_and_contacts": True,
             },
             "command_tracking": {
+                "acceptance_velocity_frame": task.velocity_frame,
+                "front_support_heading_speed_mps": ({
+                    "mean": round(float(front_forward.mean()), 5),
+                    "sample_count": int(len(front_forward)),
+                    "note": "与 front_leg_forward_speed 同一前足支撑、后足离地姿态窗口",
+                } if len(front_forward) and np.isfinite(front_forward).all() else {"available": False}),
+                "score_metric_unit": "1 (无量纲)，不能与 m/s 阈值比较",
+                "measured_heading_forward_speed_mps": ({
+                    "mean": round(float(forward_x.mean()), 5),
+                    "min": round(float(forward_x.min()), 5), "max": round(float(forward_x.max()), 5),
+                } if np.isfinite(forward_x).all() else {"available": False}),
+                "acceptance_tracking_error_mps": ({
+                    "mean": round(float(np.abs(acceptance_x - target_x).mean()), 5),
+                } if np.isfinite(acceptance_x).all() else {"available": False}),
                 "command_vector_order": list(self.command_names),
                 "target_lin_vel_x_mps": {
                     "mean": round(float(target_x.mean()), 5), "min": round(float(target_x.min()), 5),

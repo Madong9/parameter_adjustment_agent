@@ -187,6 +187,25 @@ python scripts/opencli_direct_debug.py /tmp/rl-opencli-check --session rl-opencl
 提交校验兼容“文件”“文档”“代码”附件标签。Provider 修复后可在上位机再次
 选择“从当前策略继续闭环”，新进程会加载新代码并复用已有 checkpoint。
 
+倒立前进的速度验收使用水平航向坐标（`velocity_frame: heading`）和
+`front_leg_forward_speed`（m/s）；`front_leg_walk_velocity_tracking` 仍是无量纲
+得分，不能作为 m/s 阈值。训练奖励使用相同的水平坐标转换。学习阶段标记为
+`TaskPhase.scope: training`，用户明确要求的动作内阶段标记为 `execution`。
+最终策略录像不需要重演学习阶段，足端滑移、碰撞和姿态检查仍然保留。
+
+旧任务可先只读重算已有轨迹，再用 `--apply` 迁移已知的前腿验收错误：
+
+```bash
+python scripts/reassess_acceptance.py experiments/task-你的任务ID
+python scripts/reassess_acceptance.py experiments/task-你的任务ID --apply
+```
+
+迁移仅允许原验收合同与任务一致且状态为 `HUMAN_REVIEW` 的任务，保留阈值、
+安全约束、checkpoint 和已用预算；前后合同备份保存在 `acceptance_migrations/`。
+结果写入 `acceptance_reassessment.json`，物理通过不代表视觉通过。随后在上位机
+继续闭环会重新计算缓存轨迹的指标，并按新合同重新生成视觉报告和诊断。
+预算耗尽时允许复核已有证据，但不能继续训练或增加修订次数。
+
 ## 项目目录
 
 ```text

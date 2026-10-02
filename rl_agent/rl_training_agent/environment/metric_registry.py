@@ -59,6 +59,13 @@ def normalize_task_metrics(task: TaskSpec, supported: Iterable[str]) -> List[Dic
     for threshold in list(task.success_metrics) + list(task.safety_constraints):
         original = threshold.name
         canonical = canonical_metric_name(original, supported)
+        if (canonical == "front_leg_walk_velocity_tracking" and task.velocity_frame == "heading"
+                and threshold.unit == "m/s"):
+            speed_name = canonical.split("_walk_")[0] + "_forward_speed"
+            if speed_name in set(supported):
+                threshold.name = speed_name
+                mappings.append({"original": original, "canonical": speed_name})
+                continue
         threshold.name = canonical
         if canonical != original:
             mappings.append({"original": original, "canonical": canonical})

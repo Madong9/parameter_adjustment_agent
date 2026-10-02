@@ -4,6 +4,7 @@ from typing import Dict
 
 import numpy as np
 import pandas as pd
+from .velocity import heading_forward_velocity
 
 
 class TrajectoryMetrics:
@@ -58,6 +59,13 @@ class TrajectoryMetrics:
             metrics["front_leg_stand_duration"] = longest_duration(front_stand)
             metrics["stable_stand_duration"] = max(
                 metrics["rear_leg_stand_duration"], metrics["front_leg_stand_duration"])
+            forward = heading_forward_velocity(trajectory)
+            for prefix, mask in (("front_leg", front_stand), ("rear_leg", rear_stand)):
+                values = forward[mask.to_numpy(dtype=bool)]
+                if len(values) and np.isfinite(values).all():
+                    metrics[prefix + "_forward_speed"] = float(values.mean())
+                elif not len(values):
+                    metrics[prefix + "_forward_speed"] = 0.0
         if "command" in trajectory and "base_vx" in trajectory:
             def command_x(value: object) -> float:
                 """从 rollout 命令向量中读取前向速度目标。"""

@@ -84,6 +84,7 @@ class RewardConflict(BaseModel):
 class RewardPlan(BaseModel):
     task_id: str
     version: int
+    velocity_frame: Literal["body", "heading"] = "body"
     parent_version: Optional[int] = None
     design_rationale: List[str]
     terms: List[RewardTerm]

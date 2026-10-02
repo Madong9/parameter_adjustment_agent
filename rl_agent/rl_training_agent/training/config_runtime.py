@@ -138,7 +138,14 @@ def _apply_command_changes(target: Any, changes: Dict[str, Any], originals: Dict
 
 def prepare_training_env_config(env_cfg: Any, config: Dict[str, Any]) -> None:
     """在创建训练环境前注册全部奖励、参数和身体接触终止链接。"""
-    for name, weight in config["rewards"]["scales"].items():
+    scales = config["rewards"]["scales"]
+    if (config["rewards"].get("velocity_frame") == "heading" and
+            "front_leg_stand" in scales):
+        # 编译计划删除冲突奖励后，还必须关闭环境类继承的默认权重。
+        for name in ("tracking_lin_vel", "orientation", "landing_stability"):
+            if name not in scales and hasattr(env_cfg.rewards.scales, name):
+                setattr(env_cfg.rewards.scales, name, 0.0)
+    for name, weight in scales.items():
         if not hasattr(env_cfg.rewards.scales, name):
             raise ValueError("compiled reward is not registered: %s" % name)
         setattr(env_cfg.rewards.scales, name, float(weight))
@@ -169,6 +176,7 @@ def prepare_evaluation_env_config(env_cfg: Any, config: Dict[str, Any]) -> None:
 
 def install_runtime_terminations(env: Any, config: Dict[str, Any]) -> None:
     """给环境安装配置声明的 roll、pitch 终止检查。"""
+    install_velocity_tracking(env, config)
     pitch_limit = roll_limit = None
     for item in _enabled_terminations(config):
         name = str(item.get("name", "")).lower()
@@ -190,6 +198,27 @@ def install_runtime_terminations(env: Any, config: Dict[str, Any]) -> None:
             self.reset_buf |= self.rpy[:, 0].abs() > roll_limit
 
     env.check_termination = MethodType(check_termination_with_orientation, env)
+
+
+def install_velocity_tracking(env: Any, config: Dict[str, Any]) -> None:
+    """倒立任务用水平航向速度计算奖励，避免机体俯仰导致速度目标失真。"""
+    if config.get("rewards", {}).get("velocity_frame", "body") != "heading":
+        return
+    import torch
+
+    def tracking(self: Any) -> Any:
+        roll, pitch = self.rpy[:, 0], self.rpy[:, 1]
+        vx, vy, vz = self.base_lin_vel[:, 0], self.base_lin_vel[:, 1], self.base_lin_vel[:, 2]
+        horizontal = torch.stack((torch.cos(pitch) * vx + torch.sin(pitch) *
+            (torch.sin(roll) * vy + torch.cos(roll) * vz),
+            torch.cos(roll) * vy - torch.sin(roll) * vz), dim=1)
+        error = torch.sum(torch.square(self.commands[:, :2] - horizontal), dim=1)
+        return torch.exp(-error / self.cfg.rewards.tracking_sigma)
+
+    env._reward_tracking_lin_vel = MethodType(tracking, env)
+    for index, name in enumerate(getattr(env, "reward_names", [])):
+        if name == "tracking_lin_vel":
+            env.reward_functions[index] = env._reward_tracking_lin_vel
 
 
 def apply_runtime_stage(env: Any, config: Dict[str, Any], stage_name: Optional[str],

@@ -16,8 +16,14 @@ class DeterministicEvaluator:
     def _check(self, threshold: MetricThreshold, metrics: Dict[str, float]) -> MetricSummary:
         """用任务阈值检查一项确定性指标。"""
         value = metrics.get(threshold.name, float("nan"))
-        passed = math.isfinite(value) and OPERATORS[threshold.operator](value, threshold.value)
-        return MetricSummary(name=threshold.name, value=value, unit=threshold.unit, passed=passed)
+        scores = {"tracking_lin_vel", "front_leg_walk_velocity_tracking",
+                  "rear_leg_walk_velocity_tracking", "walking_speed_tracking", "orientation"}
+        incompatible = (threshold.name in scores and threshold.unit not in ("", "1", "score", "ratio"))
+        incompatible |= (threshold.name in {"front_leg_forward_speed", "rear_leg_forward_speed"}
+                         and threshold.unit != "m/s")
+        passed = not incompatible and math.isfinite(value) and OPERATORS[threshold.operator](value, threshold.value)
+        unit = "1" if threshold.name in scores else threshold.unit
+        return MetricSummary(name=threshold.name, value=value, unit=unit, passed=passed)
 
     def evaluate(self, task: TaskSpec, metrics: Dict[str, float], visual: VisualBehaviorReport) -> EvaluationResult:
         """执行视觉与确定性证据的联合评估。"""

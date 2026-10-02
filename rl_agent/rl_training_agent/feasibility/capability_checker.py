@@ -231,7 +231,8 @@ class CapabilityChecker:
         elif rear_leg_goal:
             success_options = {"rear_leg_stand_duration", "rear_stand_duration"}
         elif front_leg_goal and locomotion:
-            success_options = {"front_leg_walk_completion", "front_leg_walk_velocity_tracking"}
+            success_options = {"front_leg_walk_completion", "front_leg_walk_velocity_tracking",
+                               "front_leg_forward_speed"}
         elif front_leg_goal:
             success_options = {"front_leg_stand_duration"}
         elif jump_goal:

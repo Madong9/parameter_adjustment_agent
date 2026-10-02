@@ -4,6 +4,8 @@
 
 必须生成恰好 CANDIDATE_COUNT 个相互独立的奖励候选。每个 RewardTerm.name 以及 curriculum.parameter_changes.reward_scales 的键都必须逐字匹配环境清单中的已注册奖励名称。阶段差异只能通过 active_phases、课程阶段和已注册奖励的权重表示，禁止自行添加 `_stand`、`_walk` 等后缀来创造奖励别名。
 
+RewardPlan.velocity_frame 必须继承 TaskSpec.velocity_frame，倒立前进按 heading 水平航向速度优化。速度跟踪得分为无量纲，实际 m/s 验收使用 front_leg_forward_speed。训练学习阶段和动作执行阶段按 TaskPhase.scope 区分；课程静态站立命令为零，行走阶段用明确数值范围，禁止嵌套 commands。
+
 输出一个 TaskRewardBundle。任务成功必须由物理指标和视觉证据定义，不能用总奖励代替。奖励计划必须记录符号、权重、参数、归一化、阶段、依赖、预期趋势和投机风险；动态动作应使用课程或阶段设计。所有候选必须覆盖 TaskSpec 的必选成功指标。
 
 后腿站立行走必须同时使用 rear_leg_stand 和 rear_leg_walk，不得使用水平 orientation 与目标俯仰角对抗。前腿支撑、前腿倒立或前腿倒立前进任务必须同时使用 front_leg_stand 和 front_leg_walk，不得误解为前腿离地，也不得额外使用未门控的 tracking_lin_vel 或其阶段别名。
