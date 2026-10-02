@@ -88,6 +88,18 @@ def test_prompt_comparison_does_not_ignore_middle(replacement):
         prefix + replacement + suffix, prefix + "速度=0.5" + suffix)
 
 
+@pytest.mark.parametrize("prefix", [
+    "attachment_check.md文档\n", "requirements.md\nDocument\n",
+    "attachment_check.md文档\nbehavior_evidence.json文档\n", "requirements.md\n文件\n",
+    "attachment_check.md文档\nbehavior_evidence.json代码\n",
+])
+def test_submitted_prompt_accepts_document_attachment_label(prefix):
+    """新页面内联的文档标签不能让已提交且已回复的消息被误报超时。"""
+    prompt = "请读取附件，只返回 JSON。"
+    assert OpenCLIChatGPTWebProvider._matches_submitted_prompt(prefix + prompt, prompt)
+    assert not OpenCLIChatGPTWebProvider._matches_submitted_prompt(prefix + prompt, "请读取附件，只返回 XML。")
+
+
 def test_doubao_locator_exact_does_not_mean_text_exact():
     """定位器 exact 和 verified 标签不能代替实际全文比较。"""
     provider = OpenCLIDoubaoWebProvider()

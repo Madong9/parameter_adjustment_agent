@@ -30,7 +30,7 @@ from ..memory.reward_experience.schema import RewardExperienceNarrative
 from ..settings import OpenCLISettings, load_opencli_settings
 from ..utils.io import atomic_write_text, json_safe
 from .errors import ProviderError, ProviderNeedsHuman, ProviderResponseError, ProviderTimeout
-from .chatgpt_dom import CHATGPT_SNAPSHOT_SCRIPT
+from .chatgpt_dom import CHATGPT_ATTACH_FILES_SCRIPT, CHATGPT_SNAPSHOT_SCRIPT
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 Runner = Callable[[Sequence[str], int], subprocess.CompletedProcess]
@@ -613,7 +613,9 @@ class OpenCLIChatGPTWebProvider:
             return True
         if actual_normalized.endswith(prompt_normalized):
             attachment_prefix = actual_normalized[:-len(prompt_normalized)].strip()
-            safe_attachment = r'[^<>:"/\\|?*\x00-\x1f]{1,240}\.(?:md|txt|json|ya?ml|png|jpe?g|webp|gif)\s+文件'
+            safe_attachment = (r'[^<>:"/\\|?*\x00-\x1f]{1,240}'
+                               r'\.(?:md|txt|json|ya?ml|png|jpe?g|webp|gif)'
+                               r'\s*(?:文件|文档|代码|File|Document|Code)')
             if re.fullmatch(r"(?:%s\s*)+" % safe_attachment, attachment_prefix,
                             flags=re.IGNORECASE):
                 return True
@@ -648,20 +650,33 @@ class OpenCLIChatGPTWebProvider:
             'button[aria-label="发送提示"]:not([disabled])',
             'button[aria-label="发送"]:not([disabled])',
         ]
+        # 定位和点击在同一次页面执行中完成。扩展的坐标点击可能返回
+        # clicked=true 却没有触发发送，尤其在附件改变编辑器布局之后。
+        script = """
+(() => {
+  const selectors = %s;
+  for (const selector of selectors) {
+    const button = Array.from(document.querySelectorAll(selector)).find(item => {
+      const style = getComputedStyle(item);
+      return item.getClientRects().length > 0 && style.visibility !== 'hidden' &&
+        !item.disabled && item.getAttribute('aria-disabled') !== 'true' &&
+        item.getAttribute('aria-busy') !== 'true';
+    });
+    if (!button) continue;
+    button.click();
+    return JSON.stringify({clicked: true, selector});
+  }
+  return JSON.stringify({clicked: false});
+})()
+""" % json.dumps(selectors)
         deadline = time.monotonic() + self.settings.submit_timeout
         last_output = ""
         while time.monotonic() < deadline:
             self._state()
-            for selector in selectors:
-                found = self._browser(["find", "--css", selector, "--limit", "2"], allow_failure=True)
-                found_data = _json_from_output(found)
-                if not (isinstance(found_data, dict) and int(found_data.get("matches_n", 0)) > 0):
-                    continue
-                clicked = self._browser(["click", selector], allow_failure=True)
-                last_output = clicked
-                clicked_data = _json_from_output(clicked)
-                if isinstance(clicked_data, dict) and clicked_data.get("clicked"):
-                    return
+            last_output = self._browser(["eval", script])
+            clicked_data = self._parse_eval_result(last_output)
+            if isinstance(clicked_data, dict) and clicked_data.get("clicked"):
+                return
             time.sleep(0.25)
         self._check_page_usage_limit()
         detail = last_output[-1000:] if last_output else "没有发现已启用的发送按钮"
@@ -820,12 +835,10 @@ class OpenCLIChatGPTWebProvider:
   for (const document of documents) {
     transfer.items.add(new File([document.content], document.name, {type: document.type}));
   }
-  input.files = transfer.files;
-  input.dispatchEvent(new Event('change', {bubbles: true}));
-  return JSON.stringify({ok: true, count: input.files.length,
-    names: Array.from(input.files).map(file => file.name)});
+  %s
+  return JSON.stringify(attachFiles(input, transfer));
 })()
-""" % payload
+""" % (payload, CHATGPT_ATTACH_FILES_SCRIPT)
         output = self._browser(["eval", script])
         parsed = _json_from_output(output)
         if isinstance(parsed, str):
@@ -834,6 +847,7 @@ class OpenCLIChatGPTWebProvider:
         if not (isinstance(parsed, dict) and parsed.get("ok") and
                 int(parsed.get("count", 0)) == len(files) and parsed.get("names") == expected_names):
             raise ProviderError("ChatGPT 页面未确认需求文档附件：%s" % output[-2000:])
+        self._wait_for_upload_preview(expected_names, allow_media=False)
 
     @staticmethod
     def _recoverable_file_upload_error(error: Exception) -> bool:
@@ -917,25 +931,12 @@ class OpenCLIChatGPTWebProvider:
     for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
     transfer.items.add(new File([bytes], item.name, {type: item.type}));
   }
-  input.files = transfer.files;
-  const propsKey = Object.keys(input).find(key => key.startsWith('__reactProps$'));
-  if (propsKey && input[propsKey] && typeof input[propsKey].onChange === 'function') {
-    const nativeEvent = new Event('change', {bubbles: true});
-    input[propsKey].onChange({
-      target: input, currentTarget: input, nativeEvent,
-      preventDefault() {}, stopPropagation() {},
-      isDefaultPrevented() { return false; },
-      isPropagationStopped() { return false; }, persist() {}
-    });
-  } else {
-    input.dispatchEvent(new Event('input', {bubbles: true}));
-    input.dispatchEvent(new Event('change', {bubbles: true}));
-  }
-  const names = Array.from(input.files).map(file => file.name);
+  %s
+  const result = attachFiles(input, transfer);
   delete uploads[%s];
-  return JSON.stringify({ok: true, count: names.length, names});
+  return JSON.stringify(result);
 })()
-""" % (token_json, json.dumps(selector), nth, token_json, token_json)
+""" % (token_json, json.dumps(selector), nth, token_json, CHATGPT_ATTACH_FILES_SCRIPT, token_json)
             commit_output = self._browser(["eval", commit_script])
             commit_result = self._parse_eval_result(commit_output)
             expected_names = [path.name for path in files]
@@ -991,7 +992,7 @@ class OpenCLIChatGPTWebProvider:
         except Exception:
             return None
 
-    def _wait_for_upload_preview(self, file_names: List[str]) -> None:
+    def _wait_for_upload_preview(self, file_names: List[str], allow_media: bool = True) -> None:
         """等待 ChatGPT 编辑器显示全部附件名称或对应数量的媒体预览。"""
         names_json = json.dumps(file_names, ensure_ascii=False)
         deadline = time.monotonic() + self.settings.submit_timeout
@@ -999,13 +1000,16 @@ class OpenCLIChatGPTWebProvider:
             script = """
 (() => {
   const names = %s;
-  const text = document.body ? (document.body.innerText || '') : '';
-  if (names.filter(name => text.includes(name)).length >= names.length) return JSON.stringify(true);
   const composer = document.querySelector('#prompt-textarea, [data-testid="prompt-textarea"], [contenteditable="true"][role="textbox"]');
+  if (!composer) return JSON.stringify(false);
   let root = composer;
-  for (let index = 0; index < 6 && root && root.parentElement; index += 1) root = root.parentElement;
-  const scope = root || document.body;
+  for (let index = 0; index < 6 && root.parentElement &&
+       root.parentElement !== document.body; index += 1) root = root.parentElement;
+  const scope = composer.closest('form') || root;
   if (!scope) return JSON.stringify(false);
+  const text = scope.innerText || '';
+  if (names.every(name => text.includes(name))) return JSON.stringify(true);
+  if (!%s) return JSON.stringify(false);
   const visible = node => {
     if (!(node instanceof HTMLElement)) return false;
     const style = window.getComputedStyle(node);
@@ -1019,13 +1023,13 @@ class OpenCLIChatGPTWebProvider:
   const media = Array.from(scope.querySelectorAll('img[src], canvas, video, [style*="background-image"]')).filter(visible);
   return JSON.stringify(media.length >= names.length);
 })()
-""" % names_json
+""" % (names_json, "true" if allow_media else "false")
             output = self._browser(["eval", script], allow_failure=True)
             result = self._parse_eval_result(output)
             if result is True:
                 return
             time.sleep(0.5)
-        raise ProviderTimeout("ChatGPT 在 %s 秒内没有显示全部视觉评估附件预览：%s" %
+        raise ProviderTimeout("ChatGPT 在 %s 秒内没有显示全部附件预览：%s" %
                               (self.settings.submit_timeout, ", ".join(file_names)))
 
     def send_with_files(self, prompt: str, files: List[Path], conversation: ConversationHandle) -> str:

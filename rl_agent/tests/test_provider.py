@@ -497,16 +497,15 @@ def test_submit_explicitly_clicks_enabled_send_button(monkeypatch):
         calls.append(args)
         if "state" in args:
             return result("Message ChatGPT textbox")
-        if "find" in args:
-            return result('{"matches_n":1,"entries":[{"visible":true}]}')
-        if "click" in args:
+        if "eval" in args and "button.click()" in args[-1]:
             return result('{"clicked":true,"matches_n":1}')
         return result("{}")
 
     provider = OpenCLIChatGPTWebProvider(runner=runner)
     monkeypatch.setattr("time.sleep", lambda _: None)
     provider._click_send_button()
-    assert any("click" in call and "send-button" in " ".join(call) for call in calls)
+    assert any("eval" in call and "button.click()" in call[-1] and
+               "send-button" in call[-1] for call in calls)
     assert not any("keys" in call for call in calls)
 
 
@@ -525,7 +524,7 @@ def test_send_button_detects_usage_limit_from_full_page_before_click(monkeypatch
     monkeypatch.setattr("time.sleep", lambda _: None)
     with pytest.raises(ProviderNeedsHuman, match="工作用量已耗尽"):
         provider._click_send_button()
-    assert not any("click" in call for call in calls)
+    assert not any("click" in call or "button.click()" in call[-1] for call in calls)
 
 
 def test_send_verifies_submission_before_waiting_for_reply(monkeypatch):
@@ -822,8 +821,8 @@ def test_mixed_visual_request_uploads_document_and_images_separately(monkeypatch
             if "const documents" in script:
                 return result('{"ok":true,"count":1,"names":["visual_需求文档.md"]}')
             if "media.length" in script:
-                assert 'contact_sheet.png' in script
-                assert 'visual_需求文档.md' not in script
+                assert ('contact_sheet.png' in script or
+                        ('visual_需求文档.md' in script and 'if (!false)' in script))
                 return result("true")
         return result("{}")
 
@@ -853,6 +852,8 @@ def test_document_upload_uses_in_page_file_object(monkeypatch, tmp_path):
         if "state" in args:
             return result("Message ChatGPT textbox")
         if "eval" in args:
+            if "media.length" in args[-1]:
+                return result("true")
             return result('{"ok":true,"count":1,"names":["requirements.md"]}')
         return result("{}")
 

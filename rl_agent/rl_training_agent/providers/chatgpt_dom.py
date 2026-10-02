@@ -1,5 +1,28 @@
 """集中定义新旧 ChatGPT 网页的消息快照，供提交确认和回复读取共同使用。"""
 
+# React onChange 可以同步清空 input.files；返回交给处理器的文件清单，
+# 页面是否接收附件仍由编辑器预览验证，不能靠这里的 ok 判断。
+CHATGPT_ATTACH_FILES_SCRIPT = r"""
+const attachFiles = (input, transfer) => {
+  input.files = transfer.files;
+  const names = Array.from(input.files).map(file => file.name);
+  const propsKey = Object.keys(input).find(key => key.startsWith('__reactProps$'));
+  if (propsKey && input[propsKey] && typeof input[propsKey].onChange === 'function') {
+    const nativeEvent = new Event('change', {bubbles: true});
+    input[propsKey].onChange({
+      target: input, currentTarget: input, nativeEvent,
+      preventDefault() {}, stopPropagation() {},
+      isDefaultPrevented() { return false; },
+      isPropagationStopped() { return false; }, persist() {}
+    });
+  } else {
+    input.dispatchEvent(new Event('input', {bubbles: true}));
+    input.dispatchEvent(new Event('change', {bubbles: true}));
+  }
+  return {ok: true, count: names.length, names};
+};
+"""
+
 CHATGPT_SNAPSHOT_SCRIPT = r"""
 (() => {
   const roleOf = node => {
