@@ -19,3 +19,6 @@ RewardPlan.velocity_frame 必须继承 TaskSpec.velocity_frame，倒立前进按
 probe_evidence 中的跟踪失败、候选跌倒或优化未收敛只描述本次原型，不证明目标不可学习；给出的改进原因应作为假设。
 
 侧向翻转验收使用 final_roll_angle（展开 roll 后的净旋转绝对值，rad）、max_roll_velocity（机体纵轴角速度绝对值峰值，rad/s），不能使用 roll_limit 代替。feet_air_time 在验收中表示四足同时离地的总持续时间，单位 s，并非训练奖励累计值。landing_stability 是最后一次腾空后恢复窗口内的四足接触乘以 exp(-4*(roll²+pitch²)) 的均值，无腾空或无落地时得分为 0；stable_stand_duration 在存在腾空时只计算最后落地后的连续四足支撑且姿态安全的时长。验收指标必须在 ENVIRONMENT_MANIFEST.evaluation_metrics 中，不能仅因同名训练奖励存在就视为可验收。
+
+奖励执行约束：active_phases 指的是 curriculum 中的迭代学习阶段，不是测试动作内部的飞行/落地状态；每个非零奖励必须至少匹配一个真实课程阶段。动作内阶段必须使用已注册的接触门控奖励。不要填写无法执行的 activation_condition 文本，不要用未经支持的嵌套 schedule。课程调权写在 parameter_changes.reward_scales 中，保持奖励符号不变，命令范围须使用有限的明确数值。计划之外的默认奖励将关闭，必须显式列出所需任务项及安全惩罚。
+侧向翻跟头使用 takeoff_velocity（有足端接触时的世界向上速度）、airborne_duration（全部足端离地）、roll_rotation（只在腾空时跟踪纵轴角速度，roll_rate_target 默认 6 rad/s、roll_rate_sigma 默认 4）、landing_recovery（发生腾空后恢复足端支撑、低姿态误差及低速度）。这些奖励按真实接触状态门控，active_phases 使用 all。takeoff_velocity_target 默认 0.8 m/s。不要用 yaw 的 tracking_ang_vel 驱动侧翻，不要使用依赖行走命令的 feet_air_time 代替腾空奖励，不要在完整侧翻过程中启用普通 roll 跌倒终止或全程水平姿态/竖直速度/横向角速度惩罚。非足端碰撞与硬件限制仍必须独立验收，成功阈值不可降低。

@@ -14,6 +14,7 @@ REWARD_PARAMETER_NAMES = {
     "rear_stand_pitch_sigma",
     "front_stand_height_target", "front_stand_pitch_target", "front_stand_height_sigma",
     "front_stand_pitch_sigma",
+    "takeoff_velocity_target", "roll_rate_target", "roll_rate_sigma",
 }
 COMMAND_RANGE_NAMES = {"lin_vel_x", "lin_vel_y", "ang_vel_yaw", "heading"}
 
@@ -92,6 +93,8 @@ def curriculum_segments(config: Dict[str, Any], total_iterations: int) -> List[T
 def _apply_reward_parameters(env_cfg: Any, config: Dict[str, Any], stage_name: Optional[str] = None) -> None:
     """将白名单奖励参数写入环境配置。"""
     for term in config.get("rewards", {}).get("terms", []):
+        if stage_name is not None and not _phase_matches(term.get('active_phases', ['all']), stage_name):
+            continue
         for name, value in term.get("parameters", {}).items():
             if name in REWARD_PARAMETER_NAMES:
                 setattr(env_cfg.rewards, name, float(value))
@@ -139,6 +142,18 @@ def _apply_command_changes(target: Any, changes: Dict[str, Any], originals: Dict
 def prepare_training_env_config(env_cfg: Any, config: Dict[str, Any]) -> None:
     """在创建训练环境前注册全部奖励、参数和身体接触终止链接。"""
     scales = config["rewards"]["scales"]
+    from .action_rewards import ACTION_REWARDS, register_action_rewards
+    if set(scales) & set(ACTION_REWARDS):
+        from legged_gym.envs.base.legged_robot import LeggedRobot
+        register_action_rewards(LeggedRobot)
+        for name in ACTION_REWARDS:
+            setattr(env_cfg.rewards.scales, name, 0.0)
+        for name, value in {"takeoff_velocity_target": .8, "roll_rate_target": 6., "roll_rate_sigma": 4.}.items():
+            setattr(env_cfg.rewards, name, value)
+    # 显式计划是全部有效权重，不能继承未审核的默认奖励。
+    for name in dir(env_cfg.rewards.scales):
+        if not name.startswith('_') and isinstance(getattr(env_cfg.rewards.scales, name), (int, float)) and name not in scales:
+            setattr(env_cfg.rewards.scales, name, 0.0)
     if (config["rewards"].get("velocity_frame") == "heading" and
             "front_leg_stand" in scales):
         # 编译计划删除冲突奖励后，还必须关闭环境类继承的默认权重。
@@ -148,7 +163,13 @@ def prepare_training_env_config(env_cfg: Any, config: Dict[str, Any]) -> None:
     for name, weight in scales.items():
         if not hasattr(env_cfg.rewards.scales, name):
             raise ValueError("compiled reward is not registered: %s" % name)
-        setattr(env_cfg.rewards.scales, name, float(weight))
+        # 初始权重为零但后续课程启用的函数也必须进入环境的 reward_functions。
+        reserve = float(weight)
+        if reserve == 0:
+            reserve = next((float(s.get('parameter_changes', {}).get('reward_scales', {}).get(name, 0.))
+                            for s in config.get('curriculum', [])
+                            if s.get('parameter_changes', {}).get('reward_scales', {}).get(name, 0.)), 0.)
+        setattr(env_cfg.rewards.scales, name, reserve)
     _apply_reward_parameters(env_cfg, config)
     if any("body" in str(item.get("name", "")).lower() or
            "body contact" in str(item.get("condition", "")).lower()
@@ -182,9 +203,11 @@ def install_runtime_terminations(env: Any, config: Dict[str, Any]) -> None:
         name = str(item.get("name", "")).lower()
         condition = str(item.get("condition", "")).lower()
         if "pitch" in name or "pitch" in condition:
-            pitch_limit = _number_from_condition(condition, 1.0)
+            part = re.search(r'pitch[^<>]*[<>]=?\s*([0-9.]+)', condition)
+            pitch_limit = float(part.group(1)) if part else _number_from_condition(condition, 1.0)
         if "roll" in name or "roll" in condition:
-            roll_limit = _number_from_condition(condition, 0.8)
+            part = re.search(r'roll[^<>]*[<>]=?\s*([0-9.]+)', condition)
+            roll_limit = float(part.group(1)) if part else _number_from_condition(condition, 0.8)
     if pitch_limit is None and roll_limit is None:
         return
     original = env.check_termination

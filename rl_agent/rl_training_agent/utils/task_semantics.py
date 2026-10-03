@@ -4,6 +4,11 @@ from __future__ import annotations
 from typing import Iterable
 
 
+def is_side_flip_text(parts: Iterable[str]) -> bool:
+    text = ' '.join(str(part) for part in parts if part).lower()
+    return any(token in text for token in ('侧向翻', '侧翻', '侧空翻', 'side_flip', 'side flip', 'lateral flip'))
+
+
 def is_front_leg_support_text(parts: Iterable[str]) -> bool:
     """判断文本是否要求以前腿支撑，而不是要求把前腿抬离地面。"""
     text = " ".join(str(part) for part in parts if part).lower()

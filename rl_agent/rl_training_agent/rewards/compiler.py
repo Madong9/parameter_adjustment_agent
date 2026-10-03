@@ -45,7 +45,13 @@ class RewardCompiler:
         diff = "".join(difflib.unified_diff(before, after, fromfile="original-registry", tofile="config.yaml"))
         atomic_write_text(output_dir / "config.diff", diff)
         write_json(output_dir / "reward_plan.json", plan)
+        from ..training.config_runtime import reward_scales_for_stage
+        effective = {stage.name: reward_scales_for_stage(compiled, stage.name) for stage in plan.curriculum}
+        if not effective:
+            effective['all'] = reward_scales_for_stage(compiled, None)
+        write_json(output_dir / 'effective_reward_scales.json', effective)
         metadata = {"config_hash": sha256_text(canonical), "config_path": "config.yaml",
-                    "diff_path": "config.diff", "effective_terms": sorted(scales)}
+                    "diff_path": "config.diff", "effective_terms": sorted(scales),
+                    "effective_reward_scales": "effective_reward_scales.json"}
         write_json(output_dir / "compile_metadata.json", metadata)
         return metadata

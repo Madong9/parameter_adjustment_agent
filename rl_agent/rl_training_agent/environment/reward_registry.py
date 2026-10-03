@@ -114,4 +114,10 @@ class RewardRegistry:
                 config_key="rewards.scales.%s" % name, expected_raw_range=expected,
                 default_weight=weight, sign=sign,
                 dependencies=DEPENDENCIES.get(name, [])))
+        from ..training.action_rewards import ACTION_REWARDS
+        for name, dependencies in ACTION_REWARDS.items():
+            items.append(RewardRegistryItem(
+                name=name, implementation="rl_training_agent/training/action_rewards.py:_reward_" + name,
+                config_key="rewards.scales." + name, expected_raw_range=[0., 1.],
+                default_weight=0., sign="positive", dependencies=dependencies))
         return items

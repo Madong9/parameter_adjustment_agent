@@ -38,6 +38,13 @@ class RewardReviewAgent:
             candidate_omissions: List[str] = []
             candidate_conflicts: List[str] = []
             names = {item.name for item in plan.terms}
+            from ..rewards.validator import validate_plan_execution, RewardValidationError
+            try:
+                validate_plan_execution(plan)
+                from ..rewards.action_normalizer import validate_action_semantics
+                validate_action_semantics(task, plan)
+            except RewardValidationError as exc:
+                candidate_conflicts.append(str(exc))
             unknown = sorted(name for name in names if name not in registered)
             if unknown:
                 candidate_conflicts.append("包含未注册奖励：%s" % ", ".join(unknown))

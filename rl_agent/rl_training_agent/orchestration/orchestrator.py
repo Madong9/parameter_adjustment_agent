@@ -129,6 +129,8 @@ class TrainingOrchestrator:
     @staticmethod
     def _validate_plan_metric_coverage(task: TaskSpec, plan: RewardPlan) -> None:
         """确保奖励计划覆盖必选指标，并为后腿任务使用姿态门控奖励。"""
+        from ..rewards.action_normalizer import validate_action_semantics
+        validate_action_semantics(task, plan)
         required = {item.name for item in task.success_metrics if item.required}
         provided = {item.name for item in plan.success_metrics if item.required}
         missing = sorted(required - provided)
@@ -195,6 +197,8 @@ class TrainingOrchestrator:
         """继承任务验收指标，并移除后腿任务中会诱导爬行的冲突奖励。"""
         adjustments: List[str] = []
         plan.velocity_frame = task.velocity_frame
+        from ..rewards.action_normalizer import normalize_action_plan
+        adjustments.extend(normalize_action_plan(task, plan))
         for metric in plan.success_metrics:
             if (task.velocity_frame == "heading" and metric.name == "front_leg_walk_velocity_tracking"
                     and metric.unit == "m/s"):
@@ -375,6 +379,14 @@ class TrainingOrchestrator:
                     reward_hacking_risks=["仅瞬时匹配速度"],
                 ))
                 adjustments.append("补充前腿门控行走奖励：front_leg_walk")
+        for term in plan.terms:
+            if term.name in ('front_leg_stand', 'rear_leg_stand'):
+                term.active_phases = ['all']
+                term.activation_condition = None
+            elif term.name in ('front_leg_walk', 'rear_leg_walk'):
+                stages = [s.name for s in plan.curriculum if 'walk' in s.name.lower() or '行走' in s.name]
+                term.active_phases = stages or ['all']
+                term.activation_condition = None
         return adjustments
 
     @staticmethod
