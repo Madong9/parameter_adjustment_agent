@@ -16,11 +16,13 @@ def test_production_reward_design_and_revision_use_chatgpt(monkeypatch):
         def call(method):
             return lambda *args: calls.append((name, method)) or {'provider': name}
         return SimpleNamespace(design_task_bundle=call('bundle'),
-            design_task_and_rewards=call('legacy'), diagnose_training=call('diagnosis'))
+            design_task_and_rewards=call('legacy'), diagnose_training=call('diagnosis'),
+            redesign_rewards=call('redesign'))
     monkeypatch.setattr(ProviderRegistry, 'create', create)
     provider = MultiAgentProvider(settings)
     provider.design_task_bundle('compiled prompt')
     provider.design_task_and_rewards('walk', 'go2', {})
     provider.diagnose_training({})
-    assert calls == [('opencli', 'bundle'), ('opencli', 'legacy'), ('opencli', 'diagnosis')]
+    provider.redesign_rewards({})
+    assert calls == [('opencli', 'bundle'), ('opencli', 'legacy'), ('opencli', 'diagnosis'), ('opencli', 'redesign')]
     assert 'bailian' not in created and 'doubao' not in created

@@ -1726,13 +1726,81 @@ class TrainingOrchestrator:
         lineage["edges"].append({"parent": parent_id, "child": experiment_id})
         write_json(path, lineage)
 
+    def _redesign_failed_rewards(self, task: TaskSpec, task_dir: Path, selected: Dict[str, Any],
+                                 diagnosis: TrainingDiagnosis, round_index: int, manifest: Any) -> Any:
+        """保存失败分析，再请求独立完整设计；审核失败有限重试，不改变验收合同。"""
+        root = task_dir / 'reward_redesign' / ('round_%02d' % round_index)
+        root.mkdir(parents=True, exist_ok=True)
+        write_json(root / 'failure_analysis.json', diagnosis)
+        round_root = selected['dir'] / 'rollouts' / ('round_%02d' % round_index)
+        def load(path: Path) -> Any:
+            return read_json(path) if path.is_file() else None
+        payload = {
+            'immutable_task': task.dict(), 'previous_plan': selected['plan'].dict(),
+            'failure_analysis': diagnosis.dict(), 'environment_manifest': manifest.dict(),
+            'remaining_budget': load(task_dir / 'loop_status.json'),
+            'rollout_metrics': load(round_root / 'rollout_metrics.json'),
+            'visual_reports': [read_json(p) for p in sorted(round_root.glob('rollout_*/visual_report.json'))],
+            'reward_evidence': {p.parent.name: self._reward_evidence({'rewards': p})
+                                for p in sorted(round_root.glob('rollout_*/rewards.parquet'))},
+            'evaluations': [read_json(p) for p in sorted(round_root.glob('rollout_*/evaluation.json'))],
+            'ppo': PPOCollector().collect(selected['dir']).dict(),
+            'effective_reward_scales': load(selected['dir'] / 'effective_reward_scales.json'),
+        }
+        if not hasattr(self.provider, 'redesign_rewards'):
+            raise RewardValidationError('当前奖励 Provider 不支持失败后完整重设计')
+        intent_path = task_dir / 'task_intent.json'
+        intent = TaskIntentSpec.parse_obj(read_json(intent_path)) if intent_path.is_file() else TaskIntentSpec(
+            original_instruction=task.original_instruction, robot=task.robot,
+            action_name=task.task_name, normalized_goal=task.normalized_description)
+        for attempt in range(self.settings.reward_design_review_retries + 1):
+            write_json(root / ('request_%02d.json' % attempt), payload)
+            raw = self._provider_call(task_dir, 'reward_designer', 'redesign_rewards',
+                lambda: self.provider.redesign_rewards(payload))
+            try:
+                revised = RewardPlan.parse_obj(raw.dict() if hasattr(raw, 'dict') else raw)
+            except ValueError as exc:
+                payload['validation_feedback'] = str(exc)
+                atomic_write_text(root / ('validation_error_%02d.txt' % attempt), str(exc) + '\n')
+                if attempt == self.settings.reward_design_review_retries:
+                    raise RewardValidationError('重设计返回的计划格式非法：' + str(exc)) from exc
+                continue
+            revised.task_id = task.task_id
+            revised.parent_version = selected['plan'].version
+            revised.version = selected['plan'].version + 1
+            write_json(root / ('proposal_%02d.json' % attempt), revised)
+            try:
+                # 先核对模型原提案；不通过补指标或改阈值掩盖目标漂移。
+                for metric in task.success_metrics:
+                    if metric.required and not any(m.dict() == metric.dict() for m in revised.success_metrics):
+                        raise RewardValidationError('重设计不得改变或遗漏验收指标：' + metric.name)
+                audit = self._normalize_plan_for_task(task, revised)
+                self._validate_plan_metric_coverage(task, revised)
+                review = self.reward_reviewer.review(intent, task, [revised], manifest.dict(),
+                    ['失败后的新奖励必须重新验证收益、动作形态及安全约束'])
+                write_json(root / ('review_%02d.json' % attempt), review)
+                if not review.approved:
+                    raise RewardValidationError('重设计审核未通过：' + '；'.join(review.conflicts + review.omissions))
+                from ..rewards.validator import RewardPlanValidator
+                RewardPlanValidator(manifest.rewards, self.settings.max_abs_reward_weight).validate(revised)
+                write_json(root / 'approved_reward_plan.json', revised)
+                return revised, ['GPT 基于失败分析和建议独立重设计完整奖励计划'] + audit
+            except RewardValidationError as exc:
+                payload['validation_feedback'] = str(exc)
+                atomic_write_text(root / ('validation_error_%02d.txt' % attempt), str(exc) + '\n')
+                if attempt == self.settings.reward_design_review_retries:
+                    raise
+        raise RewardValidationError('重设计未产生可执行计划')
+
     def _compile_revision(self, task: TaskSpec, task_dir: Path, state: PersistentStateMachine,
                           selected: Dict[str, Any], diagnosis: TrainingDiagnosis,
                           round_index: int, dry_run: bool) -> Dict[str, Any]:
         """执行诊断修改、任务专用规范化和安全编译，生成新的候选版本目录。"""
         self._validate_acceptance_contract(task_dir, task, state)
         manifest = self.inspector.inspect(task.robot)
-        if diagnosis.reward_changes or diagnosis.curriculum_changes:
+        if self.settings.failure_reward_redesign and not dry_run:
+            revised, audit = self._redesign_failed_rewards(task, task_dir, selected, diagnosis, round_index, manifest)
+        elif diagnosis.reward_changes or diagnosis.curriculum_changes:
             reviser = RewardPlanReviser(manifest.rewards, self.settings.max_abs_reward_weight)
             revised, audit = reviser.revise(selected["plan"], diagnosis)
         else:
@@ -2077,6 +2145,17 @@ class TrainingOrchestrator:
                                            loop_records, AgentState.HUMAN_REVIEW, reason, dry_run)
             diagnosis = outcome["diagnosis"]
             evaluation = outcome["evaluation"]
+            if not evaluation.completed:
+                failure_root = task_dir / 'failure_analysis'
+                failure_root.mkdir(exist_ok=True)
+                write_json(failure_root / ('round_%02d.json' % round_index), diagnosis)
+                # 当前策略失败不证明任务不可实现；有预算则进入完整重设计。
+                if (self.settings.failure_reward_redesign and not dry_run and
+                        diagnosis.decision == 'failed' and
+                        budget.used_revisions < budget.max_revisions and
+                        budget.used_iterations < budget.max_iterations):
+                    diagnosis.decision = 'restart'
+                    diagnosis.checkpoint_strategy = 'restart_from_scratch'
             record = {
                 "round": round_index, "experiment_id": selected["id"],
                 "reward_version": selected["plan"].version, "decision": diagnosis.decision,
@@ -2104,6 +2183,11 @@ class TrainingOrchestrator:
                 return self._finalize_loop(task, task_dir, state, selected, outcome, budget,
                                            loop_records, AgentState.COMPLETED,
                                            "视觉、任务指标和硬约束全部通过", dry_run)
+            if (self.settings.failure_reward_redesign and not dry_run and
+                    (budget.used_revisions >= budget.max_revisions or budget.used_iterations >= budget.max_iterations)):
+                return self._finalize_loop(task, task_dir, state, selected, outcome, budget,
+                    loop_records, AgentState.HUMAN_REVIEW,
+                    '自动闭环预算耗尽；已保存 GPT 失败分析与建议，未执行新奖励训练', dry_run)
             if diagnosis.decision == "failed":
                 return self._finalize_loop(task, task_dir, state, selected, outcome, budget,
                                            loop_records, AgentState.FAILED, "诊断判定任务不可恢复", dry_run)

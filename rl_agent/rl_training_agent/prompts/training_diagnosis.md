@@ -12,4 +12,6 @@
 
 只返回严格的 `TrainingDiagnosis` JSON。
 
+每轮未通过验收必须给出 suggestions：针对证据的具体改进建议、检查方法及局限。区分已观察事实与原因假设。没有剩余预算时仍提供分析和建议，但明确无法执行；不得仅因当前策略失败就声称动作不可实现。下一步将由独立奖励设计请求依据分析和建议产生完整新计划，不必用有限的权重修改代替完整设计。
+
 奖励参数必须有实际实现，不得凭空添加阈值或调度字段。airborne_duration 支持 min_air_time_threshold（非负秒数，默认 0），表示同一回合连续全部足端离地达到该时长后才开始获得腾空奖励；落地或回合重置会清零计时。roll_rotation 支持 roll_rate_target 与 roll_rate_sigma，takeoff_velocity 支持 takeoff_velocity_target。weight、weight_delta、weight_multiplier 优先只选一种表达，不能假设未实现的参数会自动生效。诊断中的建议需区分已观察事实与修改效果假设。

@@ -20,7 +20,7 @@ from ..agents.context_builder import ContextBuilder
 from ..schemas.agent_workflow import TaskIntentSpec, TaskRewardBundle
 from ..feasibility.motion_prototype.schema import MotionPrototype
 from ..feasibility.prompts import MOTION_PROTOTYPE_PROMPT
-from ..schemas.decisions import TrainingDiagnosis
+from ..schemas.decisions import TrainingDiagnosis, GPTTrainingDiagnosis
 from ..schemas.experiments import ConversationHandle, ProviderHealth
 from ..schemas.rewards import RewardPlan
 from ..schemas.task import TaskSpec
@@ -1217,6 +1217,13 @@ class OpenCLIChatGPTWebProvider:
         return self._request_model(
             compiled_prompt, TaskRewardBundle, "compiled-reward-design").dict()
 
+    def redesign_rewards(self, payload: Dict[str, Any]) -> RewardPlan:
+        """根据失败证据及诊断建议重新设计完整计划，任务验收保持固定。"""
+        template = (Path(__file__).parents[1] / "prompts" / "failure_reward_redesign.md").read_text(encoding="utf-8")
+        prompt = template + "\nEvidence: " + json.dumps(json_safe(payload), ensure_ascii=False, allow_nan=False)
+        prompt += "\nJSON Schema: " + RewardPlan.schema_json()
+        return self._request_model(prompt, RewardPlan, "failure-reward-redesign")
+
     def design_visual_evaluation(self, task: TaskSpec) -> Dict[str, Any]:
         """为任务生成视觉评估输入与事件设计。"""
         template = (Path(__file__).parents[1] / "prompts" / "visual_spec_design.md").read_text(encoding="utf-8")
@@ -1256,8 +1263,8 @@ class OpenCLIChatGPTWebProvider:
         template = (Path(__file__).parents[1] / "prompts" / "training_diagnosis.md").read_text(encoding="utf-8")
         prompt = (template + "\nEvidence: " +
                   json.dumps(json_safe(payload), ensure_ascii=False, separators=(",", ":"), allow_nan=False) +
-                  "\nJSON Schema: " + TrainingDiagnosis.schema_json())
-        return self._request_model(prompt, TrainingDiagnosis, "training-diagnosis")
+                  "\nJSON Schema: " + GPTTrainingDiagnosis.schema_json())
+        return self._request_model(prompt, GPTTrainingDiagnosis, "training-diagnosis")
 
     def summarize_reward_experience(self, payload: Dict[str, Any]) -> RewardExperienceNarrative:
         """使用普通聊天模式归纳受证据 ID 限定的奖励实验叙述。"""

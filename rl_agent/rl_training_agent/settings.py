@@ -44,6 +44,8 @@ class Settings(BaseModel):
     visual_critic_provider: str = "opencli"
     diagnosis_provider: str = "opencli"
     num_reward_candidates: int = 3
+    reward_design_review_retries: int = 2
+    failure_reward_redesign: bool = True
     smoke_iterations: int = 50
     screening_iterations: int = 300
     trend_iterations: int = 500
@@ -104,7 +106,7 @@ class Settings(BaseModel):
             raise ValueError("must be positive")
         return value
 
-    @validator("max_reward_revisions", "exploration_max_revisions")
+    @validator("max_reward_revisions", "exploration_max_revisions", "reward_design_review_retries")
     def nonnegative_revisions(cls, value: int) -> int:
         """允许关闭自动修订，但不允许负数修订预算。"""
         if value < 0:
