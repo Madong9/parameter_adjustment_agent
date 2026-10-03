@@ -20,14 +20,26 @@ def _reward_takeoff_velocity(self):
 
 
 def _reward_airborne_duration(self):
-    return (~_contacts(self).any(dim=1)).float()
+    import torch
+    airborne = ~_contacts(self).any(dim=1)
+    threshold = getattr(self.cfg.rewards, 'min_air_time_threshold', 0.)
+    if threshold <= 0:
+        return airborne.float()
+    if not hasattr(self, '_agent_air_time'):
+        self._agent_air_time = torch.zeros_like(self.base_ang_vel[:, 0])
+    self._agent_air_time *= self.episode_length_buf > 1
+    self._agent_air_time = torch.where(airborne, self._agent_air_time + self.dt,
+                                      torch.zeros_like(self._agent_air_time))
+    return (airborne & (self._agent_air_time >= threshold)).float()
 
 
 def _reward_roll_rotation(self):
     import torch
     # 横向翻转需要纵轴角速度，不能用 yaw 跟踪替代。目标有方向且只在腾空时激活。
     error = (self.base_ang_vel[:, 0] - self.cfg.rewards.roll_rate_target) ** 2
-    return _reward_airborne_duration(self) * torch.exp(-error / self.cfg.rewards.roll_rate_sigma)
+    # 不调用有计时副作用的腾空奖励，避免同一步重复累计时长。
+    airborne = (~_contacts(self).any(dim=1)).float()
+    return airborne * torch.exp(-error / self.cfg.rewards.roll_rate_sigma)
 
 
 def _reward_landing_recovery(self):

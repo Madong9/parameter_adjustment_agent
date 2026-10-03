@@ -11,3 +11,5 @@
 `reward_changes` 必须可直接执行：`term` 只能取当前能力清单/计划中的注册奖励；`action` 为 add/remove/update；`changes` 只可包含 `weight`、`weight_delta`、`weight_multiplier`、`parameters`、`active_phases`、`activation_condition`、`normalization`、`expected_training_trend`、`purpose`、`reward_hacking_risks`、`failure_modes_addressed`。`curriculum_changes.changes` 可包含 `start_iteration`、`end_iteration`、`parameter_changes` 或合法课程参数。根据失败是否需要重新探索选择 `continue_from_current` 或 `restart_from_scratch`。
 
 只返回严格的 `TrainingDiagnosis` JSON。
+
+奖励参数必须有实际实现，不得凭空添加阈值或调度字段。airborne_duration 支持 min_air_time_threshold（非负秒数，默认 0），表示同一回合连续全部足端离地达到该时长后才开始获得腾空奖励；落地或回合重置会清零计时。roll_rotation 支持 roll_rate_target 与 roll_rate_sigma，takeoff_velocity 支持 takeoff_velocity_target。weight、weight_delta、weight_multiplier 优先只选一种表达，不能假设未实现的参数会自动生效。诊断中的建议需区分已观察事实与修改效果假设。

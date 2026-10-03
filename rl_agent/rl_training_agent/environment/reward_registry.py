@@ -119,5 +119,6 @@ class RewardRegistry:
             items.append(RewardRegistryItem(
                 name=name, implementation="rl_training_agent/training/action_rewards.py:_reward_" + name,
                 config_key="rewards.scales." + name, expected_raw_range=[0., 1.],
+                parameters=({'min_air_time_threshold': 0.} if name == 'airborne_duration' else {}),
                 default_weight=0., sign="positive", dependencies=dependencies))
         return items

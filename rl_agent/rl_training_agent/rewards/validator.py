@@ -56,12 +56,15 @@ def validate_plan_execution(plan: RewardPlan, max_abs_weight: float = 100.0) -> 
         if term.weight and stages and not any(_phase_matches(term.active_phases, stage.name) for stage in stages):
             raise RewardValidationError('奖励在所有训练阶段均未激活：' + term.name)
         if set(term.parameters) - REWARD_PARAMETER_NAMES:
-            raise RewardValidationError('奖励参数没有运行时实现：' + term.name)
+            raise RewardValidationError('奖励参数没有运行时实现：%s；不支持的参数：%s' % (
+                term.name, ', '.join(sorted(set(term.parameters) - REWARD_PARAMETER_NAMES))))
         for name, value in term.parameters.items():
             if not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise RewardValidationError('奖励参数不是有限数值：' + name)
             if ('sigma' in name or name == 'takeoff_velocity_target') and value <= 0:
                 raise RewardValidationError('奖励尺度必须大于零：' + name)
+            if name == 'min_air_time_threshold' and value < 0:
+                raise RewardValidationError('最小腾空时间不能为负数')
 
 
 class RewardPlanValidator:

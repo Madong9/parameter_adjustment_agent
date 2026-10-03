@@ -143,3 +143,49 @@ def test_flip_conflicting_hard_constraints_are_retained_and_rejected():
     assert 'abs(roll)' in plan.terminations[0].condition
     with pytest.raises(RewardValidationError, match='硬约束冲突'):
         validate_action_semantics(task, plan)
+
+
+def test_airborne_threshold_counts_once_and_resets_on_contact_and_episode():
+    torch = pytest.importorskip('torch')
+    class Env:
+        pass
+    register_action_rewards(Env)
+    env = Env()
+    env.dt = .05
+    env.feet_indices = torch.arange(4)
+    env.contact_forces = torch.zeros(1, 4, 3)
+    env.base_ang_vel = torch.tensor([[6., 0., 0.]])
+    env.episode_length_buf = torch.tensor([5])
+    env.cfg = SimpleNamespace(rewards=SimpleNamespace(min_air_time_threshold=.15, roll_rate_target=6., roll_rate_sigma=4.))
+    assert env._reward_airborne_duration().item() == 0.
+    before = env._agent_air_time.clone()
+    env._reward_roll_rotation()
+    assert torch.equal(before, env._agent_air_time)
+    assert env._reward_airborne_duration().item() == 0.
+    assert env._reward_airborne_duration().item() == 1.
+    env.contact_forces[:, :, 2] = 2.
+    assert env._reward_airborne_duration().item() == 0.
+    assert env._agent_air_time.item() == 0.
+    env.contact_forces[:] = 0.
+    assert env._reward_airborne_duration().item() == 0.
+    env.episode_length_buf[:] = 0
+    assert env._reward_airborne_duration().item() == 0.
+    assert env._agent_air_time.item() == pytest.approx(.05)
+
+
+def test_airborne_threshold_revision_is_executable(tmp_path):
+    from rl_training_agent.rewards.reviser import RewardPlanReviser
+    from rl_training_agent.schemas.decisions import TrainingDiagnosis, RewardChange
+    manifest = EnvironmentInspector(load_settings().training_root).inspect('go2')
+    parent = RewardPlan(task_id='task-airborne', version=1, design_rationale=['test'], terms=[
+        RewardTerm(name='airborne_duration', implementation='native', purpose='test', weight=1.)])
+    diagnosis = TrainingDiagnosis(decision='revise_reward', confidence=.9, diagnosis=[], evidence=[],
+        checkpoint_strategy='continue_from_current', reward_changes=[
+        RewardChange(term='airborne_duration', action='update', rationale='test',
+                     changes={'parameters': {'min_air_time_threshold': .15}, 'weight': 2.})])
+    revised, audit = RewardPlanReviser(manifest.rewards).revise(parent, diagnosis)
+    RewardCompiler(manifest).compile(revised, tmp_path)
+    assert revised.terms[0].parameters['min_air_time_threshold'] == .15
+    revised.terms[0].parameters['min_air_time_threshold'] = -.1
+    with pytest.raises(RewardValidationError, match='不能为负数'):
+        validate_plan_execution(revised)

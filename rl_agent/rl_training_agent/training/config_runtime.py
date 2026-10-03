@@ -15,6 +15,7 @@ REWARD_PARAMETER_NAMES = {
     "front_stand_height_target", "front_stand_pitch_target", "front_stand_height_sigma",
     "front_stand_pitch_sigma",
     "takeoff_velocity_target", "roll_rate_target", "roll_rate_sigma",
+    "min_air_time_threshold",
 }
 COMMAND_RANGE_NAMES = {"lin_vel_x", "lin_vel_y", "ang_vel_yaw", "heading"}
 
@@ -148,7 +149,8 @@ def prepare_training_env_config(env_cfg: Any, config: Dict[str, Any]) -> None:
         register_action_rewards(LeggedRobot)
         for name in ACTION_REWARDS:
             setattr(env_cfg.rewards.scales, name, 0.0)
-        for name, value in {"takeoff_velocity_target": .8, "roll_rate_target": 6., "roll_rate_sigma": 4.}.items():
+        for name, value in {"takeoff_velocity_target": .8, "roll_rate_target": 6., "roll_rate_sigma": 4.,
+                            "min_air_time_threshold": 0.}.items():
             setattr(env_cfg.rewards, name, value)
     # 显式计划是全部有效权重，不能继承未审核的默认奖励。
     for name in dir(env_cfg.rewards.scales):
