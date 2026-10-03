@@ -1,4 +1,4 @@
-"""按角色把 OpenCLI/GPT 与百炼 GLM 组合成一个兼容 Provider。"""
+"""按角色组合配置的推理 Provider，默认奖励设计与修订使用 OpenCLI/GPT。"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -20,7 +20,7 @@ class MultiAgentProvider:
     """为每个推理职责选择独立 Provider，同时兼容现有编排器接口。"""
 
     def __init__(self, settings: Settings, record_dir: Optional[Path] = None):
-        """创建任务/视觉 GPT Agent 与奖励/诊断 GLM Agent。"""
+        """根据配置创建任务、奖励、视觉及诊断 Provider。"""
         self.settings = settings
         self.registry = ProviderRegistry()
         role_names = {
@@ -74,16 +74,16 @@ class MultiAgentProvider:
         return self.motion_agent.generate_motion_prototype(intent)
 
     def design_task_bundle(self, compiled_prompt: str) -> Dict[str, Any]:
-        """委托百炼 GLM 奖励设计 Agent 生成候选。"""
+        """委托配置的奖励设计 Provider 生成候选。"""
         return self.reward_agent.design_task_bundle(compiled_prompt)
 
     def design_task_and_rewards(self, instruction: str, robot: str,
                                 capabilities: Dict[str, Any]) -> Dict[str, Any]:
-        """保留旧接口，并在未使用新编译器时交由 GPT 完成兼容设计。"""
-        return self.task_agent.design_task_and_rewards(instruction, robot, capabilities)
+        """保留旧接口，仍委托奖励角色，避免走到其他模型。"""
+        return self.reward_agent.design_task_and_rewards(instruction, robot, capabilities)
 
     def diagnose_training(self, payload: Dict[str, Any]) -> TrainingDiagnosis:
-        """委托百炼 GLM 诊断 Agent 生成闭环决策。"""
+        """委托配置的诊断 Provider 生成闭环决策与奖励修订。"""
         return self.diagnosis_agent.diagnose_training(payload)
 
     def summarize_reward_experience(self, payload: Dict[str, Any]) -> Any:

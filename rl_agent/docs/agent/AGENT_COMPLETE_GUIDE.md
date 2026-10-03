@@ -61,14 +61,14 @@
 | Task Feasibility Pipeline | 本地规则 + 语义阶段 Provider + Pinocchio + Unitree Isaac Gym | TaskIntent、精简环境清单、Go2 PPO 机器人配置 | `CompleteFeasibilityReport` | 复用 PPO 环境做短时 sanity check；动态动作覆盖不足或 Mock 均不放行 |
 | 上下文构建器 | 本地代码 | 能力清单、RAG、记忆 | 限长上下文快照 | 会删除源码绝对路径 |
 | 提示词编译器 | 本地固定模板 | TaskIntent、上下文 | 版本化提示词和 SHA-256 | 模型不能修改模板版本 |
-| 奖励设计 Agent | 百炼 GLM | 编译提示词 | `TaskRewardBundle` | 只能使用结构化 JSON |
+| 奖励设计 Agent | OpenCLI/ChatGPT | 编译提示词 | `TaskRewardBundle` | 只能使用结构化 JSON |
 | 奖励审查 Agent | 本地代码 | 任务、逐个候选、注册表 | 逐候选 `RewardReviewReport` | 隔离失败候选，合格候选继续；不直接修正 |
 | 奖励编译器 | 本地代码 | 已审核 `RewardPlan` | 独立训练配置和 diff | 只允许注册奖励 |
 | PPO 训练器 | Unitree RL Gym | 配置、种子、预算 | checkpoint、日志、指标 | 受限命令参数数组 |
 | 数值评估器 | 本地代码 | 多 rollout 轨迹和指标 | `EvaluationResult` 数值门 | 最终安全裁决的一部分 |
 | 视觉评估 Agent | GPT / OpenCLI | TaskSpec、同步视觉材料 | `VisualBehaviorReport` | 不读取奖励设计 RAG |
-| 诊断与修订 Agent | 百炼 GLM | 数值、视觉、PPO、预算、历史 | `TrainingDiagnosis` | 修改必须再次本地校验 |
-| Reward Experience Agent | `diagnosis_provider`（默认百炼 GLM）+ 本地代码 | 资格门控通过的精简证据包 | `RewardExperienceNarrative` | 只归纳文字，不改 reward/metric |
+| 诊断与修订 Agent | OpenCLI/ChatGPT | 数值、视觉、PPO、预算、历史 | `TrainingDiagnosis` | 修改必须再次本地校验 |
+| Reward Experience Agent | `diagnosis_provider`（默认OpenCLI/ChatGPT）+ 本地代码 | 资格门控通过的精简证据包 | `RewardExperienceNarrative` | 只归纳文字，不改 reward/metric |
 | Memory Validator | 本地代码 | Reward Experience、原始文件和 SHA-256 | 通过/拒绝 | 复核奖励差异、指标、任务和 evidence ID |
 | 记忆整理 Agent | 本地代码 | 通过 Validator 的经验和多种子结果 | 情景记忆或拒绝原因 | dry-run/INCONCLUSIVE 不得晋升 |
 | 语义整理 Agent | 本地代码 | 多条情景记忆 | 候选或活跃规律 | 需要独立证据阈值 |
@@ -78,10 +78,10 @@
 
 ```text
 任务理解      -> GPT / OpenCLI
-奖励设计      -> 百炼 GLM
+奖励设计      -> OpenCLI/ChatGPT
 视觉评估      -> GPT / OpenCLI
-训练诊断      -> 百炼 GLM
-奖励经验归纳  -> `diagnosis_provider`（默认百炼 GLM）
+训练诊断      -> OpenCLI/ChatGPT
+奖励经验归纳  -> `diagnosis_provider`（默认OpenCLI/ChatGPT）
 安全与完成判定 -> 本地确定性代码
 ```
 

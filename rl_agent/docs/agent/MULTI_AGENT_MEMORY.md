@@ -11,12 +11,12 @@
 | 动作可行性预检 | 本地规则 + GPT/Mock 语义阶段 | TaskIntent + 紧凑环境清单 + 机器人模型 | `CompleteFeasibilityReport` |
 | 上下文构建器 | 本地代码 | 环境能力、机器人、RAG、长期记忆 | `context_snapshot.json` |
 | 提示词编译器 | 本地固定模板 | TaskIntent 与上下文 | 带版本和哈希的提示词 |
-| 奖励设计 Agent | 百炼 GLM | 编译后的提示词 | `TaskRewardBundle` |
+| 奖励设计 Agent | OpenCLI/ChatGPT | 编译后的提示词 | `TaskRewardBundle` |
 | 奖励审查 Agent | 本地确定性代码 | TaskIntent、TaskSpec、候选与注册表 | `RewardReviewReport` |
 | 数值评估器 | 本地确定性代码 | 轨迹、接触力、PPO 和安全指标 | `EvaluationResult` 数值部分 |
 | 视觉评估 Agent | GPT / OpenCLI | TaskSpec 和同步图像证据 | `VisualBehaviorReport` |
-| 诊断与修订 Agent | 百炼 GLM | 视觉、数值、预算、RAG 和记忆 | `TrainingDiagnosis` |
-| Reward Experience Agent | 诊断 Provider（当前默认为百炼 GLM）+ 本地代码 | 证据包、奖励差异、数值和视觉评价 | 带证据引用的经验叙述 |
+| 诊断与修订 Agent | OpenCLI/ChatGPT | 视觉、数值、预算、RAG 和记忆 | `TrainingDiagnosis` |
+| Reward Experience Agent | 诊断 Provider（当前默认为OpenCLI/ChatGPT）+ 本地代码 | 证据包、奖励差异、数值和视觉评价 | 带证据引用的经验叙述 |
 | Memory Validator | 本地确定性代码 | 经验、原始配置和证据文件 | 通过/拒绝及可追溯原因 |
 | 情景记忆整理器 | 本地确定性代码 | 通过 Validator 的 Reward Experience | 情景记忆或多种子门控拒绝 |
 | 语义整理 Agent | 本地确定性代码 | 多条独立情景证据 | 候选或活跃语义规律 |
@@ -71,7 +71,7 @@ Provider 使用 `/chat/completions`、`response_format=json_object` 和 `enable_
 
 ## 奖励审查门控
 
-奖励审查发生在 GLM 生成之后、配置编译和 PPO 训练之前。它检查：
+奖励审查发生在 奖励模型 生成之后、配置编译和 PPO 训练之前。它检查：
 
 - 每个候选是否只使用注册奖励；
 - 是否覆盖全部必选成功指标；

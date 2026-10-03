@@ -2,7 +2,7 @@
 
 最新架构以可编辑源图 [`images/rl-agent-architecture-v2.mmd`](images/rl-agent-architecture-v2.mmd) 为准；[`images/rl-agent-architecture-v2.png`](images/rl-agent-architecture-v2.png) 是尚未包含训练准入分流的历史导出。图中以自研确定性状态机编排按职责分工的模型 Agent；没有依赖 LangGraph、CrewAI 等编排框架。更完整的角色、Schema、状态机、运行命令和路线图见 [`AGENT_COMPLETE_GUIDE.md`](AGENT_COMPLETE_GUIDE.md)。
 
-命令层创建 `Settings`、`MultiAgentProvider`、`TrainingKnowledgeBase`、`LongTermMemoryStore` 和 `TrainingOrchestrator`。真实模式下，角色路由将任务理解和视觉评价交给 `FallbackProvider(ChatGPT 聊天模式 -> 豆包对话模式)`，将奖励设计和训练诊断交给百炼 GLM；离线演练使用确定性 Mock，但经过相同的上下文、提示词、审查、训练和记忆产物链。
+命令层创建 `Settings`、`MultiAgentProvider`、`TrainingKnowledgeBase`、`LongTermMemoryStore` 和 `TrainingOrchestrator`。真实模式下，角色路由将任务理解和视觉评价交给 `FallbackProvider(ChatGPT 聊天模式 -> 豆包对话模式)`，将奖励设计和训练诊断交给OpenCLI/ChatGPT；离线演练使用确定性 Mock，但经过相同的上下文、提示词、审查、训练和记忆产物链。
 
 编排器首先运行 `EnvironmentInspector`，然后要求任务理解 Agent 把上位机动作输入转换为 `TaskIntentSpec`。`MotionConstraintCompiler` 将语义编译为禁止 joint/torque/policy 的 `MotionConstraintSpec`，确定性注册表分别运行步态、质心、接触时序、基座姿态和末端规划器；`WholeBodyMotionSolver` 再核对 Pinocchio IK、浮动基座 IK、逆动力学、接触力和轨迹优化后端。只有动作专用求解链完整时才进入 Isaac Gym：静态姿态使用 IK、CoM/支撑几何、重力 RNEA 诊断和静态 rollout；Go2 直线行走逐步执行 `FootTrajectory → Pinocchio IK → JointReference → IsaacGym`。单腿/前后腿支撑会搜索有限候选但因接触动力学不足保持 `INCONCLUSIVE`；跳跃、特技、转向和操作会列出缺失求解器，绝不复用错误的 trot validator。完整真实 rollout 通过才报告物理验证，Mock 不得升级。之后 `ContextBuilder` 合并环境能力、机器人、RAG 和长期记忆，奖励设计仍必须通过审查与安全编译。
 

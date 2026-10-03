@@ -60,7 +60,7 @@ def test_config_payload_exposes_multi_agent_and_memory_status(tmp_path):
     providers = payload["system"]["providers"]
     assert providers["mode"] == "multi-agent"
     assert providers["task_planner"] == "opencli-doubao"
-    assert providers["reward_designer"] == "bailian"
+    assert providers["reward_designer"] == "opencli"
     assert payload["system"]["memory"]["records"] == 0
     assert payload["system"]["rag"]["enabled"]
 

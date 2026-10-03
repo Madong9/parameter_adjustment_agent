@@ -2,7 +2,7 @@
 
 检查到的 OpenCLI 同时提供 ChatGPT 适配器和底层 browser 驱动。本 Provider 使用 browser 驱动完成固定会话状态检查、稳定 CSS 与语义输入框定位、带验证的填充、显式发送按钮点击、用户消息提交确认、回复轮询、最新助手消息提取和文件上传。源码不保存任何数字元素 ref；导航或页面变化后会重新检查状态。
 
-默认多 Agent 模式下，OpenCLI/ChatGPT 只承担 `TaskIntentSpec` 任务理解和独立多模态视觉评价；奖励设计与训练诊断由百炼 GLM 完成。任务理解和视觉角色默认配置为 `opencli-doubao`：先调用 ChatGPT；若发生登录失效、额度限制、扩展断线、提交/回复超时或结构化响应错误，则将同一个高层请求和相同附件重新交给豆包，并在 `provider_records/opencli-doubao/fallback.log` 留下不含提示词和密钥的切换原因。回退成功后，该次运行的后续同角色请求继续使用豆包，避免反复探测不可用的 ChatGPT。
+默认多 Agent 模式下，任务理解、奖励设计、视觉评价、训练诊断与奖励修订均使用 OpenCLI/ChatGPT。任务理解和视觉角色配置为 `opencli-doubao`，允许豆包主备回退；奖励设计与诊断角色为 `opencli`，仅使用 ChatGPT，不回退其他模型。
 
 配置位于 `config/opencli.yaml`，角色选择位于 `config/agent.yaml`。`force_chat_mode: true` 会在打开页面和创建每个新会话时检查 ChatGPT 的模式开关；如果当前处于“工作”，程序会点击“聊天”并确认状态，切换失败则停止当前主 Provider 请求并由豆包接管。豆包使用独立的 `rl-training-agent-doubao` 会话，并同样强制选择“对话”而非“工作”。绑定模式会连接用户当前标签页，owned 模式会创建并释放 Agent 自有标签页。命令超时、提交确认超时和回复超时分别配置，所有重试都有明确上限。只有尚未确认点击发送的页面操作可以重试；发送按钮点击成功后不会重复提交消息。
 

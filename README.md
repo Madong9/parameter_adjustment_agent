@@ -8,6 +8,8 @@
 
 奖励审核与编译会检查实际课程激活、支持参数和权重符号；环境仅启用显式计划中的奖励。每个候选保存 `effective_reward_scales.json`，记录各学习阶段的有效权重。侧翻采用真实接触门控的起跳、纵轴旋转和落地恢复奖励。修复范围、验证及通用动作后续改进见 [奖励设计检查](rl_agent/docs/agent/reward_design_audit.md)。
 
+默认奖励设计、训练诊断与奖励修订、经验总结均通过 OpenCLI 操作 ChatGPT 网页，不调用百炼模型，也不为这些角色启用豆包回退。任务理解和视觉评估仍使用各自的 ChatGPT/豆包主备配置。配置变更需要重启 Agent 进程后生效。
+
 ## 项目目录结构
 
 Agent 与 Unitree 训练工程位于同一个父目录中。仓库只纳入 Agent 源码；Unitree 工程、Isaac Gym SDK、训练 checkpoint、视频和实验日志不会上传。代码和配置只保存相对路径，因此克隆后仍可复现：

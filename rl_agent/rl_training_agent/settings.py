@@ -40,9 +40,9 @@ class Settings(BaseModel):
     default_robot: str = "go2"
     provider: str = "multi-agent"
     task_planner_provider: str = "opencli"
-    reward_designer_provider: str = "bailian"
+    reward_designer_provider: str = "opencli"
     visual_critic_provider: str = "opencli"
-    diagnosis_provider: str = "bailian"
+    diagnosis_provider: str = "opencli"
     num_reward_candidates: int = 3
     smoke_iterations: int = 50
     screening_iterations: int = 300
