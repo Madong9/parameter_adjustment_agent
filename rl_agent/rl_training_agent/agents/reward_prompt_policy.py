@@ -24,6 +24,7 @@ def render_reward_policy():
                              'body_termination_force_threshold_n': BODY_TERMINATION_FORCE_THRESHOLD},
         'only_positive_rewards': False,
         'known_term_semantics': {
+            'net_roll_progress': '展开 roll 的净进度，正增益只奖励历史最高进度增加，目标后封顶，倒退扣分；只在全足腾空时发放，按 dt 归一化，net_roll_target 为正弧度目标',
             'roll_rotation': '腾空时的有方向机体纵轴角速度跟踪，不是净滚转角或单次完成奖励',
             'airborne_duration': '全足同时离地；min_air_time_threshold 为连续腾空非负秒数门槛',
             'feet_air_time': '原生步态单足腾空奖励，不对应全足同时腾空验收',

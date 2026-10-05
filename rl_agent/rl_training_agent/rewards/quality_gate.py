@@ -16,14 +16,16 @@ METRIC_SIGNALS = {
     'landing_pitch_abs': {'landing_stability', 'orientation'},
     'feet_air_time': {'airborne_duration'},  # 验收要求全足同时腾空，步态单足时长不能替代。
     'max_roll_velocity': {'roll_rotation'},
-    'final_roll_angle': set(),  # 角速度代理不等于净滚转；须实现后显式注册。
+    'final_roll_angle': {'net_roll_progress'},
     'landing_stability': {'landing_stability', 'landing_recovery'},
     'stable_stand_duration': {'stable_support', 'landing_recovery'},
     'front_leg_stand_duration': {'front_leg_stand'},
     'rear_leg_stand_duration': {'rear_leg_stand'},
     'rear_stand_duration': {'rear_leg_stand'},
     'front_leg_walk_velocity_tracking': {'front_leg_walk'},
+    'front_leg_forward_speed': {'front_leg_walk'},
     'rear_leg_walk_velocity_tracking': {'rear_leg_walk'},
+    'rear_leg_forward_speed': {'rear_leg_walk'},
     'front_leg_walk_completion': {'front_leg_walk'},
     'rear_leg_walk_completion': {'rear_leg_walk'},
 }
@@ -86,6 +88,12 @@ def audit_objectives(task, plan):
         term = SAFETY_SIGNALS.get(metric.name)
         if metric.required and term and not all(v.get(term, 0) < 0 for v in scales.values()):
             errors.append('安全约束在部分课程缺少负奖励：%s -> %s' % (metric.name, term))
+    net_term = next((t for t in plan.terms if t.name == 'net_roll_progress'), None)
+    target_metric = next((m for m in task.success_metrics if m.name == 'final_roll_angle' and m.required), None)
+    if net_term is not None and target_metric is not None:
+        target = net_term.parameters.get('net_roll_target', 2 * math.pi)
+        if not isinstance(target, (int, float)) or not math.isfinite(target) or target <= 0 or target < target_metric.value:
+            errors.append('净滚转奖励封顶目标不得低于验收目标')
     return {'passed': not errors, 'errors': errors, 'coverage': coverage,
             'effective_scales': scales, 'scope': '实现覆盖审核，非动作可行性或学习成功证明'}
 
@@ -166,3 +174,19 @@ def compare_pilots(task, previous, current):
     return {'suspected_reward_hacking': suspicious, 'previous_progress': before,
             'current_progress': after, 'previous_proxy': proxy_before, 'current_proxy': proxy_after,
             'note': '只阻止代理收益增加且目标明显倒退；不把早期尚未学会当作训练失败'}
+
+
+def capability_gaps(task, capabilities):
+    """按本地实现映射和当前注册表识别代码缺口，与模型配置错误分开。"""
+    registered = {item['name'] for item in capabilities.get('rewards', [])}
+    gaps = []
+    for metric in task.success_metrics:
+        supported = METRIC_SIGNAL_OVERRIDES.get((metric.name, metric.aggregation),
+                                               METRIC_SIGNALS.get(metric.name, set()))
+        if metric.required and not supported & registered:
+            gaps.append('reward_signal:' + metric.name)
+    for metric in task.safety_constraints:
+        term = SAFETY_SIGNALS.get(metric.name)
+        if metric.required and term and term not in registered:
+            gaps.append('safety_reward:' + term)
+    return sorted(set(gaps))

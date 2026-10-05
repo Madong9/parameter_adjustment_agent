@@ -1054,12 +1054,21 @@ class TrainingOrchestrator:
         state.transition(AgentState.REWARD_REVIEWING, {"agent_role": "reward_reviewer"})
         review = self.reward_reviewer.review(
             intent, task, plans, dict(manifest.dict(), require_objective_links=not dry_run), design.get("reward_hacking_risks", []))
+        from ..rewards.quality_gate import capability_gaps
+        local_gaps = capability_gaps(task, manifest.dict())
+        write_json(task_dir / 'reward_capability_gaps.json', {'gaps': local_gaps,
+            'requires_local_implementation': bool(local_gaps)})
         write_json(task_dir / "reward_review.json", review)
         if not review.approved:
+            issues = sorted({issue for candidate in review.candidate_results
+                             for issue in candidate.conflicts + candidate.omissions})
+            details = ('需补齐本地实现：' + '、'.join(local_gaps) if local_gaps else
+                       '；'.join(issues[:3] or (review.conflicts + review.omissions)[:3]))
             report = {
                 "task_id": task_id,
                 "state": AgentState.HUMAN_REVIEW.value,
-                "reason": "奖励审查未通过，已禁止启动训练",
+                "reason": "奖励审查未通过，已禁止启动训练；" + details,
+                "capability_gaps": local_gaps,
                 "omissions": review.omissions,
                 "conflicts": review.conflicts,
                 "rejected_candidate_indexes": review.rejected_candidate_indexes,
@@ -1800,6 +1809,11 @@ class TrainingOrchestrator:
         round_root = selected['dir'] / 'rollouts' / ('round_%02d' % round_index)
         def load(path: Path) -> Any:
             return read_json(path) if path.is_file() else None
+        from ..rewards.quality_gate import capability_gaps
+        gaps = capability_gaps(task, manifest.dict())
+        if gaps:
+            write_json(root / 'capability_gaps.json', {'gaps': gaps})
+            raise RewardValidationError('需要补齐本地奖励实现，不能靠重复设计解决：' + '、'.join(gaps))
         payload = {
             'immutable_task': task.dict(), 'previous_plan': selected['plan'].dict(),
             'LOCAL_METRIC_REWARD_SIGNALS': {k: sorted(v) for k, v in METRIC_SIGNALS.items()},

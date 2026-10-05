@@ -16,6 +16,7 @@ REWARD_PARAMETER_NAMES = {
     "front_stand_pitch_sigma",
     "takeoff_velocity_target", "roll_rate_target", "roll_rate_sigma",
     "min_air_time_threshold",
+    "net_roll_target",
 }
 COMMAND_RANGE_NAMES = {"lin_vel_x", "lin_vel_y", "ang_vel_yaw", "heading"}
 
@@ -143,14 +144,17 @@ def _apply_command_changes(target: Any, changes: Dict[str, Any], originals: Dict
 def prepare_training_env_config(env_cfg: Any, config: Dict[str, Any]) -> None:
     """在创建训练环境前注册全部奖励、参数和身体接触终止链接。"""
     scales = config["rewards"]["scales"]
-    from .action_rewards import ACTION_REWARDS, register_action_rewards
+    from .action_rewards import ACTION_REWARDS, RUNTIME_SAFETY_REWARDS, register_action_rewards
+    for name in RUNTIME_SAFETY_REWARDS:
+        if name in scales and not hasattr(env_cfg.rewards.scales, name):
+            setattr(env_cfg.rewards.scales, name, 0.0)
     if set(scales) & (set(ACTION_REWARDS) | {'collision'}):
         from legged_gym.envs.base.legged_robot import LeggedRobot
         register_action_rewards(LeggedRobot)
         for name in ACTION_REWARDS:
             setattr(env_cfg.rewards.scales, name, 0.0)
         for name, value in {"takeoff_velocity_target": .8, "roll_rate_target": 6., "roll_rate_sigma": 4.,
-                            "min_air_time_threshold": 0.}.items():
+                            "min_air_time_threshold": 0., "net_roll_target": 2 * math.pi}.items():
             setattr(env_cfg.rewards, name, value)
     # 显式计划是全部有效权重，不能继承未审核的默认奖励。
     for name in dir(env_cfg.rewards.scales):

@@ -7,7 +7,33 @@ ACTION_REWARDS = {
     "roll_rotation": ["base_ang_vel", "contact_forces"],
     "landing_recovery": ["contact_forces", "rpy", "base_lin_vel", "base_ang_vel"],
     "stable_support": ["contact_forces", "rpy", "base_lin_vel", "base_ang_vel"],
+    "net_roll_progress": ["rpy", "contact_forces"],
 }
+RUNTIME_SAFETY_REWARDS = {'torque_limits': ['torques', 'torque_limits']}
+
+
+def _reward_net_roll_progress(self):
+    """展开 roll 的净进度，正收益有单次上限，往复和重复起跳不能重复刷分。"""
+    import torch
+    roll = self.rpy[:, 0]
+    if not hasattr(self, '_agent_roll_previous'):
+        self._agent_roll_previous = roll.clone()
+        self._agent_roll_net = torch.zeros_like(roll)
+        self._agent_roll_peak = torch.zeros_like(roll)
+    fresh = self.episode_length_buf <= 1
+    delta = torch.atan2(torch.sin(roll - self._agent_roll_previous),
+                        torch.cos(roll - self._agent_roll_previous))
+    previous_progress = torch.clamp(self._agent_roll_net.abs() / self.cfg.rewards.net_roll_target, 0., 1.)
+    self._agent_roll_net = torch.where(fresh, torch.zeros_like(roll), self._agent_roll_net + delta)
+    self._agent_roll_peak = torch.where(fresh, torch.zeros_like(roll), self._agent_roll_peak)
+    progress = torch.clamp(self._agent_roll_net.abs() / self.cfg.rewards.net_roll_target, 0., 1.)
+    gain = torch.clamp(progress - self._agent_roll_peak, min=0.)
+    backtrack = torch.clamp(progress - previous_progress, max=0.)
+    reward = torch.where(fresh, torch.zeros_like(roll), gain + backtrack)
+    self._agent_roll_peak = torch.maximum(self._agent_roll_peak, progress)
+    self._agent_roll_previous = roll.clone()
+    # Unitree 会再乘 dt；抵消该缩放，使每 episode 正向总贡献最多为 term.weight。
+    return reward * (~_contacts(self).any(dim=1)).float() / self.dt
 
 
 def _contacts(env):

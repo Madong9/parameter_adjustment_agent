@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import math
 from pathlib import Path
 from typing import Dict, List
 
@@ -116,11 +117,18 @@ class RewardRegistry:
                 config_key="rewards.scales.%s" % name, expected_raw_range=expected,
                 default_weight=weight, sign=sign,
                 dependencies=DEPENDENCIES.get(name, [])))
-        from ..training.action_rewards import ACTION_REWARDS
+        from ..training.action_rewards import ACTION_REWARDS, RUNTIME_SAFETY_REWARDS
+        for name, dependencies in RUNTIME_SAFETY_REWARDS.items():
+            if name in methods and name not in {item.name for item in items}:
+                items.append(RewardRegistryItem(name=name, implementation=methods[name],
+                    config_key='rewards.scales.' + name, expected_raw_range=[0., 100.],
+                    default_weight=0., sign='negative', dependencies=dependencies))
         for name, dependencies in ACTION_REWARDS.items():
             items.append(RewardRegistryItem(
                 name=name, implementation="rl_training_agent/training/action_rewards.py:_reward_" + name,
-                config_key="rewards.scales." + name, expected_raw_range=[0., 1.],
-                parameters=({'min_air_time_threshold': 0.} if name == 'airborne_duration' else {}),
+                config_key="rewards.scales." + name,
+                expected_raw_range=([-100., 100.] if name == 'net_roll_progress' else [0., 1.]),
+                parameters=({'min_air_time_threshold': 0.} if name == 'airborne_duration' else
+                            {'net_roll_target': 2 * math.pi} if name == 'net_roll_progress' else {}),
                 default_weight=0., sign="positive", dependencies=dependencies))
         return items

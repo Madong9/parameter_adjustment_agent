@@ -23,7 +23,7 @@ def test_policy_uses_live_implementation_and_safety_tables():
     assert set(policy['runtime_parameter_names']) == REWARD_PARAMETER_NAMES
     assert len(policy['metric_signal_overrides']) == len(METRIC_SIGNAL_OVERRIDES)
     assert policy['version'] == REWARD_PROMPT_VERSION
-    assert section(prompt, 'LOCAL_METRIC_REWARD_SIGNALS')['final_roll_angle'] == []
+    assert section(prompt, 'LOCAL_METRIC_REWARD_SIGNALS')['final_roll_angle'] == ['net_roll_progress']
     assert policy['capability_gap_output']['objective_reward_terms'] == []
     assert policy['capability_gap_output']['executable'] is False
 
