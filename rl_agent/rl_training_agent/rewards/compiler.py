@@ -9,6 +9,8 @@ from ..environment.capability_manifest import CapabilityManifest
 from ..schemas.rewards import RewardPlan
 from ..utils.io import atomic_write_text, sha256_text, utc_now, write_json
 from .validator import RewardPlanValidator
+from ..training.contact_semantics import (CONTACT_SEMANTICS_VERSION, COLLISION_FORCE_THRESHOLD,
+                                          BODY_TERMINATION_FORCE_THRESHOLD)
 
 
 class RewardCompiler:
@@ -36,6 +38,11 @@ class RewardCompiler:
             "curriculum": [item.dict() for item in plan.curriculum],
             "terminations": [item.dict() for item in plan.terminations],
             "success_metrics": [item.dict() for item in plan.success_metrics],
+            "objective_links": [item.dict() for item in plan.objective_links],
+            "behavior_links": [item.dict() for item in plan.behavior_links],
+            "contact_semantics": {"version": CONTACT_SEMANTICS_VERSION,
+                                  "collision_force_threshold_n": COLLISION_FORCE_THRESHOLD,
+                                  "body_termination_force_threshold_n": BODY_TERMINATION_FORCE_THRESHOLD},
         }
         canonical = json.dumps(compiled, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         config_path = output_dir / "config.yaml"

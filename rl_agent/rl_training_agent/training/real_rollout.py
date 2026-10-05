@@ -117,10 +117,8 @@ def main() -> int:
 
     rigid_state = env.gym.acquire_rigid_body_state_tensor(env.sim)
     rigid = gymtorch.wrap_tensor(rigid_state).view(1, -1, 13)
-    foot_index_values = {int(value) for value in env.feet_indices.detach().cpu().tolist()}
-    nonfoot_indices = torch.tensor(
-        [index for index in range(env.num_bodies) if index not in foot_index_values],
-        dtype=torch.long, device=env.device)
+    from .contact_semantics import nonfoot_indices as contact_indices, COLLISION_FORCE_THRESHOLD
+    nonfoot_indices = contact_indices(env)
     steps = max(1, int(args.seconds / policy_dt))
     rows, reward_rows = [], []
     override = None if args.command_x is None else (
@@ -194,7 +192,7 @@ def main() -> int:
             "termination_contact_force_max": termination_contact_force_max,
             "nonfoot_contact_force_max": nonfoot_contact_force_max,
             "forbidden_contact_force_max": forbidden_contact_force_max,
-            "body_collision": bool(forbidden_contact_force_max > 0.1),
+            "body_collision": bool(forbidden_contact_force_max > COLLISION_FORCE_THRESHOLD),
             "fall": bool(abs(float(env.rpy[0, 0])) > 0.8 or abs(float(env.rpy[0, 1])) > 1.0),
             "foot_slip": float(torch.max(torch.norm(feet[:, 7:9], dim=-1) * contacts.float())),
             "energy": float(torch.sum(torch.abs(env.torques[0] * env.dof_vel[0])) * policy_dt),
@@ -218,7 +216,7 @@ def main() -> int:
                 "control_decimation": env_cfg.control.decimation, "video_start_sim_time": 0.0,
                 "camera": "side", "seed": args.seed, "checkpoint": Path(args.checkpoint).name,
                 "camera_tracking": "base_position_and_yaw", "camera_horizontal_fov_deg": 55.0,
-                "body_collision_force_threshold_n": 0.1,
+                "body_collision_force_threshold_n": COLLISION_FORCE_THRESHOLD,
                 "body_collision_scope": "all_non_foot_rigid_bodies",
                 "command_override": override,
                 "nonfoot_rigid_body_count": int(nonfoot_indices.numel()),

@@ -144,7 +144,7 @@ def prepare_training_env_config(env_cfg: Any, config: Dict[str, Any]) -> None:
     """在创建训练环境前注册全部奖励、参数和身体接触终止链接。"""
     scales = config["rewards"]["scales"]
     from .action_rewards import ACTION_REWARDS, register_action_rewards
-    if set(scales) & set(ACTION_REWARDS):
+    if set(scales) & (set(ACTION_REWARDS) | {'collision'}):
         from legged_gym.envs.base.legged_robot import LeggedRobot
         register_action_rewards(LeggedRobot)
         for name in ACTION_REWARDS:
@@ -173,6 +173,8 @@ def prepare_training_env_config(env_cfg: Any, config: Dict[str, Any]) -> None:
                             if s.get('parameter_changes', {}).get('reward_scales', {}).get(name, 0.)), 0.)
         setattr(env_cfg.rewards.scales, name, reserve)
     _apply_reward_parameters(env_cfg, config)
+    # 安全惩罚不可被总奖励的正值截断吞掉。
+    env_cfg.rewards.only_positive_rewards = False
     if any("body" in str(item.get("name", "")).lower() or
            "body contact" in str(item.get("condition", "")).lower()
            for item in _enabled_terminations(config)):
@@ -201,22 +203,28 @@ def install_runtime_terminations(env: Any, config: Dict[str, Any]) -> None:
     """给环境安装配置声明的 roll、pitch 终止检查。"""
     install_velocity_tracking(env, config)
     pitch_limit = roll_limit = None
+    body_contact = False
     for item in _enabled_terminations(config):
         name = str(item.get("name", "")).lower()
         condition = str(item.get("condition", "")).lower()
+        body_contact |= ('body_contact' in name or 'body_collision' in name or
+                         'body contact' in condition or 'body_contact' in condition)
         if "pitch" in name or "pitch" in condition:
             part = re.search(r'pitch[^<>]*[<>]=?\s*([0-9.]+)', condition)
             pitch_limit = float(part.group(1)) if part else _number_from_condition(condition, 1.0)
         if "roll" in name or "roll" in condition:
             part = re.search(r'roll[^<>]*[<>]=?\s*([0-9.]+)', condition)
             roll_limit = float(part.group(1)) if part else _number_from_condition(condition, 0.8)
-    if pitch_limit is None and roll_limit is None:
+    if pitch_limit is None and roll_limit is None and not body_contact:
         return
     original = env.check_termination
 
     def check_termination_with_orientation(self: Any) -> None:
         """运行项目原生终止检查，并追加配置声明的姿态限制。"""
         original()
+        if body_contact:
+            from .contact_semantics import nonfoot_forces, BODY_TERMINATION_FORCE_THRESHOLD
+            self.reset_buf |= (nonfoot_forces(self) > BODY_TERMINATION_FORCE_THRESHOLD).any(dim=1)
         if pitch_limit is not None:
             self.reset_buf |= self.rpy[:, 1].abs() > pitch_limit
         if roll_limit is not None:

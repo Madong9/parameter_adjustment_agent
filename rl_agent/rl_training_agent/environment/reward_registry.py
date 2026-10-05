@@ -105,6 +105,8 @@ class RewardRegistry:
             if (name.startswith("rear_leg_") or name.startswith("front_leg_")) and robot != "go2":
                 continue
             weight = weights[name]
+            if name == 'collision':
+                implementation = 'rl_training_agent/training/contact_semantics.py:collision_count'
             unit_interval = (name.startswith("tracking_") or name.startswith("rear_leg_") or
                              name.startswith("front_leg_") or name == "termination")
             expected = [0.0, 1.0] if unit_interval else [0.0, 100.0]

@@ -206,6 +206,10 @@ def test_runtime_orientation_termination_is_enforced():
         def __init__(self):
             """初始化两条并行环境状态。"""
             self.reset_buf = torch.tensor([False, False])
+            self.contact_forces = torch.zeros((2, 2, 3))
+            self.feet_indices = torch.tensor([1])
+            self.num_bodies = 2
+            self.device = 'cpu'
             self.rpy = torch.tensor([[0.0, 1.1, 0.0], [0.9, 0.0, 0.0]])
 
         def check_termination(self):

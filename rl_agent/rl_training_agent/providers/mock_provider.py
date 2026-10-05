@@ -17,6 +17,7 @@ from ..schemas.task import (
 from ..schemas.visual import VisualBehaviorReport, VisualPhaseResult
 from ..memory.reward_experience.schema import RewardExperienceNarrative
 from ..utils.task_semantics import is_front_leg_support_text
+from ..rewards.quality_gate import METRIC_SIGNALS
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
@@ -101,7 +102,7 @@ class MockLLMReasoningProvider:
         )
         registry_names = {item["name"] for item in capabilities.get("rewards", [])}
         wanted = (["jump_height", "feet_synchrony", "landing_stability", "horizontal_drift"] if is_jump else
-                  ["tracking_lin_vel", "tracking_ang_vel"]) + ["orientation", "torques", "action_rate", "collision"]
+                  ["tracking_lin_vel", "tracking_ang_vel"]) + ["orientation", "torques", "action_rate", "collision", "dof_pos_limits"]
         available = [name for name in wanted if name in registry_names]
         plans: List[Dict[str, Any]] = []
         emphases = ["task_completion", "stability", "curriculum"]
@@ -111,7 +112,7 @@ class MockLLMReasoningProvider:
                 base = {"tracking_lin_vel": 1.0, "tracking_ang_vel": 0.5, "orientation": -0.5,
                         "torques": -0.0002, "action_rate": -0.01, "collision": -1.0,
                         "jump_height": 3.0, "feet_synchrony": 0.5, "landing_stability": 1.5,
-                        "horizontal_drift": -1.0}[name]
+                        "horizontal_drift": -1.0, "dof_pos_limits": -1.0}[name]
                 factor = 1.2 if (index == 0 and name.startswith("tracking")) else 1.0
                 factor = 1.5 if (index == 1 and name in ("orientation", "collision")) else factor
                 terms.append({
@@ -125,6 +126,11 @@ class MockLLMReasoningProvider:
                 "task_id": task.task_id, "version": index + 1, "parent_version": None,
                 "design_rationale": ["offline deterministic %s candidate" % emphases[index % 3]],
                 "terms": terms,
+                "objective_links": [dict(metric=m.name, reward_terms=sorted(
+                    METRIC_SIGNALS.get(m.name, set()) & set(available)),
+                    rationale='确定性测试对应真实奖励', counterexamples=['错误动作须由独立指标拒绝']) for m in metrics],
+                "behavior_links": [dict(behavior=b.name, reward_terms=available[:1],
+                    rationale=b.description, counterexamples=['错误替代不能仅凭总奖励放行']) for b in behaviors],
                 "terminations": [{"name": "base_contact", "condition": "termination_contact", "enabled": True}],
                 "curriculum": ([{"name": "easy_commands", "start_iteration": 0, "end_iteration": 300,
                                  "parameter_changes": {"command_scale": 0.5}}] if index == 2 else []),

@@ -38,6 +38,9 @@ class RewardReviewAgent:
             candidate_omissions: List[str] = []
             candidate_conflicts: List[str] = []
             names = {item.name for item in plan.terms}
+            if capabilities.get('require_objective_links'):
+                from ..rewards.quality_gate import audit_objectives
+                candidate_conflicts.extend(audit_objectives(task, plan)['errors'])
             from ..rewards.validator import validate_plan_execution, RewardValidationError
             try:
                 validate_plan_execution(plan)

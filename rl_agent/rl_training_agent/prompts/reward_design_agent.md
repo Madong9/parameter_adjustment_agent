@@ -22,3 +22,7 @@ probe_evidence 中的跟踪失败、候选跌倒或优化未收敛只描述本�
 
 奖励执行约束：active_phases 指的是 curriculum 中的迭代学习阶段，不是测试动作内部的飞行/落地状态；每个非零奖励必须至少匹配一个真实课程阶段。动作内阶段必须使用已注册的接触门控奖励。不要填写无法执行的 activation_condition 文本，不要用未经支持的嵌套 schedule。课程调权写在 parameter_changes.reward_scales 中，保持奖励符号不变，命令范围须使用有限的明确数值。计划之外的默认奖励将关闭，必须显式列出所需任务项及安全惩罚。
 侧向翻跟头使用 takeoff_velocity（有足端接触时的世界向上速度）、airborne_duration（全部足端离地）、roll_rotation（只在腾空时跟踪纵轴角速度，roll_rate_target 默认 6 rad/s、roll_rate_sigma 默认 4）、landing_recovery（发生腾空后恢复足端支撑、低姿态误差及低速度）。这些奖励按真实接触状态门控，active_phases 使用 all。takeoff_velocity_target 默认 0.8 m/s。不要用 yaw 的 tracking_ang_vel 驱动侧翻，不要使用依赖行走命令的 feet_air_time 代替腾空奖励，不要在完整侧翻过程中启用普通 roll 跌倒终止或全程水平姿态/竖直速度/横向角速度惩罚。非足端碰撞与硬件限制仍必须独立验收，成功阈值不可降低。
+
+通用奖励审计：每个必选 success_metric 必须在 objective_links 提供 metric、reward_terms、rationale、counterexamples（具体错误动作反例和检查方法）。对应项须在本地 LOCAL_METRIC_REWARD_SIGNALS 表中具有真实实现并至少一个课程有效启用；不存在实现时明确说明能力缺口，不用速度、累计腾空或奖励总分代替完成指标。安全项 collision、dof_pos_limits、torque_limits 应与相应硬约束对应并在各课程保持负权重。collision 实现统一覆盖全部非足端机体，以接触力 >0.1N 计数；机体接触终止阈值为1N。奖励正值截断已关闭。分别讨论目标进度、完成、恢复与重复前半段获利，不能把 action_phases 文本当作可执行门控。
+
+每项 required_behavior 还必须在 behavior_links 提供 behavior（原始名称）、reward_terms、rationale、counterexamples，说明如何学习此行为以及如何排除错误替代。动作文字对应关系仍须独立视觉验证，不能作为物理证明。

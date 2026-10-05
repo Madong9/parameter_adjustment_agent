@@ -81,6 +81,20 @@ class RewardConflict(BaseModel):
     mitigation: str
 
 
+class RewardObjectiveLink(BaseModel):
+    metric: str
+    reward_terms: List[str]
+    rationale: str
+    counterexamples: List[str]
+
+
+class RewardBehaviorLink(BaseModel):
+    behavior: str
+    reward_terms: List[str]
+    rationale: str
+    counterexamples: List[str]
+
+
 class RewardPlan(BaseModel):
     task_id: str
     version: int
@@ -93,6 +107,8 @@ class RewardPlan(BaseModel):
     success_metrics: List[MetricThreshold] = Field(default_factory=list)
     known_conflicts: List[RewardConflict] = Field(default_factory=list)
     expected_learning_stages: List[str] = Field(default_factory=list)
+    objective_links: List[RewardObjectiveLink] = Field(default_factory=list)
+    behavior_links: List[RewardBehaviorLink] = Field(default_factory=list)
 
     @validator("terms")
     def unique_terms(cls, terms: List[RewardTerm]) -> List[RewardTerm]:

@@ -1053,7 +1053,7 @@ class TrainingOrchestrator:
 
         state.transition(AgentState.REWARD_REVIEWING, {"agent_role": "reward_reviewer"})
         review = self.reward_reviewer.review(
-            intent, task, plans, manifest.dict(), design.get("reward_hacking_risks", []))
+            intent, task, plans, dict(manifest.dict(), require_objective_links=not dry_run), design.get("reward_hacking_risks", []))
         write_json(task_dir / "reward_review.json", review)
         if not review.approved:
             report = {
@@ -1088,6 +1088,10 @@ class TrainingOrchestrator:
                 (directory / name).mkdir(exist_ok=True)
             try:
                 self._validate_plan_metric_coverage(task, plan)
+                if not dry_run:
+                    from ..rewards.quality_gate import audit_objectives, require_objectives
+                    write_json(directory / 'reward_quality_preflight.json', audit_objectives(task, plan))
+                    require_objectives(task, plan)
                 metadata = compiler.compile(plan, directory)
             except RewardValidationError as exc:
                 atomic_write_text(directory / "validation_error.txt", str(exc) + "\n")
@@ -1118,8 +1122,7 @@ class TrainingOrchestrator:
             [item["metadata"] for item in candidate_data], required_metrics)
         initial_cost = len(candidate_data) * max(
             self.settings.smoke_iterations, self.settings.screening_iterations)
-        reserved_rounds = 1 + (task.training_budget.max_reward_revisions
-                               if admission.decision == "ALLOW_BUDGETED_EXPLORATION" else 0)
+        reserved_rounds = 1 + (task.training_budget.max_reward_revisions if not dry_run else 0)
         minimum_training_iterations = initial_cost + len(
             self.settings.evaluation_seeds) * reserved_rounds
         budget_ready = task.training_budget.max_total_iterations >= minimum_training_iterations
@@ -1169,7 +1172,7 @@ class TrainingOrchestrator:
         budget = BudgetTracker(
             max_iterations=min(task.training_budget.max_total_iterations, self.settings.max_total_iterations),
             max_revisions=min(task.training_budget.max_reward_revisions, self.settings.max_reward_revisions),
-            reserve_for_revisions=admission.decision == "ALLOW_BUDGETED_EXPLORATION",
+            reserve_for_revisions=not dry_run or admission.decision == "ALLOW_BUDGETED_EXPLORATION",
         )
         initial_screening_cost = len(candidate_data) * max(
             self.settings.smoke_iterations, self.settings.screening_iterations)
@@ -1243,6 +1246,37 @@ class TrainingOrchestrator:
         write_json(selected["dir"] / "manifest.json", selected["manifest"])
         return selected
 
+    def _pilot_reward_quality(self, task: TaskSpec, item: Dict[str, Any], checkpoint: Path,
+                              stage: str) -> bool:
+        """短训练后检查真实奖励触发与同轨迹物理证据，不要求已完成最终动作。"""
+        from ..rewards.quality_gate import audit_rollout
+        directory = item['dir'] / 'reward_quality' / stage
+        result = self.controller.run_evaluation_rollouts(
+            item['id'], task.robot, item['dir'] / 'config.yaml', checkpoint,
+            directory, seed=item['manifest'].seed, fps=self.settings.video_fps)
+        if result.exit_code != 0:
+            write_json(directory / 'audit.json', {'passed': False, 'errors': ['奖励审计 rollout 失败']})
+            return False
+        media = self._media_for_rollout(directory)
+        try:
+            trajectory = pd.read_parquet(media['trajectory'])
+            rewards = pd.read_parquet(media['rewards'])
+            metrics = TrajectoryMetrics().compute(trajectory)
+            report = audit_rollout(task, item['plan'], trajectory, rewards, metrics)
+        except (OSError, ValueError, KeyError) as exc:
+            write_json(directory / 'audit.json', {'passed': False, 'errors': ['奖励审计证据不可用：' + str(exc)]})
+            return False
+        previous = item.get('pilot_quality')
+        if previous:
+            from ..rewards.quality_gate import compare_pilots
+            report['trend'] = compare_pilots(task, previous, report)
+            if report['trend']['suspected_reward_hacking']:
+                report['passed'] = False
+                report['errors'].append('奖励增长而目标指标倒退，候选暂停；须重新设计而非追加长训练')
+        item['pilot_quality'] = report
+        write_json(directory / 'audit.json', report)
+        return report['passed']
+
     def _real_train(self, task: TaskSpec, task_dir: Path, state: PersistentStateMachine,
                     candidates: List[Dict[str, Any]], budget: BudgetTracker) -> Dict[str, Any]:
         """调用实际 Unitree 入口完成候选筛选和多种子训练。"""
@@ -1261,10 +1295,15 @@ class TrainingOrchestrator:
             CheckpointManager.prune(
                 item["dir"], keep_per_run=self.settings.checkpoints_per_run)
             if result.exit_code == 0:
-                successful.append(item)
+                checkpoint = CheckpointManager.latest(item['dir'])
+                if checkpoint is not None and self._pilot_reward_quality(task, item, checkpoint, 'smoke'):
+                    successful.append(item)
         if not successful:
-            state.transition(AgentState.FAILED, {"reason": "all smoke trainings failed"})
-            raise RuntimeError("all reward candidates failed smoke training; inspect candidate stderr.log files")
+            reason = '所有候选冒烟训练或奖励完整性审计失败；检查 reward_quality/smoke/audit.json 与 stderr.log'
+            write_json(task_dir / 'blocking_report.json', {'state': 'HUMAN_REVIEW', 'reason': reason,
+                'used_iterations': budget.used_iterations, 'candidates': [item['id'] for item in candidates]})
+            state.transition(AgentState.HUMAN_REVIEW, {'reason': reason})
+            raise RuntimeError(reason)
         state.transition(AgentState.CANDIDATE_SCREENING)
         screening_increment = max(0, self.settings.screening_iterations - self.settings.smoke_iterations)
         screened = []
@@ -1280,6 +1319,9 @@ class TrainingOrchestrator:
                 continue
             CheckpointManager.prune(
                 item["dir"], keep_per_run=self.settings.checkpoints_per_run)
+            checkpoint = CheckpointManager.latest(item['dir'])
+            if checkpoint is None or not self._pilot_reward_quality(task, item, checkpoint, 'screening'):
+                continue
             latest = TensorBoardReader().latest(item["dir"])
             ppo = PPOCollector().collect(item["dir"])
             if task.task_name == "jump":
@@ -1299,8 +1341,11 @@ class TrainingOrchestrator:
             write_json(item["dir"] / "metrics" / "screening.json", screening)
             screened.append(item)
         if not screened:
-            state.transition(AgentState.FAILED, {"reason": "all candidate screenings failed"})
-            raise RuntimeError("all candidate screenings failed")
+            reason = '所有候选筛选训练或奖励趋势审计失败；检查 reward_quality/screening/audit.json'
+            write_json(task_dir / 'blocking_report.json', {'state': 'HUMAN_REVIEW', 'reason': reason,
+                'used_iterations': budget.used_iterations, 'candidates': [item['id'] for item in successful]})
+            state.transition(AgentState.HUMAN_REVIEW, {'reason': reason})
+            raise RuntimeError(reason)
         try:
             selected = self._select_safe_candidate(screened)
         except RuntimeError:
@@ -1644,6 +1689,22 @@ class TrainingOrchestrator:
         physical.setdefault("abnormal_terminations", float("nan"))
         write_json(rollout_dir / "numeric_summary.json", physical)
         evaluation = DeterministicEvaluator().evaluate(task, physical, visual)
+        quality_reports = []
+        if not dry_run:
+            from ..rewards.quality_gate import audit_rollout
+            for record in rollout_records:
+                try:
+                    report = audit_rollout(task, selected['plan'],
+                        pd.read_parquet(record['media']['trajectory']),
+                        pd.read_parquet(record['media']['rewards']), record['metrics'])
+                except (OSError, ValueError, KeyError) as exc:
+                    report = {'passed': False, 'errors': ['奖励审计证据不可用：' + str(exc)]}
+                write_json(record['dir'] / 'reward_quality_audit.json', report)
+                quality_reports.append(report)
+            if any(not r['passed'] for r in quality_reports):
+                evaluation.completed = False
+                evaluation.hard_constraints_passed = False
+                evaluation.violations.append('reward_signal_integrity')
         write_json(rollout_dir / "evaluation.json", evaluation)
         state.transition(AgentState.DIAGNOSING, {"loop_round": round_index})
         ppo = PPOCollector().collect(selected["dir"])
@@ -1652,6 +1713,9 @@ class TrainingOrchestrator:
             "capabilities": self._diagnosis_capabilities(task.robot),
             "visual": visual.dict(), "numeric": physical, "evaluation": evaluation.dict(),
             "reward_evidence": self._reward_evidence(media), "ppo": ppo.dict(),
+            "reward_quality_audits": quality_reports,
+            "pilot_quality_audits": [read_json(p) for p in sorted(
+                (selected['dir'] / 'reward_quality').glob('*/audit.json'))],
             "loop_history": loop_records,
             "budget": {"used_iterations": budget.used_iterations,
                        "remaining_iterations": budget.max_iterations - budget.used_iterations,
@@ -1729,6 +1793,7 @@ class TrainingOrchestrator:
     def _redesign_failed_rewards(self, task: TaskSpec, task_dir: Path, selected: Dict[str, Any],
                                  diagnosis: TrainingDiagnosis, round_index: int, manifest: Any) -> Any:
         """保存失败分析，再请求独立完整设计；审核失败有限重试，不改变验收合同。"""
+        from ..rewards.quality_gate import METRIC_SIGNALS
         root = task_dir / 'reward_redesign' / ('round_%02d' % round_index)
         root.mkdir(parents=True, exist_ok=True)
         write_json(root / 'failure_analysis.json', diagnosis)
@@ -1737,6 +1802,7 @@ class TrainingOrchestrator:
             return read_json(path) if path.is_file() else None
         payload = {
             'immutable_task': task.dict(), 'previous_plan': selected['plan'].dict(),
+            'LOCAL_METRIC_REWARD_SIGNALS': {k: sorted(v) for k, v in METRIC_SIGNALS.items()},
             'failure_analysis': diagnosis.dict(), 'environment_manifest': manifest.dict(),
             'remaining_budget': load(task_dir / 'loop_status.json'),
             'rollout_metrics': load(round_root / 'rollout_metrics.json'),
@@ -1744,6 +1810,8 @@ class TrainingOrchestrator:
             'reward_evidence': {p.parent.name: self._reward_evidence({'rewards': p})
                                 for p in sorted(round_root.glob('rollout_*/rewards.parquet'))},
             'evaluations': [read_json(p) for p in sorted(round_root.glob('rollout_*/evaluation.json'))],
+            'reward_quality_audits': [read_json(p) for p in sorted(
+                round_root.glob('rollout_*/reward_quality_audit.json'))],
             'ppo': PPOCollector().collect(selected['dir']).dict(),
             'effective_reward_scales': load(selected['dir'] / 'effective_reward_scales.json'),
         }
@@ -1776,7 +1844,8 @@ class TrainingOrchestrator:
                         raise RewardValidationError('重设计不得改变或遗漏验收指标：' + metric.name)
                 audit = self._normalize_plan_for_task(task, revised)
                 self._validate_plan_metric_coverage(task, revised)
-                review = self.reward_reviewer.review(intent, task, [revised], manifest.dict(),
+                review = self.reward_reviewer.review(intent, task, [revised],
+                    dict(manifest.dict(), require_objective_links=True),
                     ['失败后的新奖励必须重新验证收益、动作形态及安全约束'])
                 write_json(root / ('review_%02d.json' % attempt), review)
                 if not review.approved:

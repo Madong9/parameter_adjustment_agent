@@ -7,12 +7,13 @@ from typing import Any, Dict
 
 from ..schemas.agent_workflow import TaskIntentSpec, TaskRewardBundle
 from ..utils.io import sha256_text
+from ..rewards.quality_gate import METRIC_SIGNALS
 
 
 class RewardPromptCompiler:
     """使用仓库内固定模板生成可哈希、可审计的模型请求。"""
 
-    VERSION = "reward-design-v4"
+    VERSION = "reward-design-v5"
 
     def __init__(self, template_path: Path):
         """保存提示词模板路径。"""
@@ -30,6 +31,9 @@ class RewardPromptCompiler:
                 intent.dict(), ensure_ascii=False, separators=(",", ":")),
             "CONTEXT_SNAPSHOT: " + json.dumps(
                 context, ensure_ascii=False, separators=(",", ":"), default=str),
+            "LOCAL_METRIC_REWARD_SIGNALS: " + json.dumps(
+                {k: sorted(v) for k, v in METRIC_SIGNALS.items()},
+                ensure_ascii=False),
             "OUTPUT_JSON_SCHEMA: " + TaskRewardBundle.schema_json(),
         ])
         return {"version": self.VERSION, "sha256": sha256_text(prompt), "prompt": prompt}
