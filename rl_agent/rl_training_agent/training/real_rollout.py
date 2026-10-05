@@ -7,6 +7,11 @@ import math
 import sys
 from pathlib import Path
 
+from rl_training_agent.training.contact_semantics import (
+    nonfoot_indices as contact_indices,
+    COLLISION_FORCE_THRESHOLD,
+)
+
 from rl_training_agent.training.real_train import (
     _ensure_environment_tools_on_path,
     _install_numpy_compatibility_aliases,
@@ -117,7 +122,6 @@ def main() -> int:
 
     rigid_state = env.gym.acquire_rigid_body_state_tensor(env.sim)
     rigid = gymtorch.wrap_tensor(rigid_state).view(1, -1, 13)
-    from .contact_semantics import nonfoot_indices as contact_indices, COLLISION_FORCE_THRESHOLD
     nonfoot_indices = contact_indices(env)
     steps = max(1, int(args.seconds / policy_dt))
     rows, reward_rows = [], []
