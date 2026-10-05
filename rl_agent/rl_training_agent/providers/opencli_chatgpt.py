@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, ValidationError
 
 from ..agents.context_builder import ContextBuilder
+from ..agents.reward_prompt_policy import render_reward_policy
 from ..schemas.agent_workflow import TaskIntentSpec, TaskRewardBundle
 from ..feasibility.motion_prototype.schema import MotionPrototype
 from ..feasibility.prompts import MOTION_PROTOTYPE_PROMPT
@@ -1194,7 +1195,7 @@ class OpenCLIChatGPTWebProvider:
         """依据任务描述和环境能力生成任务规格与奖励候选。"""
         template = (Path(__file__).parents[1] / "prompts" / "task_reward_design.md").read_text(encoding="utf-8")
         compact_capabilities = _compact_capabilities(capabilities)
-        prompt = (template + "\nRobot: %s\nInstruction: %s\nENVIRONMENT_MANIFEST: %s\nJSON Schema: %s" %
+        prompt = (template + "\n" + render_reward_policy() + "\nRobot: %s\nInstruction: %s\nENVIRONMENT_MANIFEST: %s\nJSON Schema: %s" %
                   (robot, instruction, json.dumps(compact_capabilities, ensure_ascii=False, separators=(",", ":")),
                    TaskRewardBundle.schema_json()))
         return self._request_model(prompt, TaskRewardBundle, "task-reward-design").dict()
@@ -1220,7 +1221,7 @@ class OpenCLIChatGPTWebProvider:
     def redesign_rewards(self, payload: Dict[str, Any]) -> RewardPlan:
         """根据失败证据及诊断建议重新设计完整计划，任务验收保持固定。"""
         template = (Path(__file__).parents[1] / "prompts" / "failure_reward_redesign.md").read_text(encoding="utf-8")
-        prompt = template + "\nEvidence: " + json.dumps(json_safe(payload), ensure_ascii=False, allow_nan=False)
+        prompt = template + "\n" + render_reward_policy() + "\nEvidence: " + json.dumps(json_safe(payload), ensure_ascii=False, allow_nan=False)
         prompt += "\nJSON Schema: " + RewardPlan.schema_json()
         return self._request_model(prompt, RewardPlan, "failure-reward-redesign")
 

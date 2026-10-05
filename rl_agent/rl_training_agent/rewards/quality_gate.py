@@ -31,6 +31,11 @@ SAFETY_SIGNALS = {
     'forbidden_collisions': 'collision', 'forbidden_contact_force': 'collision',
     'joint_limit_violations': 'dof_pos_limits', 'torque_limit_violations': 'torque_limits',
 }
+METRIC_SIGNAL_OVERRIDES = {
+    (metric, aggregation): {'landing_recovery'}
+    for metric in ('stable_stand_duration', 'landing_stability')
+    for aggregation in ('continuous_after_last_landing', 'post_last_airborne_recovery_mean')
+}
 
 
 def effective_scales(plan):
@@ -61,10 +66,8 @@ def audit_objectives(task, plan):
     for metric in task.success_metrics:
         if not metric.required:
             continue
-        supported = METRIC_SIGNALS.get(metric.name, set())
-        if (metric.name in {'stable_stand_duration', 'landing_stability'} and
-                metric.aggregation in {'continuous_after_last_landing', 'post_last_airborne_recovery_mean'}):
-            supported = {'landing_recovery'}
+        supported = METRIC_SIGNAL_OVERRIDES.get((metric.name, metric.aggregation),
+                                               METRIC_SIGNALS.get(metric.name, set()))
         if not any(m.dict() == metric.dict() for m in plan.success_metrics):
             errors.append('不得修改或遗漏任务验收标准：' + metric.name)
         usable = supported & active
