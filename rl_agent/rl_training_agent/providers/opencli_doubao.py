@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 from ..schemas.experiments import ConversationHandle, ProviderHealth
 from ..settings import OpenCLISettings, load_opencli_settings
 from .errors import ProviderError, ProviderNeedsHuman, ProviderTimeout
+from .browser_lease import serialize_browser_operation
 from .opencli_chatgpt import (
     OpenCLIChatGPTWebProvider,
     Runner,
@@ -18,6 +19,42 @@ from .opencli_chatgpt import (
     _extract_value,
     _json_from_output,
 )
+
+
+# 与 GPT 一样只检查站点控件，旧消息中的安全验证或登录文字不是故障证据。
+DOUBAO_ACCESS_STATE_SCRIPT = r"""
+(() => {
+  const visible = node => Boolean(node && node.getClientRects().length &&
+    getComputedStyle(node).visibility !== 'hidden' && getComputedStyle(node).display !== 'none');
+  const messageSelector = '[data-testid="send_message"], [data-testid="receive_message"]';
+  const outsideMessage = node => !node.closest(messageSelector);
+  const controls = Array.from(document.querySelectorAll('button, a, input')).filter(node =>
+    visible(node) && outsideMessage(node));
+  const label = node => (node.getAttribute('aria-label') || node.textContent || '').trim();
+  const composer = Array.from(document.querySelectorAll(
+    '[data-testid="chat_input_input"] [contenteditable="true"]')).find(visible);
+  const login = controls.some(node =>
+    /^(登录|立即登录|登录\/注册|登录或注册|Log in|Sign in)$/i.test(label(node)));
+  const authForm = Array.from(document.querySelectorAll('input[type="password"], ' +
+    'form input[autocomplete="username"]')).some(node => visible(node) && outsideMessage(node));
+  const challenge = Array.from(document.querySelectorAll(
+    '[role="dialog"], iframe, [id*="captcha"], [class*="captcha"], ' +
+    '[id*="verify"], [class*="verify"]')).some(node => visible(node) && outsideMessage(node) &&
+    /验证码|安全验证|verify you are human|captcha/i.test(
+      (node.innerText || '') + ' ' + (node.getAttribute('src') || '') + ' ' +
+      (node.getAttribute('aria-label') || '')));
+  const usageNotice = Array.from(document.querySelectorAll('[role="alert"], [role="dialog"]'))
+    .filter(node => visible(node) && outsideMessage(node)).map(node => {
+      const copy = node.cloneNode(true);
+      copy.querySelectorAll(messageSelector + ', textarea, [contenteditable="true"], pre, code')
+        .forEach(item => item.remove());
+      return String(copy.textContent || '').slice(0, 2000);
+    }).join('\n');
+  return JSON.stringify({probe_version: 'doubao-access-v1', url: location.href,
+    composer_found: Boolean(composer), login_required: login || authForm,
+    challenge_required: challenge, usage_notice: usageNotice});
+})()
+"""
 
 
 class OpenCLIDoubaoWebProvider(OpenCLIChatGPTWebProvider):
@@ -43,40 +80,30 @@ class OpenCLIDoubaoWebProvider(OpenCLIChatGPTWebProvider):
         super().__init__(OpenCLISettings(**values), runner=runner, record_dir=record_dir)
 
     def _state(self) -> str:
-        """刷新豆包页面状态并识别未登录或安全验证页面。"""
+        """仅根据可见站点控件识别登录和安全验证，不扫描历史正文。"""
         state = self._browser(["state"])
-        lowered = state.lower()
-        if any(item in lowered for item in ("验证码", "安全验证", "verify", "captcha")):
-            # state 包含隐藏节点、脚本属性和历史标题；单个关键字不能证明
-            # 当前页面被验证弹窗阻断。只确认可见验证控件，无法检查时保守停止。
-            check = self._parse_eval_result(self._browser(["eval", """
-(() => {
-  const visible = node => !!node.getClientRects().length &&
-    getComputedStyle(node).visibility !== 'hidden' &&
-    getComputedStyle(node).display !== 'none';
-  const candidates = document.querySelectorAll(
-    '[role="dialog"], iframe, [id*="captcha"], [class*="captcha"], [id*="verify"], [class*="verify"]');
-  const blocked = Array.from(candidates).some(node => visible(node) &&
-    /验证码|安全验证|verify you are human|captcha/i.test(
-      (node.innerText || '') + ' ' + (node.getAttribute('src') || '') + ' ' +
-      (node.getAttribute('aria-label') || '')));
-  const editor = document.querySelector('[data-testid="chat_input_input"] [contenteditable="true"]');
-  return JSON.stringify({blocked, ready: !!editor && visible(editor)});
-})()
-"""], allow_failure=True))
-            if not isinstance(check, dict) or check.get("blocked") or not check.get("ready"):
-                raise ProviderNeedsHuman("豆包页面需要完成安全验证，请在浏览器完成验证后重试。")
-        if "登录" in state and "chat_input" not in state and "新对话" not in state:
-            raise ProviderNeedsHuman("豆包登录已失效，请在浏览器中重新登录。")
         self._assert_expected_page()
+        access = self._access_state()
+        self._raise_for_usage_limit(str(access.get("usage_notice", "")))
+        if access.get("challenge_required") is True:
+            raise ProviderNeedsHuman("豆包页面需要完成安全验证，请在浏览器完成验证后重试。")
+        if access.get("login_required") is True:
+            raise ProviderNeedsHuman("豆包页面显示登录控件或身份验证表单，请在绑定标签页完成登录。")
         return state
 
+    def _access_state(self) -> Dict[str, Any]:
+        """读取豆包控件专用探针，避免继承 ChatGPT 选择器导致错误判定。"""
+        output = self._browser(["eval", DOUBAO_ACCESS_STATE_SCRIPT], allow_failure=True)
+        value = self._parse_eval_result(output)
+        return value if isinstance(value, dict) and value.get("probe_version") == "doubao-access-v1" else {}
+
+    @serialize_browser_operation
     def doctor(self) -> ProviderHealth:
         """检查 OpenCLI 扩展和豆包网页登录状态。"""
         try:
             self.open_or_bind()
-            state = self._state()
-            available = "chat_input" in state or "新对话" in state
+            self._state()
+            available = self._access_state().get("composer_found") is True
             return ProviderHealth(
                 available=available,
                 opencli_available=True,
@@ -97,6 +124,7 @@ class OpenCLIDoubaoWebProvider(OpenCLIChatGPTWebProvider):
                 details=["豆包网页检查失败：%s" % exc],
             )
 
+    @serialize_browser_operation
     def open_or_bind(self) -> None:
         """打开独立豆包标签页并强制使用普通“对话”模式。"""
         self._ensure_bridge_connected()
@@ -105,6 +133,7 @@ class OpenCLIDoubaoWebProvider(OpenCLIChatGPTWebProvider):
         self._ensure_dialogue_mode()
         self._opened = True
 
+    @serialize_browser_operation
     def new_conversation(self, title_hint: str) -> ConversationHandle:
         """打开豆包新对话页并返回本地可审计句柄。"""
         if not self._opened:
@@ -310,6 +339,7 @@ class OpenCLIDoubaoWebProvider(OpenCLIChatGPTWebProvider):
         raise ProviderTimeout("豆包在 %s 秒内没有显示全部附件：%s" % (
             self.settings.submit_timeout, ", ".join(file_names)))
 
+    @serialize_browser_operation
     def send_with_files(self, prompt: str, files: List[Path],
                         conversation: ConversationHandle) -> str:
         """向豆包上传视觉/文档附件，再发送结构化评估提示词。"""
@@ -354,6 +384,7 @@ class OpenCLIDoubaoWebProvider(OpenCLIChatGPTWebProvider):
         return self.send_text(
             prompt, conversation, submission_timeout=max(self.settings.submit_timeout, 120))
 
+    @serialize_browser_operation
     def close(self) -> None:
         """关闭 Agent 自己创建的豆包浏览器会话。"""
         if self._opened:

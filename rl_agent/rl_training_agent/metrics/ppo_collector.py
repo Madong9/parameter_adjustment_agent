@@ -15,8 +15,9 @@ class PPOCollector:
 
     def collect(self, log_dir: Path) -> PPOStatistics:
         """从 TensorBoard 日志汇总最新 PPO 指标。"""
-        latest = TensorBoardReader().latest(log_dir)
+        series_by_tag = TensorBoardReader().read(log_dir)
+        latest = {tag: series[-1]["value"] for tag, series in series_by_tag.items() if series}
         kwargs = {field: latest.get(tag, 0.0) for field, tag in self.TAGS.items()}
-        iterations = [item["step"] for series in TensorBoardReader().read(log_dir).values() for item in series[-1:]]
+        iterations = [series[-1]["step"] for series in series_by_tag.values() if series]
         kwargs["iteration"] = max(iterations) if iterations else 0
         return PPOStatistics(**kwargs)

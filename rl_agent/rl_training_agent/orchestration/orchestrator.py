@@ -8,6 +8,7 @@ import statistics
 import shutil
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -16,6 +17,7 @@ import pandas as pd
 from ..agents.context_builder import ContextBuilder
 from ..agents.prompt_compiler import RewardPromptCompiler
 from ..agents.reward_reviewer import RewardReviewAgent
+from ..agents.task_semantics import TaskSemanticValidator
 from ..environment.inspector import EnvironmentInspector
 from ..environment.metric_registry import normalize_task_metrics
 from ..environment.project_adapter import UnitreeProjectAdapter
@@ -30,6 +32,7 @@ from ..metrics.ppo_collector import PPOCollector
 from ..metrics.tensorboard_reader import TensorBoardReader
 from ..metrics.trajectory_metrics import TrajectoryMetrics
 from ..memory.curator import MemoryCuratorAgent
+from ..memory.compatibility import compatibility_fingerprint
 from ..memory.consolidator import SemanticMemoryConsolidatorAgent
 from ..memory.procedural import ProceduralMemoryAgent
 from ..memory.store import LongTermMemoryStore
@@ -58,8 +61,10 @@ from ..schemas.visual import VisualBehaviorReport
 from ..settings import Settings
 from ..storage.experiment_store import ExperimentStore
 from ..storage.lineage import LineageGraph
+from ..storage.locking import FileLock
 from ..training.checkpoint_manager import CheckpointManager
 from ..training.controller import TrainingController
+from ..training.process_manager import process_identity
 from ..utils.io import atomic_write_text, read_json, utc_now, write_json
 from ..utils.paths import relative_display
 from ..utils.task_semantics import is_front_leg_support_text
@@ -191,6 +196,31 @@ class TrainingOrchestrator:
         if requirement not in task.visual_evaluation_requirements:
             task.visual_evaluation_requirements.append(requirement)
         return adjustments
+
+    def _check_task_semantics(self, task_dir: Path, state: PersistentStateMachine,
+                              intent: TaskIntentSpec, task: Optional[TaskSpec] = None
+                              ) -> Optional[Dict[str, Any]]:
+        """持久化意图/任务语义审核，冲突不得靠奖励重设计或扩大预算掩盖。"""
+        report = (TaskSemanticValidator.assess_task(intent, task) if task is not None
+                  else TaskSemanticValidator.assess_intent(intent))
+        stage = 'task' if task is not None else 'intent'
+        write_json(task_dir / (stage + '_semantic_check.json'), report)
+        JsonlEventRecorder(task_dir / 'events.jsonl').emit('task_semantic_check', {
+            'run_id': state.record.context.get('run_id'), 'stage': stage, **report.dict()})
+        if report.status == 'CONSISTENT':
+            return None
+        reason = ('动作目标需要澄清：' if report.status == 'NEEDS_CLARIFICATION' else
+                  '动作语义不一致，已禁止启动训练：') + '；'.join(report.issues)
+        result = {'task_id': task_dir.name, 'state': AgentState.HUMAN_REVIEW.value,
+                  'result': 'human_review', 'reason': reason,
+                  'semantic_check': report.dict(), 'requires_clarification': True}
+        write_json(task_dir / 'blocking_report.json', result)
+        state.transition(AgentState.HUMAN_REVIEW, {'reason': reason},
+                         operation_id='semantic-block:%s:%s' % (
+                             state.record.context.get('run_id'), stage))
+        self._write_working_memory(task_dir, state)
+        print('[任务语义] %s' % reason, flush=True)
+        return result
 
     @staticmethod
     def _normalize_plan_for_task(task: TaskSpec, plan: RewardPlan) -> List[str]:
@@ -446,9 +476,11 @@ class TrainingOrchestrator:
         if not self.settings.memory_enabled:
             return {"enabled": False, "hits": []}
         try:
+            compatibility = compatibility_fingerprint(
+                self.settings.training_root, self.inspector.inspect(robot).dict())
             result = self.memory.retrieve(
                 query, robot, top_k=self.settings.memory_top_k,
-                exclude_task_id=exclude_task_id)
+                exclude_task_id=exclude_task_id, **compatibility)
             print("[记忆] 从 %d 条长期记忆中检索到 %d 条相关经验" % (
                 result.get("records", 0), len(result.get("hits", []))), flush=True)
             return result
@@ -515,10 +547,16 @@ class TrainingOrchestrator:
         for name in ("blocking_report.json", "summary.json", "report.md", "loop_status.json",
                      "loop_history.json", "loop_blocking_error.txt", "feasibility_report.json",
                      "training_admission.json", "training_readiness.json", "environment_health.json",
-                     "acceptance_contract.json"):
+                     "acceptance_contract.json", "evaluation_protocol.json", "training_execution.json",
+                     "intent_semantic_check.json", "task_semantic_check.json"):
             path = task_dir / name
             if path.is_file():
                 path.unlink()
+        for pattern in ("reward_review_attempt_*.json", "design_response_attempt_*.json",
+                        "plan_normalization_attempt_*.json"):
+            for path in task_dir.glob(pattern):
+                if path.is_file():
+                    path.unlink()
 
     def plan(self, instruction: str, robot: str) -> Dict[str, Any]:
         """生成并验证任务与候选配置但不启动训练。"""
@@ -538,6 +576,143 @@ class TrainingOrchestrator:
                           for part in path.parent.parts)]
         return matches[-1] if matches else None
 
+    def _evaluation_protocol(self, task_dir: Path) -> Dict[str, Any]:
+        """读取当前运行冻结的种子及样本要求，旧运行仅接受已保存的种子集合。"""
+        path = task_dir / 'evaluation_protocol.json'
+        if path.is_file():
+            protocol = read_json(path)
+            state = read_json(task_dir / 'state.json')
+            if not isinstance(protocol, dict) or protocol.get('run_id') != state.get('context', {}).get('run_id'):
+                raise RuntimeError('恢复被拒绝：评估协议 run_id 不一致')
+        else:
+            summary_path = task_dir / 'summary.json'
+            summary = read_json(summary_path) if summary_path.is_file() else {}
+            seeds = summary.get('evaluation_seeds')
+            if not seeds:
+                raise RuntimeError('恢复被拒绝：旧任务缺少固定评估种子集合')
+            protocol = {'seeds': seeds, 'dry_run': bool(summary.get('dry_run')),
+                        'rollouts_per_seed': self.settings.rollouts_per_seed,
+                        'counterfactual_enabled': self.settings.counterfactual_enabled}
+        seeds = protocol.get('seeds')
+        if (not isinstance(seeds, list) or not seeds or
+                any(type(seed) is not int for seed in seeds) or len(set(seeds)) != len(seeds) or
+                type(protocol.get('dry_run')) is not bool or type(protocol.get('counterfactual_enabled')) is not bool or
+                type(protocol.get('rollouts_per_seed')) is not int or protocol['rollouts_per_seed'] <= 0):
+            raise RuntimeError('恢复被拒绝：固定评估协议无效')
+        return protocol
+
+    @staticmethod
+    def _save_checkpoint_set(task_dir: Path, selected: Dict[str, Any], dry_run: bool) -> None:
+        """保存每个种子的精确 checkpoint 路径和摘要，禁止恢复时隐式选择其他策略。"""
+        state = read_json(task_dir / 'state.json')
+        directory = selected['dir'].resolve()
+        seeds = list(selected.get('checkpoint_seeds', []))
+        checkpoints = list(selected.get('checkpoints', []))
+        protocol_path = task_dir / 'evaluation_protocol.json'
+        original = read_json(protocol_path).get('seeds') if protocol_path.is_file() else read_json(task_dir / 'summary.json').get('evaluation_seeds')
+        if not seeds or seeds != original or len(checkpoints) != len(seeds):
+            raise RuntimeError('禁止保存不完整或改变种子集合的 checkpoint 清单')
+        entries = []
+        for seed, checkpoint in zip(selected['checkpoint_seeds'], selected['checkpoints']):
+            relative = checkpoint.resolve().relative_to(directory)
+            entries.append({'seed': seed, 'path': str(relative),
+                            'sha256': hashlib.sha256(checkpoint.read_bytes()).hexdigest()})
+        write_json(directory / 'checkpoint_set.json', {
+            'run_id': state.get('context', {}).get('run_id'), 'dry_run': dry_run,
+            'config_hash': selected['manifest'].config_hash,
+            'reward_version': selected['plan'].version, 'entries': entries})
+
+    @staticmethod
+    def _persist_training_execution(task_dir: Path, state: PersistentStateMachine,
+                                    budget: BudgetTracker, **updates: Any) -> Dict[str, Any]:
+        """在启动前原子记录预算与操作状态，崩溃后不能退款或重放不确定训练。"""
+        path = task_dir / 'training_execution.json'
+        saved = read_json(path) if path.is_file() else {}
+        run_id = state.record.context.get('run_id')
+        if saved and saved.get('run_id') != run_id:
+            raise RuntimeError('训练执行记录 run_id 不一致')
+        saved.update(updates)
+        saved.update(run_id=run_id, budget=budget.dict(), updated_at=utc_now())
+        write_json(path, saved)
+        return saved
+
+    def _reserve_training_operation(self, task_dir: Path, state: PersistentStateMachine,
+                                    budget: BudgetTracker, operation_id: str, iterations: int,
+                                    **updates: Any) -> None:
+        """先扣减并落盘训练额度；已有操作不重复启动，包括结果不确定的操作。"""
+        path = task_dir / 'training_execution.json'
+        saved = read_json(path) if path.is_file() else {}
+        operations = dict(saved.get('operations', {}))
+        if operation_id in operations:
+            raise RuntimeError('训练操作已经登记，禁止重复执行：' + operation_id)
+        budget.consume_iterations(iterations)
+        operations[operation_id] = {'status': 'reserved', 'iterations': iterations}
+        self._persist_training_execution(task_dir, state, budget, operations=operations,
+                                         phase='training', **updates)
+
+    def _complete_training_operation(self, task_dir: Path, state: PersistentStateMachine,
+                                     budget: BudgetTracker, operation_id: str) -> None:
+        """原子标记子进程完成，保留全部已用预算和操作审计记录。"""
+        saved = read_json(task_dir / 'training_execution.json')
+        saved['operations'][operation_id]['status'] = 'completed'
+        self._persist_training_execution(task_dir, state, budget, operations=saved['operations'])
+
+    @staticmethod
+    def _load_training_execution(task_dir: Path, state: PersistentStateMachine,
+                                 dry_run: bool) -> Dict[str, Any]:
+        """核对执行快照归属，并拒绝恢复仍存活的同一训练子进程。"""
+        path = task_dir / 'training_execution.json'
+        if not path.is_file():
+            return {}
+        saved = read_json(path)
+        if (saved.get('run_id') != state.record.context.get('run_id') or
+                type(saved.get('dry_run')) is not bool or saved['dry_run'] != dry_run):
+            raise RuntimeError('恢复被拒绝：训练执行记录的运行或模式不一致')
+        raw_budget = saved.get('budget', {})
+        names = ('max_iterations', 'used_iterations', 'max_revisions', 'used_revisions')
+        if not isinstance(raw_budget, dict) or any(type(raw_budget.get(name)) is not int for name in names):
+            raise RuntimeError('恢复被拒绝：训练执行预算类型无效')
+        budget = BudgetTracker.parse_obj(raw_budget)
+        if (min(budget.used_iterations, budget.used_revisions, budget.max_iterations, budget.max_revisions) < 0 or
+                budget.used_iterations > budget.max_iterations or budget.used_revisions > budget.max_revisions):
+            raise RuntimeError('恢复被拒绝：训练执行预算无效')
+        if saved.get('phase') not in ('compiled', 'training', 'trained', 'blocked'):
+            raise RuntimeError('恢复被拒绝：训练执行阶段无效')
+        operations = saved.get('operations', {})
+        if (not isinstance(operations, dict) or any(
+                not isinstance(item, dict) or item.get('status') not in ('reserved', 'completed') or
+                type(item.get('iterations')) is not int or item['iterations'] < 0
+                for item in operations.values()) or
+                sum(item['iterations'] for item in operations.values()) > budget.used_iterations):
+            raise RuntimeError('恢复被拒绝：训练操作与已扣预算不一致')
+        experiment = str(saved.get('experiment_id', ''))
+        if not experiment or not experiment.replace('-', '').replace('_', '').isalnum():
+            raise RuntimeError('恢复被拒绝：训练执行候选标识无效')
+        if saved['phase'] == 'training' and not any(
+                operation.startswith(experiment + ':') for operation in operations):
+            raise RuntimeError('恢复被拒绝：训练阶段缺少对应候选的已登记操作键')
+        directory = task_dir / 'candidates' / experiment
+        identity_path = directory / 'process_identity.json'
+        pid_path = directory / 'pid'
+        if identity_path.is_file():
+            identity = read_json(identity_path)
+            pid = int(identity.get('pid', 0))
+            current = process_identity(pid)
+            if current is not None and all(current.get(key) == identity.get(key)
+                                           for key in ('pid', 'pgid', 'start_ticks')):
+                raise RuntimeError('恢复被拒绝：已登记的训练子进程仍在运行')
+        elif saved.get('phase') in ('training', 'blocked') and pid_path.is_file():
+            # 旧 PID 没有启动时间，不能用于发送信号，也不能假定原进程已退出。
+            import os
+            pid = int(pid_path.read_text().strip())
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise RuntimeError('恢复被拒绝：旧训练 PID 仍存在，需先确认进程归属')
+        return saved
+
     def _restore_selected_candidate(self, task_dir: Path, experiment_id: str) -> Dict[str, Any]:
         """从持久化候选目录恢复闭环所需的计划、manifest 和多种子 checkpoint。"""
         directory = self.store.candidate_dir(task_dir.name, experiment_id)
@@ -548,22 +723,58 @@ class TrainingOrchestrator:
         metadata = read_json(directory / "compile_metadata.json")
         if plan.version != manifest.reward_version:
             raise RuntimeError("恢复被拒绝：奖励版本与 manifest 不一致")
-        if str(metadata.get("config_hash")) != manifest.config_hash:
+        if plan.task_id != task_dir.name or manifest.task_id != task_dir.name:
+            raise RuntimeError('恢复被拒绝：候选的任务来源不一致')
+        config_path = directory / 'config.yaml'
+        actual_hash = hashlib.sha256(config_path.read_bytes()).hexdigest() if config_path.is_file() else None
+        if str(metadata.get("config_hash")) != manifest.config_hash or actual_hash != manifest.config_hash:
             raise RuntimeError("恢复被拒绝：配置哈希与 manifest 不一致")
+        protocol = self._evaluation_protocol(task_dir)
+        expected_result = 'dry_run_completed' if protocol['dry_run'] else 'completed'
+        if manifest.training_result != expected_result:
+            raise RuntimeError('恢复被拒绝：候选训练未完成或 Mock/真实模式不一致')
+        seeds = list(protocol['seeds'])
         checkpoints: List[Path] = []
-        seeds: List[int] = []
-        for seed in self.settings.evaluation_seeds:
-            checkpoint = self._checkpoint_for_seed(directory, seed)
-            if checkpoint is not None:
-                checkpoints.append(checkpoint)
-                seeds.append(seed)
-        if not checkpoints and manifest.checkpoint:
-            checkpoint = directory / manifest.checkpoint
-            if checkpoint.is_file():
-                checkpoints = [checkpoint]
-                seeds = [manifest.seed]
-        if not checkpoints:
-            raise FileNotFoundError("恢复候选没有可用 checkpoint：%s" % experiment_id)
+        index_path = directory / 'checkpoint_set.json'
+        entries = {}
+        if index_path.is_file():
+            index = read_json(index_path)
+            current_run = read_json(task_dir / 'state.json').get('context', {}).get('run_id')
+            if (not isinstance(index, dict) or index.get('run_id') != current_run or index.get('config_hash') != manifest.config_hash or
+                    index.get('reward_version') != plan.version or
+                    type(index.get('dry_run')) is not bool or index['dry_run'] != protocol['dry_run']):
+                raise RuntimeError('恢复被拒绝：checkpoint 来源与当前运行不一致')
+            raw_entries = index.get('entries')
+            if (not isinstance(raw_entries, list) or any(not isinstance(item, dict) or
+                    type(item.get('seed')) is not int or not isinstance(item.get('path'), str) or
+                    not isinstance(item.get('sha256'), str) or not re.fullmatch('[0-9a-f]{64}', item['sha256'])
+                    for item in raw_entries)):
+                raise RuntimeError('恢复被拒绝：checkpoint 条目格式无效')
+            if any(Path(item['path']).is_absolute() or '..' in Path(item['path']).parts or
+                   not CheckpointManager.PATTERN.fullmatch(Path(item['path']).name)
+                   for item in raw_entries):
+                raise RuntimeError('恢复被拒绝：checkpoint 路径越界或格式无效')
+            entries = {item['seed']: item for item in raw_entries}
+            if set(entries) != set(seeds) or len(index.get('entries', [])) != len(seeds):
+                raise RuntimeError('恢复被拒绝：checkpoint 种子集合不完整')
+        for seed in seeds:
+            entry = entries.get(seed)
+            checkpoint = (directory / entry['path']) if entry else self._checkpoint_for_seed(directory, seed)
+            if checkpoint is None or not checkpoint.is_file():
+                raise FileNotFoundError('恢复被拒绝：缺少种子 %s 的 checkpoint' % seed)
+            try:
+                checkpoint.resolve().relative_to(directory.resolve())
+            except ValueError as exc:
+                raise RuntimeError('恢复被拒绝：checkpoint 路径越界') from exc
+            if entry and hashlib.sha256(checkpoint.read_bytes()).hexdigest() != entry.get('sha256'):
+                raise RuntimeError('恢复被拒绝：checkpoint 摘要不一致')
+            if entry and not any(part == 'seed_%d' % seed or part.endswith('-seed-%d' % seed)
+                                 for part in checkpoint.parent.parts):
+                raise RuntimeError('恢复被拒绝：checkpoint 路径的种子来源不一致')
+            checkpoints.append(checkpoint)
+        if not entries and manifest.checkpoint:
+            if (directory / manifest.checkpoint).resolve() != checkpoints[0].resolve():
+                raise RuntimeError('恢复被拒绝：旧运行 checkpoint 与 manifest 记录不一致')
         selected = {
             "id": experiment_id, "dir": directory, "plan": plan, "manifest": manifest,
             "metadata": metadata,
@@ -572,7 +783,8 @@ class TrainingOrchestrator:
         if manifest.parent_experiment_id:
             parent_dir = self.store.candidate_dir(task_dir.name, manifest.parent_experiment_id)
             parent_checkpoints = [self._checkpoint_for_seed(parent_dir, seed) for seed in seeds]
-            selected["parent_checkpoints"] = [path for path in parent_checkpoints if path is not None]
+            # 保留原种子槽位，绝不能过滤后让另一种子的策略顶替缺失父策略。
+            selected["parent_checkpoints"] = parent_checkpoints
         return selected
 
     def _recover_interrupted_finalization(
@@ -583,6 +795,42 @@ class TrainingOrchestrator:
             AgentState.CONTINUE_TRAINING, AgentState.REVISE_REWARD,
             AgentState.REVISE_CURRICULUM, AgentState.ROLLBACK, AgentState.RESTART,
         }
+        execution = self._load_training_execution(task_dir, state, dry_run)
+        if execution and state.record.state in decision_states | {AgentState.FULL_TRAINING}:
+            task = TaskSpec.parse_obj(read_json(task_dir / 'task_spec.json'))
+            budget = BudgetTracker.parse_obj(execution['budget'])
+            self._apply_persisted_admission_budget(task_dir, task, state, budget, dry_run)
+            candidate = str(execution['experiment_id'])
+            manifest_path = task_dir / 'candidates' / candidate / 'manifest.json'
+            manifest = read_json(manifest_path) if manifest_path.is_file() else {}
+            complete = (manifest.get('training_result') in ('completed', 'dry_run_completed') and
+                        (manifest_path.parent / 'checkpoint_set.json').is_file())
+            if not complete:
+                candidate = str(execution.get('parent_experiment') or '')
+            if not candidate:
+                state.transition(AgentState.HUMAN_REVIEW, {
+                    'reason': '初始训练中断且没有完整多种子策略；已用预算保留，不重放训练操作',
+                    'training_budget': budget.dict()})
+                return {'task_id': task_dir.name, 'state': 'HUMAN_REVIEW',
+                        'reason': state.record.context['reason'],
+                        'used_iterations': budget.used_iterations,
+                        'used_revisions': budget.used_revisions, 'recoverable': False}
+            selected = self._restore_selected_candidate(task_dir, candidate)
+            records = read_json(task_dir / 'loop_history.json') if (task_dir / 'loop_history.json').is_file() else []
+            round_index = int(execution.get('round_index', 0)) + 1
+            round_index = max(1, round_index)
+            write_json(task_dir / 'loop_status.json', {
+                'round': round_index, 'experiment_id': candidate,
+                'used_iterations': budget.used_iterations,
+                'remaining_iterations': max(0, budget.max_iterations - budget.used_iterations),
+                'used_revisions': budget.used_revisions,
+                'remaining_revisions': max(0, budget.max_revisions - budget.used_revisions)})
+            reason = ('训练中断后已恢复完整策略，评估可继续' if complete else
+                      '修订训练中断或失败；保留父策略和已扣预算，不重放不确定训练操作')
+            if budget.exhausted:
+                reason += '；' + self._budget_exhaustion_reason(selected, budget, dry_run)
+            return self._finalize_loop(task, task_dir, state, selected, {}, budget, records,
+                                       AgentState.HUMAN_REVIEW, reason, dry_run)
         blocking_path = task_dir / "loop_blocking_error.txt"
         status_path = task_dir / "loop_status.json"
         history_path = task_dir / "loop_history.json"
@@ -632,6 +880,11 @@ class TrainingOrchestrator:
             AgentState.HUMAN_REVIEW, "闭环修订无法安全执行：%s" % error, dry_run)
 
     def resume(self, task_id: str, dry_run: bool = False) -> Dict[str, Any]:
+        """对同一任务加跨进程排他锁，避免恢复与新训练覆盖彼此。"""
+        with FileLock(self.store.task_dir(task_id) / '.run.lock', blocking=False):
+            return self._resume_locked(task_id, dry_run)
+
+    def _resume_locked(self, task_id: str, dry_run: bool = False) -> Dict[str, Any]:
         """从人工审核时保存的候选、预算和 rollout 恢复自动闭环，不重复初始训练。"""
         task_dir = self.store.task_dir(task_id)
         state = PersistentStateMachine(task_dir / "state.json")
@@ -655,6 +908,14 @@ class TrainingOrchestrator:
         if not experiment_id:
             raise RuntimeError("人工审核发生在训练前，当前没有可恢复 checkpoint")
         task = TaskSpec.parse_obj(read_json(task_dir / "task_spec.json"))
+        execution = self._load_training_execution(task_dir, state, dry_run)
+        if execution:
+            execution_dir = task_dir / 'candidates' / str(execution['experiment_id'])
+            manifest_path = execution_dir / 'manifest.json'
+            if manifest_path.is_file() and (execution_dir / 'checkpoint_set.json').is_file():
+                manifest = read_json(manifest_path)
+                if manifest.get('training_result') in ('completed', 'dry_run_completed'):
+                    experiment_id = execution['experiment_id']
         selected = self._restore_selected_candidate(task_dir, str(experiment_id))
         loop_status = read_json(task_dir / "loop_status.json") \
             if (task_dir / "loop_status.json").is_file() else {}
@@ -679,10 +940,35 @@ class TrainingOrchestrator:
             max_revisions=max_revisions,
             used_revisions=used_revisions,
         )
+        if execution:
+            saved_budget = BudgetTracker.parse_obj(execution['budget'])
+            budget.used_iterations = max(budget.used_iterations, saved_budget.used_iterations)
+            budget.used_revisions = max(budget.used_revisions, saved_budget.used_revisions)
+            budget.max_iterations = min(budget.max_iterations, saved_budget.max_iterations)
+            budget.max_revisions = min(budget.max_revisions, saved_budget.max_revisions)
         self._apply_persisted_admission_budget(task_dir, task, state, budget, dry_run)
+        # 所有冻结预算与策略证据均核对后再短路；不得因恢复而重复昂贵评估或扣费。
+        if budget.exhausted:
+            return self._stop_exhausted_resume(task_dir, state, selected, budget, summary, dry_run)
+        intent_path = task_dir / 'task_intent.json'
+        if intent_path.is_file():
+            intent = TaskIntentSpec.parse_obj(read_json(intent_path))
+        else:
+            # 旧运行不重设计意图：仅从已冻结的用户原文恢复最小输入，再核对原合同。
+            intent = TaskIntentSpec(original_instruction=task.original_instruction, robot=task.robot,
+                action_name=task.task_name, normalized_goal=task.original_instruction)
+        semantics = TaskSemanticValidator.assess_task(intent, task)
+        if semantics.status != 'CONSISTENT':
+            raise RuntimeError('恢复被拒绝：原动作语义需要澄清或与验收合同冲突；%s。'
+                               '请明确贴地侧滚或腾空侧翻后建立新实验，不能改写旧合同恢复。%s' % (
+                                   '；'.join(semantics.issues), semantics.question or ''))
         loop_records = read_json(task_dir / "loop_history.json") \
             if (task_dir / "loop_history.json").is_file() else []
         start_round = max(1, int(loop_status.get("round", len(loop_records) + 1)))
+        if execution and experiment_id != summary.get('selected_experiment'):
+            start_round = max(start_round, int(execution.get('round_index', 0)) + 1)
+        elif execution and execution.get('parent_experiment') and execution.get('phase') in ('training', 'blocked', 'compiled'):
+            start_round = max(start_round, int(execution.get('round_index', 0)) + 1)
         # 旧阻塞文件只描述上一次已收束的人工复核。恢复后先清理，避免后续若被
         # 意外中断，恢复逻辑把陈旧原因误判为本轮错误。
         blocking_path = task_dir / "loop_blocking_error.txt"
@@ -696,11 +982,62 @@ class TrainingOrchestrator:
             task, task_dir, state, selected, dry_run, budget,
             start_round=start_round, existing_records=loop_records, reuse_first_rollout=True)
 
+    @staticmethod
+    def _budget_exhaustion_reason(selected: Dict[str, Any], budget: BudgetTracker,
+                                  dry_run: bool) -> str:
+        """区分已完成的策略训练与未启动的下一轮，不暗示任务已经通过验收。"""
+        version = selected['plan'].version
+        training_kind = '模拟训练' if dry_run else '奖励训练'
+        return ('自动闭环预算耗尽；已完成 v%s %s（不代表验收通过）；'
+                'PPO 训练迭代 %s/%s，奖励修订 %s/%s；'
+                '本次下一轮未启动训练；已保留已有评估、失败分析与建议；'
+                '恢复不会重新调用 Provider，仍可单独评估已有 checkpoint') % (
+                    version, training_kind, budget.used_iterations, budget.max_iterations,
+                    budget.used_revisions, budget.max_revisions)
+
+    def _stop_exhausted_resume(self, task_dir: Path, state: PersistentStateMachine,
+                               selected: Dict[str, Any], budget: BudgetTracker,
+                               summary: Dict[str, Any], dry_run: bool) -> Dict[str, Any]:
+        """耗尽的恢复仅刷新预算提示，保留历史、训练快照和验收结果且不请求模型。"""
+        result = dict(summary)
+        result.setdefault('reason_before_budget_gate', summary.get('reason'))
+        if result.get('selected_experiment') != selected['id']:
+            # 若训练中断后发现完整子策略，不能把父策略 final 文件冒充该子策略的产物。
+            result.update({
+                'selected_experiment': selected['id'],
+                'checkpoint': str(Path(selected['checkpoint']).relative_to(task_dir)),
+                'config': str((selected['dir'] / 'config.yaml').relative_to(task_dir)),
+                'rollout': None, 'last_decision': None,
+                'evaluation_seeds': list(selected.get('checkpoint_seeds', [])),
+            })
+        result.update(budget.summary_fields())
+        result.update({
+            'state': AgentState.HUMAN_REVIEW.value, 'result': 'human_review',
+            'reason': self._budget_exhaustion_reason(selected, budget, dry_run),
+            'reward_version': selected['plan'].version,
+            'resume_allowed': False, 'next_training_started': False,
+        })
+        state.record.context.update({'reason': result['reason'], 'training_budget': budget.dict()})
+        state.record.updated_at = utc_now()
+        state._save()
+        ReportBuilder().build(task_dir.name, result, task_dir)
+        state.events.emit('resume_budget_exhausted', budget.summary_fields())
+        return result
+
     def _apply_persisted_admission_budget(self, task_dir: Path, task: TaskSpec,
                                           state: PersistentStateMachine,
                                           budget: BudgetTracker, dry_run: bool) -> None:
         """恢复时取持久化准入、任务和当前配置的最小上限，保留所有已用额度。"""
         self._validate_acceptance_contract(task_dir, task, state)
+        if min(budget.used_iterations, budget.used_revisions, budget.max_iterations, budget.max_revisions) < 0:
+            raise RuntimeError('恢复被拒绝：持久化预算不能为负数')
+        compatibility_path = task_dir / 'environment_compatibility.json'
+        manifest_path = task_dir / 'environment_manifest.json'
+        if compatibility_path.is_file() and manifest_path.is_file():
+            current = compatibility_fingerprint(self.settings.training_root,
+                EnvironmentInspector(self.settings.training_root).inspect(task.robot).dict())
+            if current != read_json(compatibility_path):
+                raise RuntimeError('恢复被拒绝：机器人环境或奖励实现兼容指纹已改变')
         iteration_cap = min(task.training_budget.max_total_iterations,
                             self.settings.max_total_iterations)
         revision_cap = min(task.training_budget.max_reward_revisions,
@@ -720,6 +1057,8 @@ class TrainingOrchestrator:
                 budget.reserve_for_revisions = True
         budget.max_iterations = min(budget.max_iterations, iteration_cap)
         budget.max_revisions = min(budget.max_revisions, revision_cap)
+        if budget.used_iterations > budget.max_iterations or budget.used_revisions > budget.max_revisions:
+            raise RuntimeError('恢复被拒绝：已用预算超过当前允许上限，不能退款或扩大上限')
 
     @staticmethod
     def _task_acceptance_identity(task: TaskSpec) -> Dict[str, Any]:
@@ -762,15 +1101,25 @@ class TrainingOrchestrator:
             raise RuntimeError("验收合同不一致：改变任务动作或行为要求应重新建立任务")
 
     def _run(self, instruction: str, robot: str, dry_run: bool, stop_after_plan: bool) -> Dict[str, Any]:
+        """锁住完整任务运行，保护状态、验收合同和最终结果。"""
+        task_dir = self.store.task_dir(self._task_id(instruction, robot))
+        with FileLock(task_dir / '.run.lock', blocking=False):
+            return self._run_locked(instruction, robot, dry_run, stop_after_plan)
+
+    def _run_locked(self, instruction: str, robot: str, dry_run: bool, stop_after_plan: bool) -> Dict[str, Any]:
         """执行受限子流程并返回结构化结果。"""
         if robot not in self.settings.allowed_robots:
             raise ValueError("unsupported robot: %s" % robot)
         task_id = self._task_id(instruction, robot)
-        run_id = "run-" + hashlib.sha1(utc_now().encode("utf-8")).hexdigest()[:8]
+        run_id = 'run-' + uuid.uuid4().hex[:12]
         task_dir = self.store.initialize_task(task_id)
         self._clear_stale_run_outputs(task_dir)
         state = PersistentStateMachine(task_dir / "state.json")
         state.start_new_run(run_id)
+        write_json(task_dir / 'evaluation_protocol.json', {
+            'run_id': run_id, 'dry_run': dry_run, 'seeds': list(self.settings.evaluation_seeds),
+            'rollouts_per_seed': self.settings.rollouts_per_seed,
+            'counterfactual_enabled': self.settings.counterfactual_enabled})
         if self.settings.memory_enabled:
             try:
                 self.memory.save_procedural(self.procedural_memory.snapshot())
@@ -780,6 +1129,8 @@ class TrainingOrchestrator:
         atomic_write_text(task_dir / "task_request.txt", instruction.rstrip() + "\n")
         manifest = self.inspect_environment(robot, self.settings.artifacts_path / "environment_manifest.json")
         write_json(task_dir / "environment_manifest.json", manifest)
+        write_json(task_dir / "environment_compatibility.json",
+                   compatibility_fingerprint(self.settings.training_root, manifest.dict()))
         state.transition(AgentState.ENVIRONMENT_INSPECTED)
 
         state.transition(AgentState.TASK_UNDERSTANDING, {"agent_role": "task_planner"})
@@ -824,6 +1175,9 @@ class TrainingOrchestrator:
         intent.original_instruction = instruction
         intent.robot = robot
         write_json(task_dir / "task_intent.json", intent)
+        semantic_block = self._check_task_semantics(task_dir, state, intent)
+        if semantic_block is not None:
+            return semantic_block
         self._write_working_memory(task_dir, state)
 
         state.transition(AgentState.TASK_FEASIBILITY_CHECK, {
@@ -1008,9 +1362,11 @@ class TrainingOrchestrator:
                 lambda: self.provider.design_task_and_rewards(
                     instruction, robot, augmented_capabilities))
         write_json(task_dir / "design_response.json", design)
+        write_json(task_dir / "design_response_attempt_00.json", design)
         task = TaskSpec.parse_obj(design["task_spec"])
         task.task_id = task_id
         task.robot = robot
+        task.original_instruction = instruction
         task.training_budget.max_total_iterations = min(
             task.training_budget.max_total_iterations, admission.max_iterations)
         task.training_budget.max_reward_revisions = min(
@@ -1022,6 +1378,9 @@ class TrainingOrchestrator:
         unsupported, derivable = self.inspector.validate_task(task, manifest)
         write_json(task_dir / "task_spec.json", task)
         state.transition(AgentState.TASK_DESIGNED, {"unsupported": unsupported, "derivable": derivable})
+        semantic_block = self._check_task_semantics(task_dir, state, intent, task)
+        if semantic_block is not None:
+            return semantic_block
         if unsupported:
             report = {"task_id": task_id, "state": AgentState.HUMAN_REVIEW.value,
                       "unsupported_requirements": unsupported,
@@ -1058,6 +1417,50 @@ class TrainingOrchestrator:
         local_gaps = capability_gaps(task, manifest.dict())
         write_json(task_dir / 'reward_capability_gaps.json', {'gaps': local_gaps,
             'requires_local_implementation': bool(local_gaps)})
+        for attempt in range(self.settings.reward_design_review_retries + 1):
+            write_json(task_dir / ("reward_review_attempt_%02d.json" % attempt), review)
+            if review.approved or local_gaps or attempt == self.settings.reward_design_review_retries:
+                break
+            # 只重新设计全被拒绝的奖励；任务与验收合同不可由修复请求降级。
+            feedback = {"attempt": attempt + 1, "review": review.dict(),
+                        "fixed_task_spec": task.dict(),
+                        "instruction": instruction, "robot": robot}
+            JsonlEventRecorder(task_dir / "events.jsonl").emit("reward_redesign", feedback)
+            retry_prompt = compiled_prompt["prompt"] + (
+                "\n奖励业务审查未通过。根据下列逐候选意见重新设计；保留原始动作、"
+                "环境能力及固定 TaskSpec 的全部验收标准，只修改 reward_plans。\n" +
+                json.dumps(feedback, ensure_ascii=False))
+            try:
+                if hasattr(self.provider, "design_task_bundle"):
+                    design = self._provider_call(
+                        task_dir, "reward_designer", "review_redesign",
+                        lambda: self.provider.design_task_bundle(retry_prompt))
+                else:
+                    retry_context = dict(augmented_capabilities, reward_review_feedback=feedback)
+                    design = self._provider_call(
+                        task_dir, "reward_designer", "review_redesign",
+                        lambda: self.provider.design_task_and_rewards(
+                            instruction, robot, retry_context))
+                write_json(task_dir / ("design_response_attempt_%02d.json" % (attempt + 1)), design)
+                plans = [RewardPlan.parse_obj(item) for item in design["reward_plans"]
+                         ][:self.settings.num_reward_candidates]
+                normalization_records = []
+                for plan in plans:
+                    plan.task_id = task_id
+                    adjustments = self._normalize_plan_for_task(task, plan)
+                    normalization_records.append({"version": plan.version, "adjustments": adjustments})
+                write_json(task_dir / "plan_normalization.json", normalization_records)
+                write_json(task_dir / ("plan_normalization_attempt_%02d.json" % (attempt + 1)),
+                           normalization_records)
+                review = self.reward_reviewer.review(
+                    intent, task, plans, dict(manifest.dict(), require_objective_links=not dry_run), design.get("reward_hacking_risks", []))
+            except (ProviderError, ValueError, KeyError) as exc:
+                review.approved = False
+                review.conflicts.append("奖励重新设计失败：%s" % exc)
+                break
+        # 保留实际用于审查/编译的设计，但强制绑定原始 TaskSpec。
+        write_json(task_dir / "design_response.json", dict(
+            design, task_spec=task.dict(), reward_plans=[plan.dict() for plan in plans]))
         write_json(task_dir / "reward_review.json", review)
         if not review.approved:
             issues = sorted({issue for candidate in review.candidate_results
@@ -1101,7 +1504,7 @@ class TrainingOrchestrator:
                     from ..rewards.quality_gate import audit_objectives, require_objectives
                     write_json(directory / 'reward_quality_preflight.json', audit_objectives(task, plan))
                     require_objectives(task, plan)
-                metadata = compiler.compile(plan, directory)
+                metadata = compiler.compile(plan, directory, task=task)
             except RewardValidationError as exc:
                 atomic_write_text(directory / "validation_error.txt", str(exc) + "\n")
                 continue
@@ -1210,17 +1613,20 @@ class TrainingOrchestrator:
         """离线模拟候选筛选和多种子完整训练阶段。"""
         state.transition(AgentState.SMOKE_TRAINING)
         for index, item in enumerate(candidates):
-            budget.consume_iterations(self.settings.smoke_iterations)
+            self._reserve_training_operation(task_dir, state, budget, item['id'] + ':smoke',
+                self.settings.smoke_iterations, dry_run=True, experiment_id=item['id'], parent_experiment=None)
             metrics = {"success_rate": 0.75 + index * 0.05, "task_score": 0.8 - index * 0.02,
                        "ppo_stability": 0.9, "energy": 0.1 + index * 0.02,
                        "reward_hacking_score": 0.0, "hard_constraints_passed": 1.0}
             write_json(item["dir"] / "metrics" / "smoke.json", metrics)
             atomic_write_text(item["dir"] / "stdout.log", "dry-run smoke training completed\n")
             atomic_write_text(item["dir"] / "stderr.log", "")
+            self._complete_training_operation(task_dir, state, budget, item['id'] + ':smoke')
         state.transition(AgentState.CANDIDATE_SCREENING)
         screening_increment = max(0, self.settings.screening_iterations - self.settings.smoke_iterations)
         for index, item in enumerate(candidates):
-            budget.consume_iterations(screening_increment)
+            self._reserve_training_operation(task_dir, state, budget, item['id'] + ':screening',
+                screening_increment, dry_run=True, experiment_id=item['id'], parent_experiment=None)
             screening = {"iteration": self.settings.screening_iterations,
                          "hard_constraints_passed": True, "task_score": 0.82 - index * 0.04,
                          "success_rate": 0.8 - index * 0.03, "ppo_stability": 0.92 - index * 0.02,
@@ -1230,6 +1636,7 @@ class TrainingOrchestrator:
                                              0.05 * screening["reward_hacking_score"])
             write_json(item["dir"] / "metrics" / "screening.json", screening)
             item["screening_score"] = screening["composite_score"]
+            self._complete_training_operation(task_dir, state, budget, item['id'] + ':screening')
         selected = self._select_safe_candidate(candidates)
         screening_path = selected["dir"] / "metrics" / "screening.json"
         selected_screening = read_json(screening_path)
@@ -1242,10 +1649,13 @@ class TrainingOrchestrator:
         if per_seed <= 0:
             raise RuntimeError("initial full-training iteration budget exhausted")
         for seed in self.settings.evaluation_seeds:
-            budget.consume_iterations(per_seed)
+            operation = selected['id'] + ':full:seed:%d' % seed
+            self._reserve_training_operation(task_dir, state, budget, operation, per_seed,
+                dry_run=True, experiment_id=selected['id'], parent_experiment=None, round_index=0)
             checkpoint = selected["dir"] / "checkpoints" / ("seed_%d" % seed) / ("model_%d.pt" % per_seed)
             atomic_write_text(checkpoint, "dry-run checkpoint placeholder; never deploy to hardware\n")
             checkpoints.append(checkpoint)
+            self._complete_training_operation(task_dir, state, budget, operation)
         selected["checkpoints"] = checkpoints
         selected["checkpoint_seeds"] = list(self.settings.evaluation_seeds)
         selected["checkpoint"] = checkpoints[0]
@@ -1253,6 +1663,8 @@ class TrainingOrchestrator:
         selected["manifest"].iteration = per_seed
         selected["manifest"].checkpoint = str(checkpoints[0].relative_to(selected["dir"]))
         write_json(selected["dir"] / "manifest.json", selected["manifest"])
+        self._save_checkpoint_set(task_dir, selected, True)
+        self._persist_training_execution(task_dir, state, budget, phase='trained')
         return selected
 
     def _pilot_reward_quality(self, task: TaskSpec, item: Dict[str, Any], checkpoint: Path,
@@ -1271,7 +1683,8 @@ class TrainingOrchestrator:
             trajectory = pd.read_parquet(media['trajectory'])
             rewards = pd.read_parquet(media['rewards'])
             metrics = TrajectoryMetrics().compute(trajectory)
-            report = audit_rollout(task, item['plan'], trajectory, rewards, metrics)
+            report = audit_rollout(task, item['plan'], trajectory, rewards, metrics,
+                                   metadata=read_json(media['metadata']), require_contact_metadata=True)
         except (OSError, ValueError, KeyError) as exc:
             write_json(directory / 'audit.json', {'passed': False, 'errors': ['奖励审计证据不可用：' + str(exc)]})
             return False
@@ -1292,7 +1705,9 @@ class TrainingOrchestrator:
         state.transition(AgentState.SMOKE_TRAINING)
         successful = []
         for item in candidates:
-            budget.consume_iterations(self.settings.smoke_iterations)
+            operation = item['id'] + ':smoke'
+            self._reserve_training_operation(task_dir, state, budget, operation,
+                self.settings.smoke_iterations, dry_run=False, experiment_id=item['id'], parent_experiment=None)
             item["manifest"].started_at = utc_now()
             result = self.controller.run_smoke_training(item["id"], task.robot, item["dir"] / "config.yaml",
                                                         self.settings.smoke_iterations, item["manifest"].seed,
@@ -1301,6 +1716,7 @@ class TrainingOrchestrator:
             item["manifest"].training_result = "completed" if result.exit_code == 0 else "failed"
             item["manifest"].failure_reason = "timeout" if result.timed_out else (None if result.exit_code == 0 else "process_exit_%d" % result.exit_code)
             write_json(item["dir"] / "manifest.json", item["manifest"])
+            self._complete_training_operation(task_dir, state, budget, operation)
             CheckpointManager.prune(
                 item["dir"], keep_per_run=self.settings.checkpoints_per_run)
             if result.exit_code == 0:
@@ -1320,10 +1736,13 @@ class TrainingOrchestrator:
             checkpoint = CheckpointManager.latest(item["dir"])
             if checkpoint is None:
                 continue
-            budget.consume_iterations(screening_increment)
+            operation = item['id'] + ':screening'
+            self._reserve_training_operation(task_dir, state, budget, operation,
+                screening_increment, dry_run=False, experiment_id=item['id'], parent_experiment=None)
             result = self.controller.continue_training(item["id"], task.robot, item["dir"] / "config.yaml",
                                                        screening_increment, item["manifest"].seed,
                                                        item["dir"], checkpoint)
+            self._complete_training_operation(task_dir, state, budget, operation)
             if result.exit_code != 0:
                 continue
             CheckpointManager.prune(
@@ -1333,10 +1752,7 @@ class TrainingOrchestrator:
                 continue
             latest = TensorBoardReader().latest(item["dir"])
             ppo = PPOCollector().collect(item["dir"])
-            if task.task_name == "jump":
-                task_score = latest.get("Episode/rew_raw_mean_jump_height", 0.0)
-            else:
-                task_score = latest.get("Episode/rew_raw_mean_tracking_lin_vel", 0.0)
+            task_score, proxy_terms = self._task_reward_proxy(task, latest)
             finite_metrics = bool(latest) and all(math.isfinite(float(value)) for value in latest.values())
             finite_ppo = all(math.isfinite(float(value)) for value in
                              (ppo.value_loss, ppo.surrogate_loss, ppo.learning_rate, ppo.mean_noise_std))
@@ -1344,6 +1760,7 @@ class TrainingOrchestrator:
             stability = 1.0 / (1.0 + max(0.0, ppo.value_loss)) if finite_ppo else 0.0
             score = 0.65 * task_score + 0.35 * stability if safety else None
             screening = {"iteration": self.settings.screening_iterations,
+                         "task_proxy_terms": proxy_terms,
                          "hard_constraints_passed": safety, "task_proxy": task_score,
                          "ppo_stability": stability, "composite_score": score,
                          "note": "必须通过数值健康门槛；最终完成仍需确定性 rollout 和视觉验收"}
@@ -1371,7 +1788,9 @@ class TrainingOrchestrator:
             raise RuntimeError("initial full-training iteration budget exhausted")
         for seed in self.settings.evaluation_seeds:
             remaining = per_seed
-            budget.consume_iterations(remaining)
+            operation = selected['id'] + ':full:seed:%d' % seed
+            self._reserve_training_operation(task_dir, state, budget, operation, remaining,
+                dry_run=False, experiment_id=selected['id'], parent_experiment=None, round_index=0)
             before = set(CheckpointManager.list_checkpoints(selected["dir"]))
             result = self.controller.run_full_training(selected["id"] + "-seed-%d" % seed, task.robot,
                                                        selected["dir"] / "config.yaml", remaining, seed,
@@ -1380,13 +1799,18 @@ class TrainingOrchestrator:
                 state.transition(AgentState.FAILED, {"reason": "full training failed", "seed": seed})
                 raise RuntimeError("full random-initialized training failed for seed %d" % seed)
             new_checkpoints = [path for path in CheckpointManager.list_checkpoints(selected["dir"]) if path not in before]
-            checkpoint = new_checkpoints[-1] if new_checkpoints else CheckpointManager.latest(selected["dir"])
+            checkpoint = self._checkpoint_for_seed(selected['dir'], seed)
+            if checkpoint not in new_checkpoints:
+                checkpoint = None
             if checkpoint is None:
+                state.transition(AgentState.FAILED, {
+                    "reason": "full training produced no new seed checkpoint", "seed": seed})
                 raise RuntimeError("full training produced no checkpoint for seed %d" % seed)
             CheckpointManager.prune(
                 checkpoint.parent, keep_per_run=self.settings.checkpoints_per_run,
                 protected=[checkpoint])
             validation_checkpoints.append(checkpoint)
+            self._complete_training_operation(task_dir, state, budget, operation)
         selected["checkpoints"] = validation_checkpoints
         selected["checkpoint_seeds"] = list(self.settings.evaluation_seeds)
         selected["checkpoint"] = validation_checkpoints[0]
@@ -1394,18 +1818,51 @@ class TrainingOrchestrator:
         selected["manifest"].iteration = per_seed
         selected["manifest"].checkpoint = str(validation_checkpoints[0].relative_to(selected["dir"]))
         write_json(selected["dir"] / "manifest.json", selected["manifest"])
+        self._save_checkpoint_set(task_dir, selected, False)
+        self._persist_training_execution(task_dir, state, budget, phase='trained')
         return selected
+
+    @staticmethod
+    def _task_reward_proxy(task: TaskSpec, latest: Dict[str, float]) -> tuple:
+        """按动作选择原始奖励代理；代理只用于筛选，不替代最终物理验收。"""
+        text = (task.task_name + ' ' + task.original_instruction).lower()
+        if '侧翻' in text or 'side_flip' in text:
+            terms = ['takeoff_velocity', 'airborne_duration', 'roll_rotation', 'landing_recovery']
+        elif is_front_leg_support_text((task.original_instruction,)):
+            terms = ['front_leg_stand', 'front_leg_walk']
+        elif '后腿' in text or 'rear_leg' in text:
+            terms = ['rear_leg_stand', 'rear_leg_walk']
+        elif task.task_name == 'jump' or '跳' in text:
+            terms = ['jump_height', 'landing_stability']
+        elif '转' in text or 'turn' in text:
+            terms = ['tracking_ang_vel']
+        else:
+            terms = ['tracking_lin_vel']
+        values = [float(latest['Episode/rew_raw_mean_' + name]) for name in terms
+                  if 'Episode/rew_raw_mean_' + name in latest]
+        return (float(statistics.mean(values)) if values else 0.0), terms
 
     @staticmethod
     def _rollout_score(task: TaskSpec, metrics: Dict[str, float]) -> float:
         """按任务进度加分并对碰撞、跌倒和姿态偏差扣分，用于选择中位 rollout。"""
-        if task.task_name == "jump":
-            progress = metrics.get("jump_height", 0.0)
-        else:
-            progress = max(metrics.get("walking_speed_tracking", 0.0),
-                           metrics.get("tracking_lin_vel", 0.0))
-        return (progress - 0.1 * metrics.get("forbidden_collisions", 0.0) -
-                2.0 * metrics.get("fall_rate", 0.0) - 0.1 * metrics.get("max_abs_roll", 0.0))
+        scores = []
+        for threshold in task.success_metrics:
+            value = metrics.get(threshold.name)
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                scores.append(0.0)
+            elif threshold.operator in ('>=', '>'):
+                scores.append(min(1.0, max(0.0, value / max(abs(threshold.value), 1e-6))))
+            elif threshold.operator in ('<=', '<'):
+                scores.append(1.0 / (1.0 + max(0.0, value - threshold.value) / max(abs(threshold.value), 1e-6)))
+            else:
+                scores.append(float(value == threshold.value))
+        progress = statistics.mean(scores) if scores else 0.0
+        def penalty(name: str) -> float:
+            """缺失安全证据视为最差样本，避免 NaN 分数破坏视觉样本排序。"""
+            value = metrics.get(name)
+            return max(0.0, float(value)) if isinstance(value, (int, float)) and math.isfinite(value) else 1e6
+
+        return progress - 0.1 * penalty("forbidden_collisions") - 2.0 * penalty("fall_rate")
 
     @staticmethod
     def _aggregate_rollout_metrics(task: TaskSpec,
@@ -1422,7 +1879,9 @@ class TrainingOrchestrator:
             "forbidden_collisions", "abnormal_terminations", "fall_rate",
         }
         for name in names:
-            values = [float(record["metrics"].get(name, float("nan"))) for record in records]
+            raw_values = [record["metrics"].get(name) for record in records]
+            values = [float(value) if isinstance(value, (int, float)) else float("nan")
+                      for value in raw_values]
             if not all(math.isfinite(value) for value in values):
                 aggregate[name] = float("nan")
                 continue
@@ -1475,26 +1934,61 @@ class TrainingOrchestrator:
         """计算零命令下的漂移速度和安全结果。"""
         frame = pd.read_parquet(rollout_dir / "trajectory.parquet")
         speed = (frame["base_vx"].astype(float) ** 2 + frame["base_vy"].astype(float) ** 2) ** 0.5
-        max_speed = float(speed.max()) if len(speed) else float("inf")
+        finite = bool(len(speed)) and all(math.isfinite(float(value)) for value in speed)
+        max_speed = float(speed.max()) if finite else float("inf")
         fall_rate = float(frame["fall"].astype(float).mean()) if "fall" in frame else 1.0
-        passed = max_speed <= self.settings.counterfactual_zero_command_speed_max and fall_rate == 0.0
+        safety = TrajectoryMetrics().compute(frame)
+        mandatory = ('nan_count', 'joint_limit_violations', 'torque_limit_violations',
+                     'forbidden_collisions', 'abnormal_terminations')
+        safe = all(isinstance(safety.get(name), (int, float)) and
+                   math.isfinite(safety[name]) and safety[name] == 0 for name in mandatory)
+        passed = finite and safe and max_speed <= self.settings.counterfactual_zero_command_speed_max and fall_rate == 0.0
         return {"scenario": "zero_command", "passed": passed,
                 "max_base_speed": max_speed, "fall_rate": fall_rate,
                 "speed_threshold": self.settings.counterfactual_zero_command_speed_max}
 
-    def _cached_round_rollout(self, round_root: Path, task: Optional[TaskSpec] = None) -> Optional[tuple]:
+    def _cached_round_rollout(self, round_root: Path, task: Optional[TaskSpec] = None,
+                              selected: Optional[Dict[str, Any]] = None) -> Optional[tuple]:
         """读取已完整采集的轮次，供 Provider 故障恢复时跳过昂贵的重复仿真。"""
         metrics_path = round_root / "rollout_metrics.json"
         if not metrics_path.is_file():
             return None
         payload = read_json(metrics_path)
         records = list(payload.get("records", []))
+        protocol = self._evaluation_protocol(round_root.parents[3])
+        seeds = list(protocol['seeds'])
+        if protocol['dry_run']:
+            if len(records) != 1:
+                return None
+        elif ({seed: sum(item.get('seed') == seed for item in records) for seed in seeds} !=
+                {seed: protocol['rollouts_per_seed'] for seed in seeds} or
+                any(item.get('seed') not in seeds for item in records)):
+            return None
+        names = [str(item.get('rollout', '')) for item in records]
+        if len(set(names)) != len(names) or any(not name or Path(name).name != name for name in names):
+            return None
+        if task is not None and protocol['counterfactual_enabled'] and self._counterfactual_applicable(task):
+            if not self._counterfactual_evidence(round_root, seeds, bool(protocol['dry_run']))['passed']:
+                return None
         for item in records:
             item_dir = round_root / str(item.get("rollout"))
             item["dir"] = item_dir
             item["media"] = self._media_for_rollout(item_dir)
             if not item["media"]["trajectory"].is_file():
                 return None
+            metadata_path = item['media']['metadata']
+            if not metadata_path.is_file():
+                return None
+            metadata = read_json(metadata_path)
+            if not protocol['dry_run'] and metadata.get('seed') != item.get('seed'):
+                return None
+            if selected is not None and not protocol['dry_run']:
+                checkpoint = dict(zip(selected['checkpoint_seeds'], selected['checkpoints'])).get(item['seed'])
+                if checkpoint is None or metadata.get('checkpoint') != checkpoint.name:
+                    return None
+                digest = item.get('checkpoint_sha256')
+                if digest and digest != hashlib.sha256(checkpoint.read_bytes()).hexdigest():
+                    return None
             # 可复用原始轨迹，不能复用旧验收口径计算的派生指标。
             item["metrics"] = TrajectoryMetrics().compute(pd.read_parquet(item["media"]["trajectory"]))
             if task is not None:
@@ -1517,7 +2011,7 @@ class TrainingOrchestrator:
         state.transition(AgentState.ROLLOUT_COLLECTING, {"loop_round": round_index})
         round_root = selected["dir"] / "rollouts" / ("round_%02d" % round_index)
         if reuse_existing:
-            cached = self._cached_round_rollout(round_root, task)
+            cached = self._cached_round_rollout(round_root, task, selected)
             if cached is not None:
                 return cached
         if dry_run:
@@ -1539,11 +2033,14 @@ class TrainingOrchestrator:
                 "dry_run": True, "scenarios": []})
             return rollout_dir, media, records
         rollout_records = []
+        protocol = self._evaluation_protocol(task_dir=selected['dir'].parents[1])
         checkpoints = selected.get("checkpoints", [selected["checkpoint"]])
-        seeds = selected.get("checkpoint_seeds", self.settings.evaluation_seeds[:len(checkpoints)])
+        seeds = selected.get("checkpoint_seeds", protocol['seeds'])
+        if list(seeds) != list(protocol['seeds']) or len(checkpoints) != len(seeds):
+            raise RuntimeError('固定评估种子与 checkpoint 集合不完整')
         rollout_index = 0
         for checkpoint, seed in zip(checkpoints, seeds):
-            for _ in range(self.settings.rollouts_per_seed):
+            for _ in range(protocol['rollouts_per_seed']):
                 rollout_index += 1
                 current_dir = round_root / ("rollout_%03d" % rollout_index)
                 result = self.controller.run_evaluation_rollouts(
@@ -1558,11 +2055,12 @@ class TrainingOrchestrator:
                 rollout_records.append({
                     "score": self._rollout_score(task, metrics), "dir": current_dir,
                     "media": current_media, "seed": seed, "metrics": metrics,
+                    'checkpoint_sha256': hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
                 })
         if not rollout_records:
             raise RuntimeError("evaluation produced no rollout")
         counterfactuals = []
-        if self.settings.counterfactual_enabled and self._counterfactual_applicable(task):
+        if protocol['counterfactual_enabled'] and self._counterfactual_applicable(task):
             for checkpoint, seed in zip(checkpoints, seeds):
                 current_dir = round_root / ("counterfactual_zero_seed_%d" % seed)
                 result = self.controller.run_evaluation_rollouts(
@@ -1572,7 +2070,7 @@ class TrainingOrchestrator:
                     command_override={"x": 0.0, "y": 0.0, "yaw": 0.0})
                 if result.exit_code != 0:
                     raise RuntimeError("counterfactual rollout failed for seed %d" % seed)
-                counterfactuals.append(self._counterfactual_summary(current_dir))
+                counterfactuals.append(dict(self._counterfactual_summary(current_dir), seed=seed))
         write_json(round_root / "counterfactual_evaluation.json", {
             "applicable": bool(counterfactuals),
             "passed": all(item["passed"] for item in counterfactuals),
@@ -1581,7 +2079,8 @@ class TrainingOrchestrator:
         rollout_records.sort(key=lambda item: item["score"])
         representative = rollout_records[len(rollout_records) // 2]
         serializable = [{"rollout": item["dir"].name, "seed": item["seed"],
-                         "score": item["score"], "metrics": item["metrics"]}
+                         "score": item["score"], "metrics": item["metrics"],
+                         'checkpoint_sha256': item['checkpoint_sha256']}
                         for item in rollout_records]
         write_json(round_root / "rollout_metrics.json", {
             "records": serializable,
@@ -1589,6 +2088,34 @@ class TrainingOrchestrator:
             "representative_rollout": representative["dir"].name,
         })
         return representative["dir"], representative["media"], rollout_records
+
+    def _counterfactual_evidence(self, round_root: Path, seeds: List[int], dry_run: bool) -> Dict[str, Any]:
+        """验证反事实每个种子的有限安全证据，缺文件或缺样本一律不通过。"""
+        path = round_root / 'counterfactual_evaluation.json'
+        failed = {'passed': False, 'scenarios': [], 'reason': '反事实证据缺失或不完整'}
+        if not path.is_file():
+            return failed
+        try:
+            evidence = read_json(path)
+        except (OSError, ValueError):
+            return failed
+        if not isinstance(evidence, dict):
+            return failed
+        if dry_run:
+            return evidence if evidence.get('dry_run') is True and evidence.get('passed') is True else failed
+        scenarios = evidence.get('scenarios')
+        if (evidence.get('dry_run') is not False or evidence.get('applicable') is not True or
+                evidence.get('passed') is not True or not isinstance(scenarios, list) or
+                len(scenarios) != len(seeds) or any(not isinstance(item, dict) for item in scenarios) or
+                {item.get('seed') for item in scenarios} != set(seeds)):
+            return failed
+        for item in scenarios:
+            speed, fall = item.get('max_base_speed'), item.get('fall_rate')
+            if (item.get('passed') is not True or item.get('scenario') != 'zero_command' or
+                    any(type(value) not in (int, float) or not math.isfinite(value) for value in (speed, fall)) or
+                    speed < 0 or speed > self.settings.counterfactual_zero_command_speed_max or fall != 0):
+                return failed
+        return evidence
 
     @staticmethod
     def _reward_evidence(media: Dict[str, Path]) -> Dict[str, float]:
@@ -1675,25 +2202,24 @@ class TrainingOrchestrator:
         })
         state.transition(AgentState.NUMERIC_EVALUATING, {"loop_round": round_index})
         physical = self._aggregate_rollout_metrics(task, rollout_records)
-        counterfactual_path = rollout_dir.parent / "counterfactual_evaluation.json"
-        if counterfactual_path.is_file():
-            counterfactual = read_json(counterfactual_path)
-            required = self.settings.counterfactual_enabled and self._counterfactual_applicable(task)
-            physical["counterfactual_applicable"] = required
-            physical["counterfactual_observed_passed"] = bool(counterfactual.get("passed", True))
+        protocol = self._evaluation_protocol(task_dir)
+        required = protocol['counterfactual_enabled'] and self._counterfactual_applicable(task)
+        physical['counterfactual_applicable'] = required
+        physical['counterfactual_passed'] = not required
+        if required:
+            counterfactual = self._counterfactual_evidence(rollout_dir.parent, protocol['seeds'], dry_run)
+            physical["counterfactual_observed_passed"] = counterfactual.get('passed') is True
             # 旧实验可能缓存了按旧规则执行的零命令测试。保留观测值用于审计，
             # 但固定动作任务不再让未要求的停车能力阻塞联合验收。
             physical["counterfactual_passed"] = (
-                bool(counterfactual.get("passed", True)) if required else True)
+                counterfactual.get('passed') is True)
             speeds = [item.get("max_base_speed") for item in counterfactual.get("scenarios", [])
                       if isinstance(item.get("max_base_speed"), (int, float))]
-            physical["zero_command_drift"] = max(speeds) if speeds else 0.0
-        if task.task_name == "jump":
-            physical.update({"takeoff_time_spread": 0.0, "landing_pitch_abs": 0.03})
+            physical["zero_command_drift"] = max(speeds) if speeds else float('nan')
         physical.setdefault("tracking_error", float("nan"))
         physical.setdefault("fall_rate", float("nan"))
-        physical.setdefault("joint_limit_violations", 0.0)
-        physical.setdefault("torque_limit_violations", 0.0)
+        physical.setdefault("joint_limit_violations", float('nan'))
+        physical.setdefault("torque_limit_violations", float('nan'))
         physical.setdefault("forbidden_collisions", float("nan"))
         physical.setdefault("abnormal_terminations", float("nan"))
         write_json(rollout_dir / "numeric_summary.json", physical)
@@ -1705,7 +2231,8 @@ class TrainingOrchestrator:
                 try:
                     report = audit_rollout(task, selected['plan'],
                         pd.read_parquet(record['media']['trajectory']),
-                        pd.read_parquet(record['media']['rewards']), record['metrics'])
+                        pd.read_parquet(record['media']['rewards']), record['metrics'],
+                        metadata=read_json(record['media']['metadata']), require_contact_metadata=True)
                 except (OSError, ValueError, KeyError) as exc:
                     report = {'passed': False, 'errors': ['奖励审计证据不可用：' + str(exc)]}
                 write_json(record['dir'] / 'reward_quality_audit.json', report)
@@ -1896,7 +2423,8 @@ class TrainingOrchestrator:
         directory.mkdir(parents=True, exist_ok=False)
         for name in ("metrics", "checkpoints", "rollouts", "prompts", "responses"):
             (directory / name).mkdir()
-        metadata = RewardCompiler(manifest, self.settings.max_abs_reward_weight).compile(revised, directory)
+        metadata = RewardCompiler(manifest, self.settings.max_abs_reward_weight).compile(
+            revised, directory, task=task)
         write_json(directory / "revision_audit.json", {
             "parent_experiment": selected["id"], "diagnosis": diagnosis.dict(), "adjustments": audit})
         command = self.controller.adapter.training_command(
@@ -1921,6 +2449,9 @@ class TrainingOrchestrator:
         revised = self._compile_revision(task, task_dir, state, selected, diagnosis, round_index, dry_run)
         # 只有安全校验与配置编译均完成后，才算真正消费了一次修订机会。
         budget.consume_revision()
+        self._persist_training_execution(task_dir, state, budget, phase='compiled',
+            dry_run=dry_run, experiment_id=revised['id'], parent_experiment=selected['id'],
+            round_index=round_index)
         decision_states = {
             "continue": AgentState.CONTINUE_TRAINING, "revise_reward": AgentState.REVISE_REWARD,
             "revise_curriculum": AgentState.REVISE_CURRICULUM, "restart": AgentState.RESTART,
@@ -1945,8 +2476,13 @@ class TrainingOrchestrator:
         checkpoints = []
         used_parent_checkpoints = selected.get("parent_checkpoints", parent_checkpoints) \
             if diagnosis.checkpoint_strategy == "continue_from_parent" else parent_checkpoints
+        restart_requested = diagnosis.decision == 'restart' or diagnosis.checkpoint_strategy == 'restart_from_scratch'
+        if not restart_requested and (len(used_parent_checkpoints) != len(seeds) or any(
+                checkpoint is None or not checkpoint.is_file() for checkpoint in used_parent_checkpoints)):
+            raise RuntimeError('修订被拒绝：对应种子的父 checkpoint 不完整')
         for index, seed in enumerate(seeds):
-            budget.consume_iterations(per_seed)
+            operation = revised['id'] + ':revision:seed:%d' % seed
+            self._reserve_training_operation(task_dir, state, budget, operation, per_seed)
             if dry_run:
                 checkpoint = revised["dir"] / "checkpoints" / ("seed_%d" % seed) / ("model_%d.pt" % per_seed)
                 atomic_write_text(checkpoint, "dry-run revised checkpoint placeholder; never deploy to hardware\n")
@@ -1958,7 +2494,7 @@ class TrainingOrchestrator:
                     result = self.controller.run_full_training(
                         run_name, task.robot, revised["dir"] / "config.yaml", per_seed, seed, revised["dir"])
                 else:
-                    parent = used_parent_checkpoints[min(index, len(used_parent_checkpoints) - 1)]
+                    parent = used_parent_checkpoints[index]
                     result = self.controller.continue_training(
                         run_name, task.robot, revised["dir"] / "config.yaml", per_seed, seed,
                         revised["dir"], parent)
@@ -1966,13 +2502,16 @@ class TrainingOrchestrator:
                     raise RuntimeError("revision training failed for seed %d" % seed)
                 new_checkpoints = [path for path in CheckpointManager.list_checkpoints(revised["dir"])
                                    if path not in before]
-                checkpoint = new_checkpoints[-1] if new_checkpoints else None
+                checkpoint = self._checkpoint_for_seed(revised['dir'], seed)
+                if checkpoint not in new_checkpoints:
+                    checkpoint = None
                 if checkpoint is None:
                     raise RuntimeError("revision training produced no checkpoint for seed %d" % seed)
                 CheckpointManager.prune(
                     checkpoint.parent, keep_per_run=self.settings.checkpoints_per_run,
                     protected=[checkpoint])
             checkpoints.append(checkpoint)
+            self._complete_training_operation(task_dir, state, budget, operation)
         revised["checkpoints"] = checkpoints
         revised["checkpoint_seeds"] = list(seeds)
         revised["checkpoint"] = checkpoints[0]
@@ -1981,6 +2520,8 @@ class TrainingOrchestrator:
         revised["manifest"].iteration = per_seed
         revised["manifest"].checkpoint = str(checkpoints[0].relative_to(revised["dir"]))
         write_json(revised["dir"] / "manifest.json", revised["manifest"])
+        self._save_checkpoint_set(task_dir, revised, dry_run)
+        self._persist_training_execution(task_dir, state, budget, phase='trained')
         return revised
 
     def _finalize_loop(self, task: TaskSpec, task_dir: Path, state: PersistentStateMachine,
@@ -2024,8 +2565,9 @@ class TrainingOrchestrator:
             "reason": reason, "selected_experiment": selected["id"],
             "checkpoint": "final/checkpoint.pt", "config": "final/config.yaml",
             "rollout": str(outcome["rollout_dir"].relative_to(task_dir)) if outcome.get("rollout_dir") else None,
-            "used_iterations": budget.used_iterations, "remaining_iterations": budget.max_iterations - budget.used_iterations,
-            "used_revisions": budget.used_revisions, "max_revisions": budget.max_revisions,
+            **budget.summary_fields(),
+            "resume_allowed": final_state == AgentState.HUMAN_REVIEW and not budget.exhausted,
+            "next_training_started": False,
             "loop_rounds": len(loop_records), "reward_version": selected["plan"].version,
             "evaluation_seeds": list(selected.get("checkpoint_seeds", [])),
             "last_decision": loop_records[-1].get("decision") if loop_records else None,
@@ -2105,7 +2647,8 @@ class TrainingOrchestrator:
                         intent, task, selected["plan"], summary, outcome, selected, task_dir,
                         require_multi_seed=self.settings.memory_require_multi_seed,
                         experience=experience,
-                        require_validated_experience=True) if experience is not None else None)
+                        require_validated_experience=True,
+                        memory_root=self.memory.root) if experience is not None else None)
                 if record is not None:
                     memory_path = self.memory.promote(record)
                     state.events.emit("episodic_memory_promoted", {
@@ -2267,10 +2810,10 @@ class TrainingOrchestrator:
                                            loop_records, AgentState.COMPLETED,
                                            "视觉、任务指标和硬约束全部通过", dry_run)
             if (self.settings.failure_reward_redesign and not dry_run and
-                    (budget.used_revisions >= budget.max_revisions or budget.used_iterations >= budget.max_iterations)):
+                    budget.exhausted):
                 return self._finalize_loop(task, task_dir, state, selected, outcome, budget,
                     loop_records, AgentState.HUMAN_REVIEW,
-                    '自动闭环预算耗尽；已保存 GPT 失败分析与建议，未执行新奖励训练', dry_run)
+                    self._budget_exhaustion_reason(selected, budget, dry_run), dry_run)
             if diagnosis.decision == "failed":
                 return self._finalize_loop(task, task_dir, state, selected, outcome, budget,
                                            loop_records, AgentState.FAILED, "诊断判定任务不可恢复", dry_run)
@@ -2278,13 +2821,11 @@ class TrainingOrchestrator:
                 return self._finalize_loop(task, task_dir, state, selected, outcome, budget,
                                            loop_records, AgentState.HUMAN_REVIEW,
                                            "诊断发现需要用户决定的真实歧义或证据冲突", dry_run)
-            if budget.used_revisions >= budget.max_revisions or budget.used_iterations >= budget.max_iterations:
+            if budget.exhausted:
                 return self._finalize_loop(task, task_dir, state, selected, outcome, budget,
                                            loop_records, AgentState.HUMAN_REVIEW,
-                                           "自动闭环预算耗尽，目标仍未通过验收；迭代 %s/%s，修订 %s/%s；"
+                                           self._budget_exhaustion_reason(selected, budget, dry_run) + '；' +
                                            "任务指标通过=%s，视觉通过=%s，硬约束通过=%s；待处理=%s" % (
-                                               budget.used_iterations, budget.max_iterations,
-                                               budget.used_revisions, budget.max_revisions,
                                                evaluation.task_metrics_passed, evaluation.visual_alignment_passed,
                                                evaluation.hard_constraints_passed, diagnosis.decision), dry_run)
             try:
@@ -2292,6 +2833,8 @@ class TrainingOrchestrator:
                     task, task_dir, state, selected, diagnosis, round_index, dry_run, budget)
             except (RuntimeError, RewardValidationError, ValueError) as exc:
                 atomic_write_text(task_dir / "loop_blocking_error.txt", str(exc) + "\n")
+                if (task_dir / 'training_execution.json').is_file():
+                    self._persist_training_execution(task_dir, state, budget, phase='blocked')
                 return self._finalize_loop(task, task_dir, state, selected, outcome, budget,
                                            loop_records, AgentState.HUMAN_REVIEW,
                                            "闭环修订无法安全执行：%s" % exc, dry_run)

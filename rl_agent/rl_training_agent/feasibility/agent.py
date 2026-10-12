@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from ..schemas.agent_workflow import TaskIntentSpec
+from ..agents.task_semantics import TaskSemanticValidator
 from .capability_checker import CapabilityChecker
 from .balance.schema import BalanceMotionPlan
 from .balance.validator import IsaacGymBalanceValidator
@@ -91,6 +92,16 @@ class FeasibilityPipeline:
 
     def assess(self, intent: TaskIntentSpec, manifest: Any) -> CompleteFeasibilityReport:
         """执行模型发现、能力检查、目标生成、IK、仿真和真实等级聚合。"""
+        semantic = TaskSemanticValidator.assess_intent(intent)
+        if semantic.status != "CONSISTENT":
+            self._emit_stage("task_semantic_check", "blocked", semantic_report=semantic.dict())
+            return CompleteFeasibilityReport(
+                status=FeasibilityStatus.NEEDS_CLARIFICATION, task=intent.normalized_goal,
+                validation_level="CAPABILITY_ONLY", motion_type="UNKNOWN",
+                motion_report={"semantic_check": semantic.dict()},
+                limitations=semantic.issues, recommendations=[semantic.question or
+                    "修正任务理解与用户原始动作之间的冲突后重新预检。"],
+                recommended_next_step=semantic.question or "重新确认动作语义")
         assessment = self.capability_checker.assess(intent, manifest)
         self._emit_stage("capability_check", "completed", result_status=assessment.status.value)
         use_mjcf = str(getattr(self.simulation_validator, "backend", "")).lower() == "mujoco"
@@ -212,6 +223,18 @@ class FeasibilityPipeline:
                 simulation_result={"status": "NOT_RUN", "backend": "not_run",
                                    "validated": False},
             )
+
+        if motion_type == MotionType.GROUND_ROLL:
+            reason = "地面侧滚需要明确机体接触阶段和专用轨迹/动力学验证器；不执行空翻或步态探针代替"
+            risks.append(reason)
+            recommendations.append("先确认计划机体接触合同和恢复条件，再接入地面侧滚求解与验证器。")
+            self._emit_stage("motion_prototype_generation", "inconclusive",
+                             motion_type=motion_type.value, reason=reason)
+            return self._report(intent, status=FeasibilityStatus.CONDITIONAL,
+                validation_level="CAPABILITY_ONLY", evidence_mode="REAL",
+                assessment=capability_payload, model=model_descriptor, checks=checks,
+                risks=risks, recommendations=recommendations, motion_type=motion_type.value,
+                motion_report={"status": "INCONCLUSIVE", "reason": reason})
 
         if motion_type in (MotionType.JUMP, MotionType.ACROBATIC):
             try:

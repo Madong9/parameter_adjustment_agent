@@ -6,16 +6,22 @@ from typing import IO, Optional
 
 
 class FileLock:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, blocking: bool = True):
         """初始化 FileLock 实例及其运行依赖。"""
         self.path = path
+        self.blocking = blocking
         self.handle: Optional[IO[str]] = None
 
     def __enter__(self):
         """获取文件锁并进入受保护的写入上下文。"""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.handle = self.path.open("a+", encoding="utf-8")
-        fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX)
+        try:
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | (0 if self.blocking else fcntl.LOCK_NB))
+        except BlockingIOError:
+            self.handle.close()
+            self.handle = None
+            raise RuntimeError('同一任务已有运行进程，请等待完成后再下发或恢复')
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -24,4 +30,3 @@ class FileLock:
             fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
             self.handle.close()
         self.handle = None
-

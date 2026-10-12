@@ -3,6 +3,7 @@ import math
 
 from .validator import RewardValidationError
 from ..training.config_runtime import reward_scales_for_stage
+from ..training.contact_semantics import contact_contract, CONTACT_SCOPE, CONTACT_FORCE_METRICS
 
 # 此表是本地审核的实现能力，不采信模型自行宣称的奖励语义。
 METRIC_SIGNALS = {
@@ -31,6 +32,7 @@ METRIC_SIGNALS = {
 }
 SAFETY_SIGNALS = {
     'forbidden_collisions': 'collision', 'forbidden_contact_force': 'collision',
+    'forbidden_body_contact': 'collision', 'body_contact_force': 'collision',
     'joint_limit_violations': 'dof_pos_limits', 'torque_limit_violations': 'torque_limits',
 }
 METRIC_SIGNAL_OVERRIDES = {
@@ -105,9 +107,14 @@ def require_objectives(task, plan):
     return report
 
 
-def audit_rollout(task, plan, trajectory, rewards, metrics):
+def audit_rollout(task, plan, trajectory, rewards, metrics, metadata=None, require_contact_metadata=False):
     """同一 pilot rollout 的反例与触发检查；零值不等于失败。"""
     errors, warnings = [], []
+    try:
+        contacts = contact_contract(task.safety_constraints, plan.terminations)
+    except (ValueError, TypeError) as exc:
+        errors.append('任务禁止接触合同无效：' + str(exc))
+        contacts = None
     if trajectory.empty or rewards.empty or len(trajectory) != len(rewards):
         errors.append('轨迹与奖励证据缺失或长度不一致')
     elif ('sim_time' not in trajectory or 'sim_time' not in rewards or
@@ -132,8 +139,48 @@ def audit_rollout(task, plan, trajectory, rewards, metrics):
     if (metrics.get('forbidden_collisions', 0) > 0 and
             contributions.get('raw_collision', 0) == 0):
         errors.append('实际非足端碰撞没有产生碰撞惩罚')
+    if ('body_collision' in trajectory and 'raw_collision' in rewards and
+            len(trajectory) == len(rewards)):
+        events = trajectory['body_collision'].astype(bool).to_numpy()
+        raw = rewards['raw_collision'].to_numpy(dtype=float)
+        if ((events & (raw <= 0)) | (~events & (raw != 0))).any():
+            errors.append('同帧碰撞事件与 raw_collision 不一致，禁止用其他帧平均奖励掩盖接触错配')
+        if 'weighted_collision' in rewards:
+            weighted = rewards['weighted_collision'].to_numpy(dtype=float)
+            if (events & (weighted >= 0)).any():
+                errors.append('同帧禁止碰撞没有产生负 collision 贡献')
+    if require_contact_metadata and not isinstance(metadata, dict):
+        errors.append('生产 pilot 缺少可审计的接触合同元数据')
+    if metadata is not None and not isinstance(metadata, dict):
+        errors.append('rollout 接触元数据必须是 JSON 对象')
+    if isinstance(metadata, dict):
+        if metadata.get('contact_semantics') != contacts or contacts is None:
+            errors.append('rollout 接触合同元数据缺失或与任务硬约束不一致')
+        if (metadata.get('body_collision_scope') != CONTACT_SCOPE or
+                contacts is None or
+                metadata.get('body_collision_force_threshold_n') != contacts['collision_force_threshold_n']):
+            errors.append('rollout 碰撞采集范围或事件阈值与共同合同不一致')
+        forbidden = metadata.get('forbidden_rigid_body_indices')
+        feet = metadata.get('foot_rigid_body_indices')
+        count = metadata.get('rigid_body_count')
+        valid_indices = (type(count) is int and count > 0 and isinstance(forbidden, list) and
+                         isinstance(feet, list) and bool(feet) and
+                         count == len(forbidden) + len(feet) and
+                         all(type(index) is int for index in forbidden + feet))
+        if not valid_indices or (set(forbidden) & set(feet) or
+                len(set(forbidden + feet)) != len(forbidden + feet) or
+                set(forbidden + feet) != set(range(count))):
+            errors.append('rollout 禁止接触刚体索引不是完整的非足端集合')
     for metric, term in SAFETY_SIGNALS.items():
-        if (metrics.get(metric, 0) > 0 and term in current_scales and
+        value = metrics.get(metric, 0)
+        if metric in CONTACT_FORCE_METRICS:
+            # 最大接触力是连续量；大于零不等于超过合同阈值。
+            threshold = contacts['body_termination_force_threshold_n'] if contacts is not None else 0
+            violated = (value >= threshold if contacts is not None and
+                        contacts['body_termination_operator'] == '>=' else value > threshold)
+        else:
+            violated = value > 0
+        if (violated and term in current_scales and
                 current_scales[term] < 0 and contributions.get('signed_' + term, 0) >= 0):
             errors.append('安全违规未产生有效负贡献：%s -> %s' % (metric, term))
     for metric in list(task.success_metrics) + list(task.safety_constraints):

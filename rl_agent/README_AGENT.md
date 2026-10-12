@@ -1,6 +1,6 @@
 # 自然语言四足机器人强化学习训练 Agent
 
-本项目把自然语言动作要求转换为可审计的强化学习实验：GPT/OpenCLI 任务理解 Agent 先输出 `TaskIntentSpec`，训练前 `Task Feasibility Pipeline` 按能力、运动学、静态几何/动力学、轨迹和物理证据分层。报告明确区分真实 backend、Pinocchio 与 Mock；缺失数据为 `UNKNOWN/INCONCLUSIVE`。Go2 预检复用 PPO 注册环境和 URDF，不依赖转换 MJCF，不创建 PPO runner、不训练策略。动态原型包含 gait 与 `FootTrajectory`；Go2 直线行走链会逐策略步采样足端目标，经 Pinocchio 多脚 IK 和轨迹限位检查生成 joint reference，再进入 Isaac Gym position-action rollout。只有覆盖目标时长且速度、稳定性、接触、关节和力矩检查全部通过，才会报告真实动态物理通过。单腿/倒立、跳跃/特技、转向和操控按各自能力报告，不复用错误验证器。训练准入与探针证据独立：默认允许能力和仿真环境已确认的任务进行有限预算探索，探针失败仍保持 `PHYSICS_FAILED`；缺失必要能力或真实环境证据不会放行。本地上下文构建器合并动作约束、探针风险、准入预算、环境、RAG 和四层记忆，再调用百炼 GLM 设计奖励，独立审查/编译后进入 PPO 训练，最后由数值与视觉评估联合验收。
+本项目把自然语言动作要求转换为可审计的强化学习实验：GPT/OpenCLI 任务理解 Agent 输出 `TaskIntentSpec`，训练前 `Task Feasibility Pipeline` 按能力、运动学、静态几何/动力学、轨迹和物理证据分层。真实 backend、Pinocchio 与 Mock 严格区分，缺失数据为 `UNKNOWN/INCONCLUSIVE`。Go2 预检复用 PPO 环境和 URDF，不依赖转换 MJCF、不训练策略。直线行走原型包含 gait 与足端轨迹，经 Pinocchio 多脚 IK、限位检查和 Isaac Gym rollout；只有实际证据通过才报告动态物理通过。倒立、跳跃、转向与特技所需专用全身求解后端尚未全部实现，不把求解计划当作物理证明。默认预算探索可对能力和仿真环境已确认的任务进行有限训练，但不改变探针失败结论和验收标准。上下文构建器合并动作约束、风险、预算、环境、RAG 和记忆，默认通过 OpenCLI/ChatGPT 设计奖励，独立审查/编译后进入 PPO，最后联合数值与视觉验收。
 
 训练准入配置在 `config/agent.yaml`：`feasibility_admission_mode: budgeted_exploration` 默认最多允许探索 `3000` 次累计 PPO 迭代、`1` 次奖励修订；改为 `strict` 则必须目标物理探针通过。实际额度取任务预算和本地上限的较小值，恢复不会重置额度。上位机分别显示物理结果与准入决定；详见 [训练前动作预检与准入](docs/agent/TASK_FEASIBILITY.md)。这不是自动降低验收标准，也不代表已学会动作。
 
@@ -8,11 +8,24 @@
 
 ## 系统架构图
 
-![自然语言四足机器人强化学习训练 Agent 架构](docs/agent/images/rl-agent-architecture-v2.png)
+```mermaid
+flowchart TD
+    UI[上位机动作输入] --> INTENT[任务理解 · ChatGPT/豆包]
+    INTENT --> FEAS[本地分层可行性检查与训练准入]
+    FEAS --> CONTEXT[环境能力 + RAG + 兼容长期记忆]
+    CONTEXT --> DESIGN[奖励设计 · OpenCLI/ChatGPT]
+    DESIGN --> REVIEW[逐候选审查与安全编译]
+    REVIEW -->|通过项| PPO[PPO 多种子训练]
+    REVIEW -->|全部拒绝 · 有限重试| DESIGN
+    PPO --> EVAL[逐控制步数值 + 独立视觉验收]
+    EVAL -->|未通过 · 有预算| DIAG[诊断与修订 · OpenCLI/ChatGPT]
+    DIAG --> REVIEW
+    EVAL -->|通过| MEMORY[证据校验 + 经验整理 + 记忆晋升]
+```
 
-新版图同时提供可编辑的 Mermaid 源文件：`docs/agent/images/rl-agent-architecture-v2.mmd`。完整的模块、协议、状态机、闭环、产物、安全边界和后续路线图见 `docs/agent/AGENT_COMPLETE_GUIDE.md`。
+完整可编辑图见 `docs/agent/images/rl-agent-architecture-v2.mmd`；目录内旧 PNG 为历史图，不作为当前角色路由依据。完整模块、协议、状态机、闭环、产物、安全边界见 `docs/agent/AGENT_COMPLETE_GUIDE.md`。
 
-该系统采用自研的确定性状态机编排多 Agent 闭环，没有依赖 LangGraph、CrewAI 等 Agent 编排框架。GPT 负责动作理解和独立视觉评价，百炼 GLM 负责奖励设计与训练诊断；本地协调器负责上下文构建、提示词编译、奖励审查、安全校验、训练执行、确定性验收、四层记忆治理、状态持久化和断点恢复。各模型 Agent 按步骤串行协作，通过结构化 JSON 交接；PPO 和最终安全判定由本地流程控制。
+该系统采用自研的确定性状态机编排多 Agent 闭环，没有依赖 LangGraph、CrewAI 等 Agent 编排框架。默认奖励设计、诊断、修订与经验总结通过 OpenCLI 使用 ChatGPT；任务理解与视觉评价按配置使用 ChatGPT/豆包主备。本地协调器负责上下文构建、提示词编译、奖励审查、安全校验、训练执行、确定性验收、四层记忆治理、状态持久化和断点恢复。各模型 Agent 通过结构化 JSON 交接；PPO 和最终安全判定由本地流程控制。
 
 训练前动作可行性预检的模块、状态门控、依赖降级和当前真实能力限制见 [`docs/agent/TASK_FEASIBILITY.md`](docs/agent/TASK_FEASIBILITY.md)。
 
@@ -34,9 +47,9 @@ python -m rl_training_agent desktop
 
 如果终端已经位于 `rl_agent`，不要再次执行 `cd rl_agent`。如果位于上一级目录，才需要先执行 `cd rl_agent`。
 
-建议首次选择“离线演练”，确认整条链路正常后再选择“真实训练”。真实训练会优先调用 OpenCLI/ChatGPT 聊天模式；若 ChatGPT 不可用，会自动调用已登录的豆包对话模式。奖励设计和诊断仍使用百炼 GLM，训练使用 Isaac Gym GPU 仿真，不会连接或部署到实体机器人。
+建议首次选择“离线演练”，确认整条链路正常后再选择“真实训练”。默认奖励设计和诊断使用 OpenCLI/ChatGPT 聊天模式；只有配置为 `opencli-doubao` 的任务理解与视觉角色才会回退豆包。训练使用 Isaac Gym GPU 仿真，不会连接或部署到实体机器人。
 
-真实多 Agent 模式还需要配置百炼密钥。首次使用时复制本地配置模板，填写一次后上位机和命令行都会自动读取：
+默认配置不需要百炼 API Key。只有将奖励设计或诊断角色显式改成 `bailian` 时，才需要本地密钥配置，填写一次后上位机和命令行都会自动读取：
 
 ```bash
 cp .env.example .env
@@ -53,7 +66,15 @@ DASHSCOPE_API_KEY="你的百炼 API Key"
 
 不要把 API Key 写入 `config/bailian.yaml` 或任何实验文件。
 
-网页推理的模式与主备策略已经默认配置完成，无需填写豆包 API Key：`config/opencli.yaml` 的 `force_chat_mode: true` 强制 ChatGPT 使用“聊天”，`config/agent.yaml` 的 `opencli-doubao` 表示 ChatGPT 故障时自动切换到已登录的豆包“对话”。首次使用豆包备用链路时，只需在安装 Browser Bridge 的 Chrome 中登录一次豆包。
+网页推理的模式与主备策略已经默认配置完成，无需填写豆包 API Key：`config/opencli.yaml` 的 `force_chat_mode: true` 强制 ChatGPT 使用“聊天”，`config/agent.yaml` 中角色的 `opencli-doubao` 表示该角色在 ChatGPT 故障时自动切换到已登录的豆包“对话”。首次使用豆包备用链路时，只需在安装 Browser Bridge 的 Chrome 中登录一次豆包。
+
+## 可靠性与恢复约束
+
+完整修复说明、旧实验兼容行为及验证边界见 [可靠性修复说明](docs/agent/RELIABILITY_FIXES.md)。安全证据缺失不再默认按零处理；物理轨迹逐控制步采样，视频独立降采样。全部奖励候选被拒绝时，`reward_design_review_retries` 控制带上下文的有限次重新设计。同任务训练/恢复互斥，同一浏览器 profile 的网页请求跨进程串行化。长期记忆按机器人、环境源码/资产指纹和奖励注册表版本硬过滤，缺少版本的旧记忆保留但不会进入生产奖励上下文。
+
+登录误报、消息归属、停止进程、GPU 租约、接口访问和记忆证据的新增约束见 [系统边界加固](docs/agent/SECURITY_FIXES.md)。GPT 保持登录却反复报过期时，旧实现可能把“奖励注册表”误当登录提示；新实现只检查站点控件。应用修改后重启上位机；有剩余额度且动作、配置、环境和策略证据一致时，才允许“从当前策略继续闭环”。上位机现在仅允许本机访问，打开首页会自动初始化会话，无需新增密钥配置。
+
+动作语义、接触合同和预算展示的本轮优化见 [2026-10 项目优化说明](docs/agent/OPTIMIZATION_2026_10.md)。输入“侧向翻滚”时须明确贴地侧滚还是腾空侧翻；否定句不会触发空翻模板。PPO 训练结束、联合验收通过和预算耗尽分别展示，预算耗尽后不再自动恢复或请求模型。接触硬约束不会因动作名称而自动豁免。
 
 ## 上位机工作流
 
@@ -63,7 +84,7 @@ DASHSCOPE_API_KEY="你的百炼 API Key"
 4. 在“学习遥测”查看任务理解、可行性预检、经验检索、奖励设计、训练、评估和记忆整理阶段，在“动作可行性”查看约束→规划→全身求解→物理证据链。
 5. 在“四层记忆”查看当前任务工作记忆、晋升原因，以及全局情景/语义/程序记忆状态。
 6. 只有状态为“训练完成”时，才表示视觉目标、任务物理指标与硬安全约束全部通过。
-7. “等待人工复核”会显示具体原因。如果已有可恢复 checkpoint，点击“从当前策略继续闭环”即可复用既有奖励版本、checkpoint 和已采集 rollout，不会从头重复初始训练。
+7. “等待人工复核”会显示具体原因。仅当 checkpoint、冻结预算及恢复前置条件有效时显示“从当前策略继续闭环”；耗尽或额度未知时禁止恢复，不会重置额度。已通过验收的策略仍可播放。
 
 状态含义：
 
@@ -202,9 +223,10 @@ python scripts/reassess_acceptance.py experiments/task-你的任务ID --apply
 
 迁移仅允许原验收合同与任务一致且状态为 `HUMAN_REVIEW` 的任务，保留阈值、
 安全约束、checkpoint 和已用预算；前后合同备份保存在 `acceptance_migrations/`。
-结果写入 `acceptance_reassessment.json`，物理通过不代表视觉通过。随后在上位机
-继续闭环会重新计算缓存轨迹的指标，并按新合同重新生成视觉报告和诊断。
-预算耗尽时允许复核已有证据，但不能继续训练或增加修订次数。
+结果写入 `acceptance_reassessment.json`，物理通过不代表视觉通过。剩余额度和
+恢复条件有效时，上位机继续闭环会重新计算缓存轨迹的指标，再生成视觉报告和诊断。
+预算耗尽时只能用上述只读命令单独复核已有证据；自动恢复不会重新调用 Provider，
+也不能继续训练或增加修订次数。修改当前 YAML 不会扩充旧运行的冻结额度。
 
 ## 项目目录
 

@@ -5,6 +5,7 @@ import re
 from typing import Optional, Tuple
 
 from ...schemas.agent_workflow import TaskIntentSpec
+from ...utils.task_semantics import RollMotionKind, classify_roll_motion, _positive_motion_text
 from .schema import (DynamicMotionPhase, DynamicMotionPrototype, GaitPattern,
                      GaitType, MotionType, VelocityTrajectory, FootTrajectory)
 
@@ -19,6 +20,13 @@ class DynamicMotionPrototypeGenerator:
     @classmethod
     def classify(cls, intent: TaskIntentSpec) -> MotionType:
         """按动作语义规则分类；未知文本不会被猜成可验证动态动作。"""
+        roll = classify_roll_motion(intent.original_instruction)
+        if roll == RollMotionKind.GROUND_ROLL:
+            return MotionType.GROUND_ROLL
+        if roll == RollMotionKind.AERIAL_SIDE_FLIP:
+            return MotionType.ACROBATIC
+        if roll == RollMotionKind.AMBIGUOUS:
+            return MotionType.UNKNOWN
         text = cls._task_text(intent)
         if any(term in text for term in ("机械臂", "抓取", "抓住", "grasp", "manipulat", "arm")):
             return MotionType.MANIPULATION
@@ -46,8 +54,8 @@ class DynamicMotionPrototypeGenerator:
     @staticmethod
     def _task_text(intent: TaskIntentSpec) -> str:
         """汇总用户原文和结构化动作字段供确定性分类。"""
-        return " ".join((intent.original_instruction, intent.action_name,
-                         intent.normalized_goal, " ".join(intent.required_behaviors))).lower()
+        return _positive_motion_text(" ".join((intent.original_instruction, intent.action_name,
+                         intent.normalized_goal, " ".join(intent.required_behaviors))))
 
     @staticmethod
     def _duration(intent: TaskIntentSpec) -> Tuple[float, bool]:

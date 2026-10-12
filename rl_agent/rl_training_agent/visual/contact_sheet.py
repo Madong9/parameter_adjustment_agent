@@ -13,21 +13,28 @@ from .overlay_renderer import render_overlay
 class ContactSheetBuilder:
     def __init__(self, tile_size: Tuple[int, int] = (320, 240), columns: int = 4, max_dimension: int = 4096):
         """初始化 ContactSheetBuilder 实例及其运行依赖。"""
+        if columns <= 0 or max_dimension <= 0 or any(value <= 0 for value in tile_size):
+            raise ValueError("contact sheet dimensions and columns must be positive")
         self.tile_size = tile_size
         self.columns = columns
         self.max_dimension = max_dimension
 
     def build(self, frames: Sequence[Tuple[int, np.ndarray]], output: Path,
               annotations: Optional[Dict[int, dict]] = None) -> Path:
-        """构建并保存人类可读及机器可读的训练报告。"""
+        """先限制画布尺寸再绘制接触图，避免分配超大中间图像。"""
         if not frames:
             raise ValueError("contact sheet requires at least one decoded frame")
         columns = min(self.columns, len(frames))
         rows = int(math.ceil(len(frames) / columns))
         tile_width, tile_height = self.tile_size
+        scale = min(1.0, self.max_dimension / max(rows * tile_height, columns * tile_width))
+        tile_width = max(1, int(tile_width * scale))
+        tile_height = max(1, int(tile_height * scale))
+        if max(rows * tile_height, columns * tile_width) > self.max_dimension:
+            raise ValueError("too many frames for contact sheet dimensions")
         canvas = np.full((rows * tile_height, columns * tile_width, 3), 245, dtype=np.uint8)
         for position, (frame_index, frame) in enumerate(frames):
-            tile = cv2.resize(frame, self.tile_size, interpolation=cv2.INTER_AREA)
+            tile = cv2.resize(frame, (tile_width, tile_height), interpolation=cv2.INTER_AREA)
             if annotations is not None:
                 values = dict(annotations.get(frame_index, {}))
                 values.setdefault("frame", frame_index)
@@ -35,9 +42,6 @@ class ContactSheetBuilder:
             row, column = divmod(position, columns)
             canvas[row * tile_height:(row + 1) * tile_height,
                    column * tile_width:(column + 1) * tile_width] = tile
-        scale = min(1.0, self.max_dimension / max(canvas.shape[:2]))
-        if scale < 1.0:
-            canvas = cv2.resize(canvas, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         output.parent.mkdir(parents=True, exist_ok=True)
         if not cv2.imwrite(str(output), canvas):
             raise IOError("failed to write contact sheet: %s" % output.name)
@@ -53,4 +57,3 @@ class ContactSheetBuilder:
                             0.6, (0, 255, 255), 2, cv2.LINE_AA)
                 merged.append((index, labeled))
         return self.build(merged, output)
-

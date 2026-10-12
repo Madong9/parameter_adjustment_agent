@@ -1,8 +1,11 @@
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 from rl_training_agent.cli import build_parser
 from rl_training_agent.desktop_ui import (
     STATUS_LABELS,
+    RLDesktopApp,
     _display_time,
     _shorten,
     choose_font_family,
@@ -65,3 +68,38 @@ def test_desktop_browser_uses_isolated_app_window():
     assert "--app=http://127.0.0.1:8765/" in command
     assert "--user-data-dir=artifacts/profile" in command
     assert "--disable-extensions" in command
+
+
+def test_tk_close_cleans_entire_scheduler_without_current_job():
+    """没有当前展示任务时，关闭 Tk 仍清理隐藏队列及 Viewer。"""
+    app = object.__new__(RLDesktopApp)
+    app.root = SimpleNamespace(destroy=Mock())
+    app.manager = SimpleNamespace(shutdown=Mock())
+    app.current_job = None
+    app._on_close()
+    app.manager.shutdown.assert_called_once_with()
+    app.root.destroy.assert_called_once_with()
+
+
+def test_tk_close_confirmation_preserves_all_jobs_when_cancelled(monkeypatch):
+    """取消关闭确认时，不停止任何训练、不关闭调度器。"""
+    app = object.__new__(RLDesktopApp)
+    app.root = SimpleNamespace(destroy=Mock())
+    app.manager = SimpleNamespace(shutdown=Mock())
+    app.current_job = {"job_id": "active", "can_stop": True}
+    monkeypatch.setattr("rl_training_agent.desktop_ui.messagebox.askyesno", lambda *args, **kwargs: False)
+    app._on_close()
+    app.manager.shutdown.assert_not_called()
+    app.root.destroy.assert_not_called()
+
+
+def test_tk_close_confirmation_stops_all_jobs_when_accepted(monkeypatch):
+    """接受退出确认时调用整体 shutdown，而不是只停止当前显示作业。"""
+    app = object.__new__(RLDesktopApp)
+    app.root = SimpleNamespace(destroy=Mock())
+    app.manager = SimpleNamespace(shutdown=Mock())
+    app.current_job = {"job_id": "active", "can_stop": True}
+    monkeypatch.setattr("rl_training_agent.desktop_ui.messagebox.askyesno", lambda *args, **kwargs: True)
+    app._on_close()
+    app.manager.shutdown.assert_called_once_with()
+    app.root.destroy.assert_called_once_with()

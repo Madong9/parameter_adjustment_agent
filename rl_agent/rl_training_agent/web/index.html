@@ -112,15 +112,21 @@
               <div><span>训练机型</span><b id="activeRobot">—</b></div>
               <div><span>运行模式</span><b id="activeMode">—</b></div>
               <div><span>闭环轮次</span><b id="loopRound">—</b></div>
-              <div><span>剩余预算</span><b id="loopBudget">—</b></div>
+              <div><span>冻结额度（已用/上限）</span><b id="loopBudget">—</b></div>
             </div>
+            <div class="result-facts" aria-label="预算、训练与验收分别展示">
+              <div><span>训练预算</span><b id="budgetStatus">额度未知</b></div>
+              <div><span>PPO 训练结果</span><b id="ppoStatus">尚无已确认策略</b></div>
+              <div><span>动作联合验收</span><b id="acceptanceStatus">验收证据待核对</b></div>
+            </div>
+            <p class="budget-notice" id="budgetNotice" role="status">当前实验的冻结额度尚未确认。</p>
             <div class="stage-track" id="stageTrack" aria-label="训练阶段">
               <div data-threshold="10"><i></i><span>环境检查</span></div>
               <div data-threshold="25"><i></i><span>奖励设计</span></div>
               <div data-threshold="48"><i></i><span>冒烟训练</span></div>
               <div data-threshold="74"><i></i><span>完整训练</span></div>
               <div data-threshold="89"><i></i><span>视觉评估</span></div>
-              <div data-threshold="100"><i></i><span>训练完成</span></div>
+              <div data-threshold="100"><i></i><span>联合验收通过</span></div>
             </div>
             <div class="review-reason hidden" id="reviewReason" role="status"></div>
             <div class="training-controls">

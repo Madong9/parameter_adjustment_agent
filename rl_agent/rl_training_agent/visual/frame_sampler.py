@@ -25,16 +25,21 @@ class FrameSampler:
 
     @staticmethod
     def decode(path: Path, indices: Sequence[int]) -> List[Tuple[int, np.ndarray]]:
-        """按索引顺序解码视频帧并忽略坏帧。"""
+        """连续索引顺序解码，仅在跳帧时定位，并始终释放视频句柄。"""
         capture = cv2.VideoCapture(str(path))
-        if not capture.isOpened():
-            raise ValueError("bad video: %s" % path.name)
         result: List[Tuple[int, np.ndarray]] = []
-        for index in sorted(set(indices)):
-            capture.set(cv2.CAP_PROP_POS_FRAMES, index)
-            ok, frame = capture.read()
-            if ok and frame is not None and frame.size:
-                result.append((index, frame))
-        capture.release()
+        try:
+            if not capture.isOpened():
+                raise ValueError("bad video: %s" % path.name)
+            next_frame = 0
+            for index in sorted(set(index for index in indices if index >= 0)):
+                if index != next_frame and not capture.set(cv2.CAP_PROP_POS_FRAMES, int(index)):
+                    next_frame = None
+                    continue
+                ok, frame = capture.read()
+                next_frame = index + 1 if ok else None
+                if ok and frame is not None and frame.size:
+                    result.append((index, frame))
+        finally:
+            capture.release()
         return result
-

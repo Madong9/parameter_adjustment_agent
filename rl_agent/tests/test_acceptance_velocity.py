@@ -172,13 +172,20 @@ def test_audited_migration_preserves_budget_and_rejects_tampering(tmp_path):
 
 
 def test_resume_recomputes_metrics_from_cached_trajectory(tmp_path):
-    directory = tmp_path/'rollout_001'
-    directory.mkdir()
+    task_dir = tmp_path / 'task-cache'
+    round_root = task_dir / 'candidates' / 'candidate' / 'rollouts' / 'round_01'
+    directory = round_root / 'rollout_001'
+    directory.mkdir(parents=True)
+    write_json(task_dir / 'state.json', {'context': {'run_id': 'run-cache'}})
+    write_json(task_dir / 'evaluation_protocol.json', {'run_id': 'run-cache', 'dry_run': False,
+        'seeds': [1], 'rollouts_per_seed': 1, 'counterfactual_enabled': False})
+    write_json(directory / 'metadata.json', {'seed': 1})
     trajectory().to_parquet(directory/'trajectory.parquet')
     for name in ('front','side','overview'):
         (directory/(name+'.mp4')).write_bytes(b'fixture')
-    write_json(tmp_path/'rollout_metrics.json', {'representative_rollout':'rollout_001',
-        'records':[{'rollout':'rollout_001','metrics':{'front_leg_walk_velocity_tracking':.99}}]})
+    write_json(round_root/'rollout_metrics.json', {'representative_rollout':'rollout_001',
+        'records':[{'rollout':'rollout_001', 'seed': 1,
+                    'metrics':{'front_leg_walk_velocity_tracking':.99}}]})
     orchestrator = TrainingOrchestrator.__new__(TrainingOrchestrator)
-    restored = orchestrator._cached_round_rollout(tmp_path, task())
+    restored = orchestrator._cached_round_rollout(round_root, task())
     assert restored[2][0]['metrics']['front_leg_forward_speed'] == pytest.approx(.5)

@@ -144,6 +144,8 @@ def _apply_command_changes(target: Any, changes: Dict[str, Any], originals: Dict
 def prepare_training_env_config(env_cfg: Any, config: Dict[str, Any]) -> None:
     """在创建训练环境前注册全部奖励、参数和身体接触终止链接。"""
     scales = config["rewards"]["scales"]
+    from .contact_semantics import resolve_contact_contract
+    env_cfg._agent_contact_contract = resolve_contact_contract(config)
     from .action_rewards import ACTION_REWARDS, RUNTIME_SAFETY_REWARDS, register_action_rewards
     for name in RUNTIME_SAFETY_REWARDS:
         if name in scales and not hasattr(env_cfg.rewards.scales, name):
@@ -204,8 +206,10 @@ def prepare_evaluation_env_config(env_cfg: Any, config: Dict[str, Any]) -> None:
 
 
 def install_runtime_terminations(env: Any, config: Dict[str, Any]) -> None:
-    """给环境安装配置声明的 roll、pitch 终止检查。"""
+    """安装同源接触硬约束和配置声明的 roll、pitch 终止检查。"""
     install_velocity_tracking(env, config)
+    from .contact_semantics import resolve_contact_contract, forbidden_contact_flags
+    env._agent_contact_contract = resolve_contact_contract(config)
     pitch_limit = roll_limit = None
     body_contact = False
     for item in _enabled_terminations(config):
@@ -219,16 +223,20 @@ def install_runtime_terminations(env: Any, config: Dict[str, Any]) -> None:
         if "roll" in name or "roll" in condition:
             part = re.search(r'roll[^<>]*[<>]=?\s*([0-9.]+)', condition)
             roll_limit = float(part.group(1)) if part else _number_from_condition(condition, 0.8)
-    if pitch_limit is None and roll_limit is None and not body_contact:
+    # 真实训练/播放环境始终执行固定接触安全底线；不依赖模型是否声明终止项。
+    contact_checks = hasattr(env, 'contact_forces')
+    if not contact_checks and ('contact_semantics' in config or 'safety_constraints' in config or body_contact):
+        raise ValueError('环境缺少接触张量，无法执行禁止接触合同')
+    if pitch_limit is None and roll_limit is None and not contact_checks:
         return
     original = env.check_termination
 
     def check_termination_with_orientation(self: Any) -> None:
         """运行项目原生终止检查，并追加配置声明的姿态限制。"""
         original()
-        if body_contact:
-            from .contact_semantics import nonfoot_forces, BODY_TERMINATION_FORCE_THRESHOLD
-            self.reset_buf |= (nonfoot_forces(self) > BODY_TERMINATION_FORCE_THRESHOLD).any(dim=1)
+        if contact_checks:
+            _, _, terminated = forbidden_contact_flags(self)
+            self.reset_buf |= terminated
         if pitch_limit is not None:
             self.reset_buf |= self.rpy[:, 1].abs() > pitch_limit
         if roll_limit is not None:

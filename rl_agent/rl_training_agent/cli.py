@@ -4,10 +4,13 @@ import argparse
 import importlib.util
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from contextlib import contextmanager
+import threading
 from typing import Any, Dict, Optional
 
 import cv2
@@ -71,11 +74,15 @@ def doctor() -> Dict[str, Any]:
         checks["torch_error"] = str(exc)
     settings.experiments_path.mkdir(parents=True, exist_ok=True)
     checks["experiment_root_writable"] = os.access(str(settings.experiments_path), os.W_OK)
-    # 生产网页推理采用 ChatGPT -> 豆包主备组合。ChatGPT 不可用但豆包
-    # 健康时不应把整套系统误报为不可生产运行。
-    checks["opencli"] = ProviderRegistry().create(
-        "opencli-doubao", settings, settings.artifacts_path / "provider_doctor").doctor().dict()
-    checks["bailian"] = BailianGLMProvider().health()
+    # 检查实际角色路由；仅显式配置主备组合时，备用服务健康才能替代主服务。
+    configured = TrainingOrchestrator.provider_for(settings, settings.provider)
+    checks['provider'] = configured.doctor().dict()
+    checks['opencli'] = dict(checks['provider'])
+    bailian_required = (settings.provider == "multi-agent" and "bailian" in (
+        settings.task_planner_provider, settings.reward_designer_provider,
+        settings.visual_critic_provider, settings.diagnosis_provider)) or settings.provider == "bailian"
+    checks["bailian"] = (BailianGLMProvider().health() if bailian_required else
+                         {"available": False, "required": False, "details": ["当前角色不使用百炼，跳过检查"]})
     upload_failure = settings.artifacts_path / "opencli_test" / "upload_failure.txt"
     validated_response = settings.artifacts_path / "opencli_test" / "validated_response.json"
     if upload_failure.exists():
@@ -86,9 +93,11 @@ def doctor() -> Dict[str, Any]:
                             ("python_supported", "agent_root_writable", "training_project", "training_entry",
                              "evaluation_entry", "torch_installed", "isaacgym_installed", "cuda_available",
                              "experiment_root_writable"))
-    bailian_required = settings.provider == "multi-agent"
+    mock_configured = settings.provider == "mock" or (settings.provider == "multi-agent" and "mock" in (
+        settings.task_planner_provider, settings.reward_designer_provider,
+        settings.visual_critic_provider, settings.diagnosis_provider))
     checks["production_ready"] = (
-        checks["healthy"] and checks["opencli"]["available"] and
+        not mock_configured and checks["healthy"] and checks["opencli"]["available"] and
         checks["opencli"]["image_upload_supported"] and
         (checks["bailian"]["available"] or not bailian_required)
     )
@@ -178,9 +187,44 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+@contextmanager
+def _managed_training_signals(command: str):
+    """在 GPU 工作流退出或收到终止信号时回收登记的真实训练子进程。"""
+    from .training.process_manager import ProcessManager
+    managed = command in {"plan", "train", "resume", "evaluate", "benchmark", "feasibility-view", "play"}
+    can_signal = managed and threading.current_thread() is threading.main_thread()
+    previous = signal.getsignal(signal.SIGTERM) if can_signal else None
+    stopping = False
+
+    def terminate(signum, frame):
+        """只清理本进程登记的训练组，防止重入时重复回收。"""
+        nonlocal stopping
+        if stopping:
+            return
+        stopping = True
+        ProcessManager.stop_all_active(grace_seconds=5.0)
+        raise SystemExit(128 + signum)
+
+    if can_signal:
+        signal.signal(signal.SIGTERM, terminate)
+    try:
+        yield
+    finally:
+        if managed:
+            ProcessManager.stop_all_active(grace_seconds=5.0)
+        if can_signal:
+            signal.signal(signal.SIGTERM, previous)
+
+
 def main(argv=None) -> int:
-    """解析命令行参数并执行对应的 Agent 工作流。"""
+    """解析命令行，并在受控子进程生命周期内执行工作流。"""
     args = build_parser().parse_args(argv)
+    with _managed_training_signals(args.command):
+        return _run_command(args)
+
+
+def _run_command(args) -> int:
+    """执行已经解析的子命令，保持现有 CLI 参数和返回码兼容。"""
     settings = load_settings()
     if args.command == "ui":
         from .web_ui import serve

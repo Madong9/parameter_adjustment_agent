@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -31,7 +32,8 @@ from ..memory.reward_experience.schema import RewardExperienceNarrative
 from ..settings import OpenCLISettings, load_opencli_settings
 from ..utils.io import atomic_write_text, json_safe
 from .errors import ProviderError, ProviderNeedsHuman, ProviderResponseError, ProviderTimeout
-from .chatgpt_dom import CHATGPT_ATTACH_FILES_SCRIPT, CHATGPT_SNAPSHOT_SCRIPT
+from .chatgpt_dom import CHATGPT_ACCESS_STATE_SCRIPT, CHATGPT_ATTACH_FILES_SCRIPT, CHATGPT_SNAPSHOT_SCRIPT
+from .browser_lease import BrowserLease, serialize_browser_operation
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 Runner = Callable[[Sequence[str], int], subprocess.CompletedProcess]
@@ -120,6 +122,7 @@ class OpenCLIChatGPTWebProvider:
         self._submission_baseline: Dict[str, Any] = {}
         self._confirmed_user_id = ""
         self._last_message_snapshot: Dict[str, Any] = {}
+        self._browser_lease = BrowserLease()
 
     def _run(self, args: Sequence[str], timeout: Optional[int] = None, allow_failure: bool = False) -> str:
         """执行受限子流程并返回结构化结果。"""
@@ -144,16 +147,22 @@ class OpenCLIChatGPTWebProvider:
         return self._run(["browser", self.settings.session] + list(command), timeout, allow_failure)
 
     def _state(self) -> str:
-        """刷新页面状态并检测登录失效或验证码。"""
+        """核对真实地址与可见站点控件，禁止从会话正文推断登录失效。"""
         state = self._browser(["state"])
-        self._raise_for_usage_limit(state)
-        lowered = state.lower()
-        if any(item in lowered for item in ("captcha", "verify you are human", "cloudflare")):
-            raise ProviderNeedsHuman("ChatGPT page requires CAPTCHA verification")
-        if any(item in lowered for item in ("log in", "sign up", "登录", "注册")) and "message chatgpt" not in lowered:
-            raise ProviderNeedsHuman("ChatGPT login has expired")
         self._assert_expected_page()
+        access = self._access_state()
+        self._raise_for_usage_limit(str(access.get("usage_notice", "")))
+        if access.get("challenge_required") is True:
+            raise ProviderNeedsHuman("ChatGPT page requires CAPTCHA verification")
+        if access.get("login_required") is True:
+            raise ProviderNeedsHuman("ChatGPT 页面显示登录控件或身份验证表单，请在绑定的 Chrome 标签页完成登录")
         return state
+
+    def _access_state(self) -> Dict[str, Any]:
+        """读取不含聊天正文的登录/验证码/额度探针；未知状态不冒充已过期。"""
+        output = self._browser(["eval", CHATGPT_ACCESS_STATE_SCRIPT], allow_failure=True)
+        value = self._parse_eval_result(output)
+        return value if isinstance(value, dict) and value.get("probe_version") == "chatgpt-access-v1" else {}
 
     @staticmethod
     def _url_matches_expected(current_url: str, expected_url: str) -> bool:
@@ -226,13 +235,8 @@ class OpenCLIChatGPTWebProvider:
             "已有训练 checkpoint 不受影响。" % reset_hint)
 
     def _check_page_usage_limit(self) -> None:
-        """读取完整页面可见正文，弥补 OpenCLI 精简状态可能遗漏的额度弹窗。"""
-        output = self._browser(
-            ["eval", "JSON.stringify((document.body&&document.body.innerText||'').slice(0,30000))"],
-            allow_failure=True,
-        )
-        page_text = self._parse_eval_result(output)
-        self._raise_for_usage_limit(page_text if isinstance(page_text, str) else "")
+        """只从站点额度提示控件取证，忽略消息中引用的额度报错文本。"""
+        self._raise_for_usage_limit(str(self._access_state().get("usage_notice", "")))
 
     @staticmethod
     def _bridge_connected(doctor_output: str) -> bool:
@@ -286,6 +290,7 @@ class OpenCLIChatGPTWebProvider:
             "看到 opencli doctor 显示 Extension: connected 后再重新下发任务。"
         )
 
+    @serialize_browser_operation
     def doctor(self) -> ProviderHealth:
         """检查运行环境、外部依赖和服务健康状态。"""
         details: List[str] = []
@@ -318,6 +323,7 @@ class OpenCLIChatGPTWebProvider:
                               extension_connected=extension, chatgpt_logged_in=logged_in,
                               image_upload_supported=extension and logged_in, details=details)
 
+    @serialize_browser_operation
     def open_or_bind(self) -> None:
         """打开或绑定配置指定的 ChatGPT 浏览器会话。"""
         self._ensure_bridge_connected()
@@ -338,6 +344,7 @@ class OpenCLIChatGPTWebProvider:
         self._ensure_chat_mode()
         self._opened = True
 
+    @serialize_browser_operation
     def new_conversation(self, title_hint: str) -> ConversationHandle:
         """创建新会话并返回可持久化的会话句柄。"""
         if not self._opened:
@@ -529,56 +536,30 @@ class OpenCLIChatGPTWebProvider:
         return parsed if isinstance(parsed, dict) else {}
 
     def _collect_page_debug_artifacts(self, conversation: Optional[ConversationHandle], label: str) -> None:
-        """采集页面快照、主要 DOM / 按钮状态、性能资源与有限的控制台线索，写入记录目录以便离线分析。"""
+        """仅保存白名单状态、文本长度与消息身份，不采集正文、HTML 或带签名资源 URL。"""
         try:
             base = self.record_dir or (Path.cwd() / "artifacts" / "provider_records")
             convo_dir = base / (conversation.conversation_id if conversation else "no-conversation")
             convo_dir.mkdir(parents=True, exist_ok=True)
             timestamp = int(time.time())
-            # 1) 结构化 submission snapshot
             try:
                 snapshot = self._submission_snapshot()
-            except Exception as exc:
-                snapshot = {"error": "failed_to_capture_submission_snapshot", "detail": str(exc)}
-            atomic_write_text(convo_dir / (f"debug_snapshot_{label}_{timestamp}.json"), json.dumps(snapshot, ensure_ascii=False, indent=2))
-
-            # 2) Lightweight DOM / buttons / perf summary
-            script = r'''
-(() => {
-  const body = document.body ? String(document.body.innerText || '').slice(0, 20000) : '';
-  const buttons = Array.from(document.querySelectorAll('button')).slice(0,200).map(b=>({label: b.getAttribute('aria-label')||b.innerText||'', disabled: !!b.disabled, dataset: b.dataset?Object.fromEntries(Object.entries(b.dataset)):{}}));
-  const stop = !!document.querySelector('button[data-testid="stop-button"]');
-  const imgs = Array.from(document.querySelectorAll('img')).slice(0,10).map(i=>i.src);
-  const perf = (window.performance && typeof window.performance.getEntries === 'function') ? window.performance.getEntries().slice(-50).map(e=>({name: e.name, initiatorType: e.initiatorType, duration: e.duration, transferSize: e.transferSize||0})) : [];
-  return JSON.stringify({body_prefix: body, buttons, stop, imgs, perf, url: location.href, title: document.title});
-})()
-'''
-            try:
-                output = self._browser(["eval", script], allow_failure=True)
-                parsed = self._parse_eval_result(output)
-            except Exception as exc:
-                parsed = {"error": "eval_failed", "detail": str(exc)}
-            atomic_write_text(convo_dir / (f"debug_dom_{label}_{timestamp}.json"), json.dumps(parsed, ensure_ascii=False, indent=2))
-
-            # 3) Try to capture visible HTML head/body (trimmed)
-            try:
-                html_out = self._browser(["eval", "JSON.stringify((document.documentElement&&document.documentElement.outerHTML||'').slice(0,200000))"], allow_failure=True)
-                html_parsed = _json_from_output(html_out)
-                if isinstance(html_parsed, str):
-                    atomic_write_text(convo_dir / (f"debug_page_html_{label}_{timestamp}.html"), html_parsed)
             except Exception:
-                # best-effort
-                pass
-
-            # 4) File inputs info
-            try:
-                found = self._browser(["find", "--css", "input[type=file]", "--limit", "10"], allow_failure=True)
-                found_data = _json_from_output(found)
-                atomic_write_text(convo_dir / (f"debug_file_inputs_{label}_{timestamp}.json"), json.dumps(found_data, ensure_ascii=False, indent=2))
-            except Exception:
-                pass
+                snapshot = {}
+            safe = {key: snapshot.get(key) for key in (
+                "user_count", "assistant_count", "composer_found", "generating", "extraction_version")}
+            for key in ("latest_user", "latest_assistant", "composer_text"):
+                safe[key + "_length"] = len(str(snapshot.get(key, "")))
+            for key in ("latest_user_id", "latest_assistant_id", "assistant_user_id"):
+                value = str(snapshot.get(key, ""))
+                safe[key + "_hash"] = hashlib.sha256(value.encode()).hexdigest()[:16] if value else ""
+            parsed_url = urlparse(str(snapshot.get("url", "")))
+            safe["page_origin"] = "%s://%s" % (parsed_url.scheme, parsed_url.hostname or "")
+            safe["debug_version"] = "privacy-safe-v1"
+            atomic_write_text(convo_dir / ("debug_snapshot_%s_%s.json" % (label, timestamp)),
+                              json.dumps(safe, ensure_ascii=False, indent=2))
         except Exception:
-            # never fail the provider because debug capture failed
+            # 最小诊断采集失败不能改变提交幂等性或覆盖原始 Provider 错误。
             return
 
     @staticmethod
@@ -725,7 +706,6 @@ class OpenCLIChatGPTWebProvider:
         while time.monotonic() < deadline:
             self._state()
             current = self._latest_assistant()
-            self._raise_for_usage_limit(current)
             snapshot = self._last_message_snapshot
             # 视觉附件分析可能超过初始五分钟。仅为已确认提交的本轮请求
             # 续等，不重发，也不让上一轮的生成状态延长本轮等待。
@@ -787,6 +767,7 @@ class OpenCLIChatGPTWebProvider:
         output = self._browser(["eval", script], allow_failure=True)
         return self._parse_eval_result(output) is True
 
+    @serialize_browser_operation
     def send_text(self, prompt: str, conversation: ConversationHandle,
                   submission_timeout: Optional[int] = None) -> str:
         """向指定网页会话发送文本并返回最新助手回复。"""
@@ -1048,6 +1029,7 @@ class OpenCLIChatGPTWebProvider:
         raise ProviderTimeout("ChatGPT 在 %s 秒内没有显示全部附件预览：%s" %
                               (self.settings.submit_timeout, ", ".join(file_names)))
 
+    @serialize_browser_operation
     def send_with_files(self, prompt: str, files: List[Path], conversation: ConversationHandle) -> str:
         """上传本地文件、发送提示词并返回最新助手回复。"""
         if not files:
@@ -1136,6 +1118,7 @@ class OpenCLIChatGPTWebProvider:
         except (ValueError, ValidationError) as exc:
             raise ProviderResponseError(str(exc)) from exc
 
+    @serialize_browser_operation
     def _request_model(self, prompt: str, schema: Type[ModelT], title: str,
                        files: Optional[List[Path]] = None) -> ModelT:
         """发送结构化请求并在校验失败时进行有限修复。"""
@@ -1167,7 +1150,14 @@ class OpenCLIChatGPTWebProvider:
                     self._parse_candidate(raw)
                 except ValueError:
                     latest = self._latest_assistant()
-                if latest and len(latest) > len(raw):
+                snapshot = self._last_message_snapshot
+                belongs_to_request = bool(self._confirmed_user_id and
+                    snapshot.get("latest_user_id") == self._confirmed_user_id and
+                    snapshot.get("assistant_user_id") == self._confirmed_user_id and
+                    snapshot.get("latest_assistant_id") and
+                    snapshot.get("latest_assistant_id") != self._submission_baseline.get("latest_assistant_id") and
+                    not snapshot.get("generating"))
+                if latest and len(latest) > len(raw) and belongs_to_request:
                     try:
                         return self.parse_json_response(latest, schema)
                     except ProviderResponseError:
@@ -1176,19 +1166,20 @@ class OpenCLIChatGPTWebProvider:
                         pass
                 if attempt >= self.settings.max_retries:
                     raise
-                repair = ("Return only corrected strict JSON matching this JSON Schema. Validation error: %s\nSchema: %s\n"
-                          "Do not add commentary." % (exc, schema.schema_json()))
+                repair = (prompt + '\n\n修复要求：保持上述原始目标、环境能力和附件约束不变。\n' +
+                          "Return only corrected strict JSON matching this JSON Schema. Validation error: %s\nSchema: %s\n"
+                          "Do not add commentary.\nInvalid JSON response to repair:\n%s" %
+                          (exc, schema.schema_json(), raw))
                 repair_title = "%s-repair-%02d" % (title, attempt + 1)
                 try:
-                    raw = self._send_model_prompt(conversation, repair, repair_title)
+                    raw = self._send_model_prompt(conversation, repair, repair_title, files)
                 except ProviderNeedsHuman:
                     raise
                 except (ProviderError, ProviderTimeout):
                     # 页面偶发会在点击修复请求后仍显示上一条用户消息。换新会话携带原回复，
                     # 可避免重复点击同一会话，同时保留严格 Schema 修复能力。
                     conversation = self.new_conversation(repair_title + "-recovery")
-                    recovery = repair + "\nInvalid JSON response to repair:\n" + raw
-                    raw = self._send_model_prompt(conversation, recovery, repair_title + "-recovery")
+                    raw = self._send_model_prompt(conversation, repair, repair_title + "-recovery", files)
         raise ProviderResponseError("unreachable response validation state")
 
     def design_task_and_rewards(self, instruction: str, robot: str, capabilities: Dict[str, Any]) -> Dict[str, Any]:
@@ -1225,6 +1216,7 @@ class OpenCLIChatGPTWebProvider:
         prompt += "\nJSON Schema: " + RewardPlan.schema_json()
         return self._request_model(prompt, RewardPlan, "failure-reward-redesign")
 
+    @serialize_browser_operation
     def design_visual_evaluation(self, task: TaskSpec) -> Dict[str, Any]:
         """为任务生成视觉评估输入与事件设计。"""
         template = (Path(__file__).parents[1] / "prompts" / "visual_spec_design.md").read_text(encoding="utf-8")
@@ -1275,6 +1267,7 @@ class OpenCLIChatGPTWebProvider:
                   "\nJSON Schema: " + RewardExperienceNarrative.schema_json())
         return self._request_model(prompt, RewardExperienceNarrative, "reward-experience")
 
+    @serialize_browser_operation
     def close(self) -> None:
         """释放 Provider 持有或绑定的浏览器资源。"""
         if not self._opened:

@@ -5,6 +5,7 @@ import hashlib
 from typing import Dict, List, Optional, Tuple
 
 from ..schemas.agent_workflow import LongTermMemoryRecord, SemanticMemoryRecord
+from ..storage.locking import FileLock
 from ..utils.io import utc_now
 from .store import LongTermMemoryStore
 
@@ -40,19 +41,32 @@ class SemanticMemoryConsolidatorAgent:
     def consolidate(self, store: LongTermMemoryStore, record: LongTermMemoryRecord,
                     min_support: int) -> Optional[SemanticMemoryRecord]:
         """合并同类证据；只有不同任务达到阈值时才把候选升级为活跃规律。"""
+        if min_support <= 0:
+            raise ValueError("语义记忆支持数必须为正数")
+        with FileLock(store.root / ".curation.lock"):
+            return self._consolidate_locked(store, record, min_support)
+
+    def _consolidate_locked(self, store: LongTermMemoryStore, record: LongTermMemoryRecord,
+                            min_support: int) -> Optional[SemanticMemoryRecord]:
+        """在全局记忆锁内累计独立证据，保留归档与反证替代结论。"""
         candidate = self._candidate(record)
         if candidate is None:
             return None
         rule_key, statement = candidate
-        semantic_id = "semantic-" + hashlib.sha1(rule_key.encode("utf-8")).hexdigest()[:12]
+        scope_key = "|".join((rule_key, record.robot, record.environment_version, record.reward_registry_version))
+        semantic_id = "semantic-" + hashlib.sha1(scope_key.encode("utf-8")).hexdigest()[:12]
         existing: Optional[SemanticMemoryRecord] = next(
             (item for item in store.semantic_records() if item.semantic_id == semantic_id), None)
+        if existing is not None and record.memory_id in existing.supporting_memory_ids:
+            return existing
         now = utc_now()
         if existing is None:
             existing = SemanticMemoryRecord(
                 semantic_id=semantic_id,
                 rule_key=rule_key,
                 statement=statement,
+                environment_version=record.environment_version,
+                reward_registry_version=record.reward_registry_version,
                 created_at=now,
                 updated_at=now,
             )
@@ -66,7 +80,8 @@ class SemanticMemoryConsolidatorAgent:
         existing.action_scope = sorted(set(existing.action_scope + [record.action_name]))
         existing.evidence_count = len(tasks)
         existing.confidence = min(0.99, 0.45 + 0.15 * existing.evidence_count)
-        existing.status = "active" if existing.evidence_count >= min_support else "candidate"
+        if existing.status not in ("superseded", "archived"):
+            existing.status = "active" if existing.evidence_count >= min_support else "candidate"
         existing.updated_at = now
         store.save_semantic(existing)
         if existing.status == "active" and record.outcome == "verified_failure":
@@ -77,7 +92,9 @@ class SemanticMemoryConsolidatorAgent:
             if {"front_leg_stand", "front_leg_walk"}.issubset(rewards):
                 contradicted.append("front-leg-support-gating")
             for semantic in store.semantic_records(active_only=True):
-                if semantic.rule_key not in contradicted:
+                if (semantic.rule_key not in contradicted or record.robot not in semantic.robot_scope or
+                        semantic.environment_version != record.environment_version or
+                        semantic.reward_registry_version != record.reward_registry_version):
                     continue
                 semantic.counterevidence_memory_ids = sorted(set(
                     semantic.counterevidence_memory_ids + [record.memory_id]))

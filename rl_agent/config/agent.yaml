@@ -10,6 +10,7 @@ visual_critic_provider: opencli-doubao  # 视觉评估 Agent：优先使用 Chat
 diagnosis_provider: opencli  # 训练诊断、奖励修订及经验总结：通过 OpenCLI 使用 ChatGPT。
 failure_reward_redesign: true  # 未通过验收时，先分析原因和建议，再独立重新设计完整奖励计划。
 num_reward_candidates: 3  # 每次奖励设计生成并筛选的候选方案数量。
+reward_design_review_retries: 2  # 全部候选业务审查失败时，携带意见重新设计的上限；0 关闭，不消耗 PPO 预算。
 smoke_iterations: 50  # 每个候选方案首次冒烟训练的 PPO 迭代数。
 screening_iterations: 300  # 通过冒烟检查后用于候选筛选的迭代数。
 trend_iterations: 500  # 用于判断奖励和 PPO 变化趋势的训练迭代数。

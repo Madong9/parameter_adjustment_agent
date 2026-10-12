@@ -23,13 +23,33 @@ class ExperimentCleaner:
             return self.experiment_root
         if not task_id.startswith("task-") or "/" in task_id or "\\" in task_id:
             raise ValueError("task_id 格式非法")
-        return ensure_within(self.experiment_root / task_id, self.experiment_root)
+        path = self.experiment_root / task_id
+        if path.is_symlink():
+            raise ValueError("不能清理符号链接任务目录")
+        return ensure_within(path, self.experiment_root)
+
+    @staticmethod
+    def _safe_file(path: Path, scope: Path) -> bool:
+        """只处理当前范围内的普通文件，拒绝任何文件或父目录符号链接。"""
+        try:
+            path.relative_to(scope)
+            current = path
+            while current != scope:
+                if current.is_symlink():
+                    return False
+                current = current.parent
+            ensure_within(path, scope)
+            return path.is_file()
+        except (OSError, ValueError):
+            return False
 
     def cleanup_completed_videos(self, task_id: str) -> Dict[str, Any]:
         """联合验收完成且经验整理落盘后，删除该任务的视频，保留其余证据。"""
         scope = self._scope(task_id)
         if (self.experiment_root / task_id).is_symlink():
             raise ValueError("不能清理符号链接任务目录")
+        if not all(self._safe_file(scope / name, scope) for name in ("summary.json", "state.json")):
+            raise ValueError("清理需要当前任务内的普通终态证据文件")
         summary = read_json(scope / "summary.json")
         state = read_json(scope / "state.json")
         if summary.get("state") != "COMPLETED" or state.get("state") != "COMPLETED":
@@ -39,7 +59,7 @@ class ExperimentCleaner:
         errors = []
         reclaimed = 0
         for path in sorted(scope.rglob("*")):
-            if path.suffix.lower() not in extensions or path.is_symlink() or not path.is_file():
+            if path.suffix.lower() not in extensions or not self._safe_file(path, scope):
                 continue
             try:
                 ensure_within(path, scope)
@@ -73,6 +93,8 @@ class ExperimentCleaner:
         """收集 manifest 明确引用的恢复 checkpoint。"""
         protected: Set[Path] = set()
         for manifest_path in scope.rglob("manifest.json"):
+            if not ExperimentCleaner._safe_file(manifest_path, scope):
+                continue
             try:
                 checkpoint = read_json(manifest_path).get("checkpoint")
             except (OSError, ValueError, json.JSONDecodeError):
@@ -92,7 +114,7 @@ class ExperimentCleaner:
         parents = {path.parent for path in scope.rglob("model_*.pt")}
         for parent in parents:
             paths = [path for path in CheckpointManager.list_checkpoints(parent)
-                     if path.parent == parent]
+                     if path.parent == parent and self._safe_file(path, scope)]
             retained = {path.resolve() for path in paths[-keep_per_run:]}
             retained.update(protected)
             candidates.extend(path for path in paths if path.resolve() not in retained)
@@ -102,6 +124,8 @@ class ExperimentCleaner:
         """找出未入选视觉聚合的普通视频和仅用于数值反事实测试的视频。"""
         candidates: List[Path] = []
         for metrics_path in scope.glob("**/rollouts/round_*/rollout_metrics.json"):
+            if not self._safe_file(metrics_path, scope):
+                continue
             keep = self._selected_rollouts(metrics_path)
             if not keep:
                 continue
@@ -125,7 +149,7 @@ class ExperimentCleaner:
         candidates: List[Path] = []
         for task_dir in self._task_directories(scope):
             summary_path = task_dir / "summary.json"
-            if not summary_path.is_file():
+            if not self._safe_file(summary_path, scope):
                 continue
             try:
                 summary = read_json(summary_path)
@@ -155,21 +179,21 @@ class ExperimentCleaner:
             if cleanup_checkpoints else []
         videos = (self._video_candidates(scope) + self._obsolete_candidate_videos(scope)) \
             if cleanup_videos else []
-        paths = sorted({path.resolve() for path in checkpoints + videos})
+        paths = sorted({path for path in checkpoints + videos if self._safe_file(path, scope)})
         for path in paths:
-            ensure_within(path, self.experiment_root)
+            ensure_within(path, scope)
         bytes_to_reclaim = sum(path.stat().st_size for path in paths if path.is_file())
         if apply:
             for path in paths:
-                if path.is_file():
+                if self._safe_file(path, scope):
                     path.unlink()
         return {
             "mode": "applied" if apply else "preview",
             "scope": task_id or "all",
             "cleanup_checkpoints": cleanup_checkpoints,
             "cleanup_videos": cleanup_videos,
-            "checkpoint_files": len({path.resolve() for path in checkpoints}),
-            "video_files": len({path.resolve() for path in videos}),
+            "checkpoint_files": len(set(paths).intersection(checkpoints)),
+            "video_files": len(set(paths).intersection(videos)),
             "total_files": len(paths),
             "reclaim_bytes": bytes_to_reclaim,
             "reclaim_gib": round(bytes_to_reclaim / float(1024 ** 3), 3),

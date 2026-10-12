@@ -685,7 +685,7 @@ class RLDesktopApp:
         self.root.after(1000, self._tick)
 
     def _on_close(self) -> None:
-        """在关闭窗口前确认并停止仍由桌面端跟踪的训练。"""
+        """确认退出后关闭整个调度器，回收训练、等待队列和 Viewer。"""
         if self.current_job and self.current_job.get("can_stop"):
             confirmed = messagebox.askyesno(
                 "训练仍在运行",
@@ -694,10 +694,7 @@ class RLDesktopApp:
             )
             if not confirmed:
                 return
-            try:
-                self.manager.stop_job(self.current_job["job_id"])
-            except (JobValidationError, KeyError):
-                pass
+        self.manager.shutdown()
         self.root.destroy()
 
 

@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import json
+import hmac
+import ipaddress
 import mimetypes
 import os
 import re
 import signal
+import secrets
+import socket
 import subprocess
 import sys
 import threading
+import time
 import uuid
 import webbrowser
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
@@ -22,6 +28,9 @@ from .memory.store import LongTermMemoryStore
 from .observability import JsonlEventRecorder, sample_gpu
 from .providers.bailian_glm import BailianGLMProvider
 from .settings import Settings, load_settings
+from .training.process_manager import (capture_process_group, registered_child_groups,
+                                      signal_process_group, signal_registered_groups, stop_process_group,
+                                      wait_registered_groups)
 from .utils.io import read_json, utc_now, write_json
 from .utils.paths import ensure_within, relative_display
 
@@ -76,6 +85,8 @@ TRAINING_STAGE_RANGES = {
 
 TERMINAL_STATUSES = {"completed", "review", "failed", "stopped", "interrupted"}
 JOB_ID_PATTERN = re.compile(r"^[a-f0-9]{12}$")
+TASK_ID_PATTERN = re.compile(r"^task-[A-Za-z0-9_-]{1,128}$")
+SESSION_COOKIE = "rl_ui_session"
 
 
 class JobValidationError(ValueError):
@@ -162,14 +173,18 @@ class JobManager:
     def __init__(self, settings: Optional[Settings] = None):
         """初始化作业目录并恢复可展示的历史作业。"""
         self.settings = settings or load_settings()
-        self.root = self.settings.artifacts_path / "ui_jobs"
+        self.root = ensure_within(self.settings.artifacts_path / "ui_jobs", self.settings.artifacts_path)
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._jobs: Dict[str, Dict[str, Any]] = {}
         self._processes: Dict[str, subprocess.Popen] = {}
+        self._job_control_tokens: Dict[str, str] = {}
+        self._job_child_groups: Dict[str, List[dict]] = {}
         self._playback_process: Optional[subprocess.Popen] = None
         self._playback_task_id: Optional[str] = None
         self._playback_kind: Optional[str] = None
+        self._playback_stopping = False
+        self._closing = False
         self._load_jobs()
         self._dispatch_queued()
 
@@ -177,11 +192,21 @@ class JobManager:
         """从磁盘加载历史界面作业，并标记无法继续跟踪的旧进程。"""
         for metadata_path in sorted(self.root.glob("*/job.json")):
             try:
+                metadata_path = ensure_within(metadata_path, self.root)
                 job = read_json(metadata_path)
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
+            if not isinstance(job, dict):
+                continue
             job_id = str(job.get("job_id", ""))
-            if not JOB_ID_PATTERN.fullmatch(job_id):
+            if (not JOB_ID_PATTERN.fullmatch(job_id) or metadata_path.parent.name != job_id or
+                    not TASK_ID_PATTERN.fullmatch(str(job.get("task_id", "")))):
+                continue
+            try:
+                validate_job_request(job, self.settings.allowed_robots)
+            except JobValidationError:
+                continue
+            if not {"status", "created_at", "started_at", "task", "robot"}.issubset(job):
                 continue
             if job.get("status") in ("running", "stopping"):
                 job["status"] = "interrupted"
@@ -193,21 +218,52 @@ class JobManager:
                 job["finished_at"] = utc_now()
                 job["message"] = "旧队列记录缺少安全命令，不能自动恢复"
                 write_json(metadata_path, job)
+            elif job.get("status") == "queued":
+                job["gpu_id"] = None
+                write_json(metadata_path, job)
             self._jobs[job_id] = job
 
     def _job_dir(self, job_id: str) -> Path:
         """返回由服务端生成且已校验的作业目录。"""
         if not JOB_ID_PATTERN.fullmatch(job_id):
             raise JobValidationError("作业编号格式无效")
-        return self.root / job_id
+        try:
+            return ensure_within(self.root / job_id, self.root)
+        except ValueError as exc:
+            raise JobValidationError("作业路径越过允许目录") from exc
+
+    def _job_artifact(self, job_id: str, filename: str) -> Path:
+        """校验作业文件及其符号链接目标，避免越界读取或写入。"""
+        return ensure_within(self._job_dir(job_id) / filename, self._job_dir(job_id))
+
+    def _task_dir(self, task_id: str) -> Path:
+        """校验历史实验标识和符号链接，拒绝实验目录逃逸。"""
+        if not TASK_ID_PATTERN.fullmatch(str(task_id)):
+            raise JobValidationError("实验编号格式无效")
+        return ensure_within(self.settings.experiments_path / task_id, self.settings.experiments_path)
+
+    def _task_artifact(self, job: Dict[str, Any], filename: str) -> Path:
+        """解析仅位于该实验目录中的状态和结果文件。"""
+        task_dir = self._task_dir(job["task_id"])
+        return ensure_within(task_dir / filename, task_dir)
+
+    def _assert_accepting(self) -> None:
+        """关闭开始后禁止启动或恢复任何新作业与 Viewer。"""
+        if self._closing:
+            raise JobValidationError("界面正在关闭，不能启动新任务")
+
+    def _viewer_running(self) -> bool:
+        """在同一锁内检查 Viewer 租约，避免训练绕过资源互斥。"""
+        return self._playback_process is not None and (self._playback_stopping or
+                                                       self._playback_process.poll() is None)
 
     def _save_job(self, job: Dict[str, Any]) -> None:
         """原子保存单个作业的元数据。"""
-        write_json(self._job_dir(job["job_id"]) / "job.json", job)
+        write_json(self._job_artifact(job["job_id"], "job.json"), job)
 
     def _append_log(self, job_id: str, message: str) -> None:
         """向作业日志追加一行由界面服务生成的消息。"""
-        log_path = self._job_dir(job_id) / "training.log"
+        log_path = self._job_artifact(job_id, "training.log")
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(message.rstrip() + "\n")
@@ -215,6 +271,8 @@ class JobManager:
     def _allocate_gpu(self) -> Optional[int]:
         """从配置 GPU 池中分配未被活动作业占用的设备，无空闲时返回 None。"""
         with self._lock:
+            if self._closing or self._viewer_running():
+                return None
             active = [job for job in self._jobs.values()
                       if job.get("status") in ("queued", "running", "stopping")]
         used = {int(job["gpu_id"]) for job in active if job.get("gpu_id") is not None}
@@ -245,12 +303,28 @@ class JobManager:
         return self._start_persisted_job(job_id)
 
     def _start_persisted_job(self, job_id: str) -> Dict[str, Any]:
+        """在资源租约锁内启动持久作业，关闭时不再派发。"""
+        with self._lock:
+            self._assert_accepting()
+            return self._start_persisted_job_locked(job_id)
+
+    def _start_persisted_job_locked(self, job_id: str) -> Dict[str, Any]:
         """启动已经持久化且获得 GPU 租约的队列作业。"""
         with self._lock:
             job = self._jobs[job_id]
             command = list(job["command"])
         prefix = [sys.executable, "-u", "-m", "rl_training_agent"]
-        if command[:4] != prefix or len(command) < 5 or command[4] not in ("train", "resume"):
+        task, robot, mode = validate_job_request(job, self.settings.allowed_robots)
+        if job.get("resume_of"):
+            self._task_dir(job["task_id"])
+            expected = prefix + ["resume", "--task-id", job["task_id"], "--provider",
+                                 "mock" if mode == "dry-run" else self.settings.provider]
+        else:
+            expected = prefix + ["train", "--task", task, "--robot", robot, "--provider",
+                                 "mock" if mode == "dry-run" else self.settings.provider]
+        if mode == "dry-run":
+            expected.append("--dry-run")
+        if command != expected:
             job["status"] = "failed"
             job["finished_at"] = utc_now()
             job["message"] = "持久队列命令未通过安全白名单"
@@ -259,16 +333,20 @@ class JobManager:
         job_dir = self._job_dir(job_id)
         environment = os.environ.copy()
         environment["PYTHONUNBUFFERED"] = "1"
+        control_token = secrets.token_hex(32)
+        environment["RL_AGENT_JOB_CONTROL_FILE"] = str(self._job_artifact(job_id, "job_control.jsonl"))
+        environment["RL_AGENT_JOB_CONTROL_TOKEN"] = control_token
         if job.get("mode") != "dry-run":
             environment["CUDA_VISIBLE_DEVICES"] = str(job["gpu_id"])
             JsonlEventRecorder(job_dir / "events.jsonl").emit(
                 "gpu_sample", {"phase": "job_start", **sample_gpu(int(job["gpu_id"]))})
         try:
-            with (job_dir / "training.log").open("a", encoding="utf-8") as output:
+            with self._job_artifact(job_id, "training.log").open("a", encoding="utf-8") as output:
                 process = subprocess.Popen(
                     command, cwd=str(self.settings.agent_root), env=environment,
                     stdout=output, stderr=subprocess.STDOUT, shell=False,
                     start_new_session=True)
+                capture_process_group(process)
         except Exception as exc:
             job["status"] = "failed"
             job["finished_at"] = utc_now()
@@ -285,12 +363,20 @@ class JobManager:
         with self._lock:
             self._jobs[job_id] = job
             self._processes[job_id] = process
+            self._job_control_tokens[job_id] = control_token
             self._save_job(job)
         monitor = threading.Thread(target=self._monitor_job, args=(job_id, process), daemon=True)
         monitor.start()
         return self.get_job(job_id)
 
     def _dispatch_queued(self) -> None:
+        """原子派发队列；关闭与 Viewer 租约期间不启动训练。"""
+        with self._lock:
+            if self._closing or self._viewer_running():
+                return
+            self._dispatch_queued_locked()
+
+    def _dispatch_queued_locked(self) -> None:
         """按创建时间顺序为等待作业分配空闲 GPU 并启动。"""
         while True:
             gpu_id = self._allocate_gpu()
@@ -310,11 +396,22 @@ class JobManager:
             self._start_persisted_job(job["job_id"])
 
     def start_job(self, payload: Any) -> Dict[str, Any]:
+        """把参数验证、GPU 预留和进程登记作为单个原子启动操作。"""
+        with self._lock:
+            self._assert_accepting()
+            if self._viewer_running():
+                raise JobValidationError("仿真 Viewer 正在运行，请先停止播放")
+            return self._start_job_locked(payload)
+
+    def _start_job_locked(self, payload: Any) -> Dict[str, Any]:
         """创建作业并通过固定参数数组启动现有训练 CLI。"""
         task, robot, mode = validate_job_request(payload, self.settings.allowed_robots)
         gpu_id = self._allocate_gpu()
         job_id = uuid.uuid4().hex[:12]
         task_id = TrainingOrchestrator._task_id(task, robot)
+        if any(item.get("task_id") == task_id and item.get("status") in ("queued", "running", "stopping")
+               for item in self._jobs.values()):
+            raise JobValidationError("同一实验已有活动作业，请等待或停止后再提交")
         now = utc_now()
         job: Dict[str, Any] = {
             "job_id": job_id,
@@ -342,6 +439,14 @@ class JobManager:
         ])
 
     def resume_job(self, source_job_id: str) -> Dict[str, Any]:
+        """在同一资源锁内校验恢复条件并预留 GPU，防止恢复竞争。"""
+        with self._lock:
+            self._assert_accepting()
+            if self._viewer_running():
+                raise JobValidationError("仿真 Viewer 正在运行，请先停止播放")
+            return self._resume_job_locked(source_job_id)
+
+    def _resume_job_locked(self, source_job_id: str) -> Dict[str, Any]:
         """从人工审核作业创建恢复作业，复用已有 checkpoint、rollout 和剩余预算。"""
         gpu_id = self._allocate_gpu()
         with self._lock:
@@ -350,10 +455,18 @@ class JobManager:
             raise KeyError(source_job_id)
         if source.get("status") != "review":
             raise JobValidationError("只有等待人工复核的作业可以继续闭环")
-        task_dir = self.settings.experiments_path / source["task_id"]
-        summary_path = task_dir / "summary.json"
+        if any(item.get("task_id") == source.get("task_id") and item.get("status") in
+               ("queued", "running", "stopping") for item in self._jobs.values()):
+            raise JobValidationError("该实验已有活动恢复作业")
+        summary_path = self._task_artifact(source, "summary.json")
         if not summary_path.is_file() or not read_json(summary_path).get("selected_experiment"):
             raise JobValidationError("该作业没有可恢复的训练候选或 checkpoint")
+        budget_detail = self._budget_for_job(source, self._state_for_job(source))
+        if not budget_detail["valid"] or budget_detail["exhausted"]:
+            raise JobValidationError(budget_detail["resume_block_reason"])
+        summary = read_json(summary_path)
+        if summary.get("resume_allowed") is False or summary.get("recoverable") is False:
+            raise JobValidationError("后端已禁止该实验恢复训练，请查看已保存结果与阻塞原因")
         job_id = uuid.uuid4().hex[:12]
         now = utc_now()
         mode = source.get("mode", "real")
@@ -376,7 +489,33 @@ class JobManager:
 
     def _monitor_job(self, job_id: str, process: subprocess.Popen) -> None:
         """等待训练进程退出，并把退出结果同步到作业元数据。"""
-        return_code = process.wait()
+        while True:
+            capture_process_group(process)
+            self._registered_children(job_id, process)
+            try:
+                return_code = process.wait(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+            except TypeError:
+                # 保持旧测试桩和无 timeout 参数的兼容实现可用。
+                return_code = process.wait()
+                break
+        stop_process_group(process, grace_seconds=0.0)
+        # CLI 被 SIGKILL 或崩溃时仍清理签名登记的真实训练会话，再释放 GPU。
+        groups = self._registered_children(job_id, process)
+        own_group = getattr(process, "_rl_group_identity", None)
+        if own_group is not None:
+            groups.append(own_group)
+        signal_registered_groups(groups, signal.SIGTERM)
+        signal_registered_groups(groups, signal.SIGKILL)
+        while not wait_registered_groups(groups, timeout=1.0):
+            with self._lock:
+                job = self._jobs.get(job_id)
+                if job:
+                    job.update(status="stopping", message="等待真实训练子进程退出，GPU 租约尚未释放")
+                    self._save_job(job)
+            signal_registered_groups(groups, signal.SIGKILL)
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
@@ -391,6 +530,8 @@ class JobManager:
             job["return_code"] = return_code
             job["finished_at"] = utc_now()
             self._processes.pop(job_id, None)
+            self._job_control_tokens.pop(job_id, None)
+            self._job_child_groups.pop(job_id, None)
             self._save_job(job)
         self._append_log(job_id, "[界面] 训练进程结束，退出码：{}".format(return_code))
         gpu_id = job.get("gpu_id")
@@ -412,35 +553,47 @@ class JobManager:
                 job["message"] = "等待中的作业已取消"
                 self._save_job(job)
                 return self.get_job(job_id)
-            if process is None or process.poll() is not None:
+            if process is None or (process.poll() is not None and not self._registered_children(job_id, process)):
                 raise JobValidationError("该训练作业当前不可停止")
             job["status"] = "stopping"
             job["message"] = "正在停止训练"
             self._save_job(job)
         self._append_log(job_id, "[界面] 已请求停止训练，正在终止训练进程组")
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except (AttributeError, ProcessLookupError, PermissionError):
-            process.terminate()
+        self._stop_registered_children(job_id, process, signal.SIGTERM)
+        signal_process_group(process, signal.SIGTERM)
         terminator = threading.Thread(target=self._ensure_stopped, args=(job_id, process), daemon=True)
         terminator.start()
         return self.get_job(job_id)
 
     def _ensure_stopped(self, job_id: str, process: subprocess.Popen) -> None:
         """等待正常终止，并在超时后强制结束失去响应的训练进程组。"""
+        groups = self._registered_children(job_id, process)
+        stop_process_group(process, grace_seconds=10.0)
+        signal_registered_groups(groups, signal.SIGKILL)
+
+    def _registered_children(self, job_id: str, process: subprocess.Popen) -> List[dict]:
+        """从受限文件解析该作业本次启动签名的真实训练进程身份。"""
+        with self._lock:
+            token = self._job_control_tokens.get(job_id)
+        if not token:
+            return []
         try:
-            process.wait(timeout=8)
-            return
-        except subprocess.TimeoutExpired:
-            self._append_log(job_id, "[界面] 正常停止等待超时，正在强制终止训练进程组")
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (AttributeError, ProcessLookupError, PermissionError):
-            process.kill()
+            current = registered_child_groups(self._job_artifact(job_id, "job_control.jsonl"), token, process.pid)
+        except ValueError:
+            current = []
+        with self._lock:
+            known = self._job_child_groups.setdefault(job_id, [])
+            identities = {(item["pid"], item["start_ticks"]) for item in current}
+            known[:] = [item for item in known if (item["pid"], item["start_ticks"]) not in identities] + current
+            return list(known)
+
+    def _stop_registered_children(self, job_id: str, process: subprocess.Popen, sig: int) -> None:
+        """即使 CLI 已崩溃也只终止经过本次会话签名验证的真实子组。"""
+        signal_registered_groups(self._registered_children(job_id, process), sig)
 
     def _state_for_job(self, job: Dict[str, Any]) -> Dict[str, Any]:
         """读取当前作业对应且时间有效的持久化训练状态。"""
-        state_path = self.settings.experiments_path / job["task_id"] / "state.json"
+        state_path = self._task_artifact(job, "state.json")
         if not state_path.is_file():
             return {"state": "PENDING", "updated_at": None, "history": []}
         try:
@@ -453,11 +606,17 @@ class JobManager:
 
     def _training_progress_for_job(self, job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """读取当前作业产生的最新候选训练迭代快照。"""
-        candidates_root = self.settings.experiments_path / job["task_id"] / "candidates"
-        snapshots = list(candidates_root.glob("*/training_progress.json")) if candidates_root.is_dir() else []
+        candidates_root = self._task_artifact(job, "candidates")
+        snapshots = []
+        for path in candidates_root.glob("*/training_progress.json") if candidates_root.is_dir() else []:
+            try:
+                snapshots.append(ensure_within(path, self._task_dir(job["task_id"])))
+            except ValueError:
+                continue
         snapshots.sort(key=lambda path: path.stat().st_mtime, reverse=True)
         for path in snapshots:
             try:
+                path = ensure_within(path, self._task_dir(job["task_id"]))
                 detail = read_json(path)
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
@@ -468,7 +627,7 @@ class JobManager:
 
     def _loop_status_for_job(self, job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """读取当前作业的闭环轮次、奖励版本、决策和剩余预算。"""
-        path = self.settings.experiments_path / job["task_id"] / "loop_status.json"
+        path = self._task_artifact(job, "loop_status.json")
         if not path.is_file():
             return None
         try:
@@ -479,29 +638,185 @@ class JobManager:
             return None
         return detail
 
-    def _can_resume_job(self, job: Dict[str, Any], state: Dict[str, Any]) -> bool:
-        """判断人工审核作业是否具备候选 checkpoint 且当前没有其他活动作业。"""
+    def _can_resume_job(self, job: Dict[str, Any], state: Dict[str, Any],
+                        budget_detail: Optional[Dict[str, Any]] = None) -> bool:
+        """只为冻结额度仍可用的人工复核候选开放恢复，且不能与活动作业竞争。"""
         if job.get("status") != "review" or state.get("state") != "HUMAN_REVIEW":
+            return False
+        budget_detail = budget_detail or self._budget_for_job(job, state)
+        if not budget_detail["valid"] or budget_detail["exhausted"]:
             return False
         with self._lock:
             if any(item.get("status") in ("queued", "running", "stopping")
                    for item in self._jobs.values()):
                 return False
-        summary_path = self.settings.experiments_path / job["task_id"] / "summary.json"
+        summary_path = self._task_artifact(job, "summary.json")
         if not summary_path.is_file():
             return False
         try:
             summary = read_json(summary_path)
         except (OSError, ValueError, json.JSONDecodeError):
             return False
+        if summary.get("resume_allowed") is False or summary.get("recoverable") is False:
+            return False
         experiment_id = summary.get("selected_experiment")
-        return bool(experiment_id and (
-            self.settings.experiments_path / job["task_id"] / "candidates" /
-            str(experiment_id) / "reward_plan.json").is_file())
+        try:
+            return bool(experiment_id and self._task_artifact(
+                job, "candidates/%s/reward_plan.json" % experiment_id).is_file())
+        except ValueError:
+            return False
+
+    def _persisted_ui_artifact(self, job: Dict[str, Any], filename: str,
+                               state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """读取该运行的冻结记录，恢复作业允许展示继承的产物而不混入旧实验。"""
+        try:
+            if not job.get("resume_of"):
+                payload = self._current_json_artifact(job, filename)
+            else:
+                path = self._task_artifact(job, filename)
+                payload = read_json(path) if path.is_file() else None
+            if not isinstance(payload, dict):
+                return None
+            context = state.get("context", {})
+            run_id = context.get("run_id") if isinstance(context, dict) else None
+            if job.get("resume_of") and not run_id:
+                inherited_state = read_json(self._task_artifact(job, "state.json"))
+                run_id = inherited_state.get("context", {}).get("run_id")
+            if payload.get("run_id") is not None and payload["run_id"] != run_id:
+                return None
+            return payload
+        except (OSError, ValueError, TypeError, AttributeError):
+            return None
+
+    @staticmethod
+    def _parse_frozen_budget(payload: Dict[str, Any]) -> Optional[Dict[str, int]]:
+        """解析严格整数的已用和冻结上限，兼容旧版已用加剩余额度格式。"""
+        budget = {}
+        for unit in ("iterations", "revisions"):
+            used = payload.get("used_" + unit)
+            maximum = payload.get("max_" + unit)
+            remaining = payload.get("remaining_" + unit)
+            if maximum is None and type(used) is int and type(remaining) is int:
+                maximum = used + remaining
+            if (type(used) is not int or type(maximum) is not int or
+                    used < 0 or maximum < 0 or used > maximum or
+                    (remaining is not None and (type(remaining) is not int or remaining < 0 or
+                                               used + remaining != maximum))):
+                return None
+            budget["used_" + unit] = used
+            budget["max_" + unit] = maximum
+            budget["remaining_" + unit] = maximum - used
+        return budget
+
+    def _budget_for_job(self, job: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+        """只展示持久化运行额度，缺失或无效时不从当前配置猜测可恢复预算。"""
+        unknown = {
+            "valid": False, "status": "unknown", "source": None,
+            "used_iterations": None, "max_iterations": None, "remaining_iterations": None,
+            "used_revisions": None, "max_revisions": None, "remaining_revisions": None,
+            "exhausted": None, "iteration_exhausted": None, "revision_exhausted": None,
+            "resume_block_reason": "冻结预算缺失或无效，不能确认剩余额度；请核对实验记录，不能直接继续训练",
+        }
+        execution_path = self._task_artifact(job, "training_execution.json")
+        execution = self._persisted_ui_artifact(job, "training_execution.json", state)
+        summary = self._persisted_ui_artifact(job, "summary.json", state) or {}
+        loop = self._persisted_ui_artifact(job, "loop_status.json", state) or {}
+        sources = []
+        if execution_path.is_file():
+            if (not execution or type(execution.get("dry_run")) is not bool or
+                    execution["dry_run"] != (job.get("mode") == "dry-run") or
+                    not isinstance(execution.get("run_id"), str) or not execution["run_id"].strip() or
+                    not isinstance(execution.get("budget"), dict)):
+                return unknown
+            parsed = self._parse_frozen_budget(execution["budget"])
+            if parsed is None:
+                return unknown
+            sources.append(("training_execution", parsed))
+        for name, record in (("summary", summary), ("loop_status", loop)):
+            raw = record.get("budget", record)
+            parsed = self._parse_frozen_budget(raw) if isinstance(raw, dict) else None
+            if parsed is not None:
+                sources.append((name, parsed))
+        if not sources:
+            return unknown
+        # 历史摘要可比执行快照更旧：已用取最大、上限取最小，绝不显示退款或扩额。
+        budget = dict(sources[0][1])
+        for _, evidence in sources[1:]:
+            for unit in ("iterations", "revisions"):
+                budget["used_" + unit] = max(budget["used_" + unit], evidence["used_" + unit])
+                budget["max_" + unit] = min(budget["max_" + unit], evidence["max_" + unit])
+        if any(budget["used_" + unit] > budget["max_" + unit] for unit in ("iterations", "revisions")):
+            return unknown
+        for unit in ("iterations", "revisions"):
+            budget["remaining_" + unit] = budget["max_" + unit] - budget["used_" + unit]
+        iteration_exhausted = budget["remaining_iterations"] == 0
+        revision_exhausted = budget["remaining_revisions"] == 0
+        exhausted = iteration_exhausted or revision_exhausted or summary.get("budget_exhausted") is True
+        reason = ("冻结训练预算已耗尽，当前实验不能继续训练；需新实验或显式批准扩额度"
+                  "（当前界面没有追加额度功能）；已保存策略与验收结果不会删除") if exhausted else None
+        if not exhausted and (summary.get("resume_allowed") is False or summary.get("recoverable") is False):
+            reason = "后端已禁止恢复该实验，请查看阻塞原因；不会自动增加训练额度"
+        return dict(budget, valid=True, status="exhausted" if exhausted else "available",
+                    source=sources[0][0], sources=[name for name, _ in sources], exhausted=exhausted,
+                    iteration_exhausted=iteration_exhausted, revision_exhausted=revision_exhausted,
+                    resume_block_reason=reason)
+
+    def _result_for_job(self, job: Dict[str, Any], state: Dict[str, Any],
+                        loop: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """分别展示奖励版本、实际 PPO 产物和联合验收，不把预算耗尽等同成功。"""
+        summary = self._persisted_ui_artifact(job, "summary.json", state) or {}
+        execution = self._persisted_ui_artifact(job, "training_execution.json", state) or {}
+        loop = loop or {}
+        candidate = summary.get("selected_experiment") or execution.get("experiment_id") or loop.get("experiment_id")
+        manifest, plan = {}, {}
+        if isinstance(candidate, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", candidate):
+            prefix = "candidates/%s/" % candidate
+            manifest = self._persisted_ui_artifact(job, prefix + "manifest.json", state) or {}
+            plan = self._persisted_ui_artifact(job, prefix + "reward_plan.json", state) or {}
+        context = state.get("context", {}) if isinstance(state.get("context"), dict) else {}
+        versions = (context.get("reward_version"), loop.get("reward_version"),
+                    summary.get("reward_version"), plan.get("version"), manifest.get("reward_version"))
+        version = next((value for value in versions if type(value) is int and value > 0), None)
+        checkpoint_available = False
+        checkpoint = summary.get("checkpoint")
+        if not checkpoint and manifest.get("checkpoint") and candidate:
+            checkpoint = "candidates/%s/%s" % (candidate, manifest["checkpoint"])
+        if isinstance(checkpoint, str):
+            try:
+                checkpoint_available = self._task_artifact(job, checkpoint).is_file()
+            except ValueError:
+                pass
+        training_result = manifest.get("training_result", "unknown")
+        training_status = "unknown"
+        if checkpoint_available and training_result == "completed":
+            training_status = "completed"
+        elif checkpoint_available and training_result == "dry_run_completed":
+            training_status = "mock_completed"
+        elif training_result in ("failed", "compiled", "running", "pending"):
+            training_status = training_result
+        accepted = (state.get("state") == "COMPLETED" and summary.get("state") == "COMPLETED" and
+                    summary.get("result") == "completed" and summary.get("dry_run") is False)
+        if accepted:
+            acceptance_status = "passed"
+        elif summary.get("result") == "completed" and summary.get("dry_run") is True:
+            acceptance_status = "mock_passed"
+        elif summary.get("result") == "failed" or (loop.get("phase") == "evaluated" and
+                                                    loop.get("decision") != "complete"):
+            acceptance_status = "not_passed"
+        elif summary:
+            acceptance_status = "pending"
+        else:
+            acceptance_status = "unknown"
+        return {"reward_version": version, "trained_reward_version": manifest.get("reward_version"),
+                "selected_experiment": candidate, "training_status": training_status,
+                "ppo_completed": training_status == "completed", "checkpoint_available": checkpoint_available,
+                "acceptance_status": acceptance_status, "accepted": accepted,
+                "dry_run": job.get("mode") == "dry-run"}
+
     def _current_json_artifact(self, job: Dict[str, Any], relative_path: str
                                ) -> Optional[Dict[str, Any]]:
         """读取当前作业启动后生成的 JSON，避免展示同 task_id 的旧轮次产物。"""
-        path = self.settings.experiments_path / job["task_id"] / relative_path
+        path = self._task_artifact(job, relative_path)
         if not path.is_file():
             return None
         started_at = job.get("started_at")
@@ -606,12 +921,15 @@ class JobManager:
         job["history"] = state.get("history", [])
         job["training_detail"] = training_detail
         job["loop_detail"] = loop_detail
+        job["budget_detail"] = self._budget_for_job(job, state)
+        job["result_detail"] = self._result_for_job(job, state, loop_detail)
         job["can_stop"] = job["status"] in ("running", "stopping") and job_id in self._processes
-        job["can_resume"] = self._can_resume_job(job, state)
+        job["can_resume"] = self._can_resume_job(job, state, job["budget_detail"])
+        job["resume_block_reason"] = job["budget_detail"]["resume_block_reason"]
         job["review_reason"] = None
         if job["status"] == "review":
-            task_dir = self.settings.experiments_path / job["task_id"]
-            for result_path in (task_dir / "summary.json", task_dir / "blocking_report.json"):
+            for result_path in (self._task_artifact(job, "summary.json"),
+                                self._task_artifact(job, "blocking_report.json")):
                 if not result_path.is_file():
                     continue
                 try:
@@ -638,13 +956,14 @@ class JobManager:
             return experiments
         for state_path in self.settings.experiments_path.glob("task-*/state.json"):
             try:
+                task_dir = self._task_dir(state_path.parent.name)
+                state_path = ensure_within(state_path, task_dir)
                 state = read_json(state_path)
+                request_path = ensure_within(task_dir / "task_request.txt", task_dir)
+                spec_path = ensure_within(task_dir / "task_spec.json", task_dir)
+                task = request_path.read_text(encoding="utf-8").strip() if request_path.is_file() else "未记录动作描述"
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
-            task_dir = state_path.parent
-            request_path = task_dir / "task_request.txt"
-            spec_path = task_dir / "task_spec.json"
-            task = request_path.read_text(encoding="utf-8").strip() if request_path.is_file() else "未记录动作描述"
             robot = "未知"
             if spec_path.is_file():
                 try:
@@ -666,12 +985,12 @@ class JobManager:
         """只为真实联合验收成功且 checkpoint/config 完整的实验解析播放产物。"""
         if not re.fullmatch(r"task-[a-f0-9]{10}", str(task_id)):
             return None
-        task_dir = ensure_within(self.settings.experiments_path / task_id, self.settings.experiments_path)
-        state_path = task_dir / "state.json"
-        summary_path = task_dir / "summary.json"
-        if not state_path.is_file() or not summary_path.is_file():
-            return None
         try:
+            task_dir = self._task_dir(task_id)
+            state_path = ensure_within(task_dir / "state.json", task_dir)
+            summary_path = ensure_within(task_dir / "summary.json", task_dir)
+            if not state_path.is_file() or not summary_path.is_file():
+                return None
             state = read_json(state_path)
             summary = read_json(summary_path)
         except (OSError, ValueError, json.JSONDecodeError):
@@ -679,8 +998,8 @@ class JobManager:
         if (state.get("state") != "COMPLETED" or summary.get("state") != "COMPLETED" or
                 summary.get("result") != "completed" or summary.get("dry_run") is not False):
             return None
-        task_spec_path = task_dir / "task_spec.json"
         try:
+            task_spec_path = ensure_within(task_dir / "task_spec.json", task_dir)
             robot = str(read_json(task_spec_path).get("robot", ""))
         except (OSError, ValueError, json.JSONDecodeError):
             return None
@@ -715,6 +1034,12 @@ class JobManager:
         return playable
 
     def start_playback(self, task_id: str, seed: int = 1, num_envs: int = 1) -> Dict[str, Any]:
+        """把 Viewer 的互斥校验、启动和租约登记放在同一个临界区。"""
+        with self._lock:
+            self._assert_accepting()
+            return self._start_playback_locked(task_id, seed, num_envs)
+
+    def _start_playback_locked(self, task_id: str, seed: int, num_envs: int) -> Dict[str, Any]:
         """启动已验收策略的仿真 Viewer 播放，不允许 dry-run 或训练并发占用 GPU。"""
         artifacts = self._playable_artifacts(task_id)
         if artifacts is None:
@@ -726,7 +1051,7 @@ class JobManager:
                            if job.get("status") in ("queued", "running", "stopping")]
             if active_jobs:
                 raise JobValidationError("训练任务仍在运行，请等待训练结束后再播放策略")
-            if self._playback_process is not None and self._playback_process.poll() is None:
+            if self._viewer_running():
                 raise JobValidationError("已有策略正在播放，请先关闭当前仿真 Viewer")
         adapter = UnitreeProjectAdapter(self.settings.training_root, self.settings.agent_root,
                                         self.settings.experiments_path)
@@ -735,23 +1060,31 @@ class JobManager:
         environment = os.environ.copy()
         if self.settings.gpu_ids:
             environment["CUDA_VISIBLE_DEVICES"] = str(self.settings.gpu_ids[0])
-        log_path = self.root / "playback.log"
+        log_path = ensure_within(self.root / "playback.log", self.root)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             with log_path.open("a", encoding="utf-8") as output:
                 process = subprocess.Popen(command, cwd=str(self.settings.training_root), env=environment,
                                            stdout=output, stderr=subprocess.STDOUT, shell=False,
                                            start_new_session=True)
+                capture_process_group(process)
         except OSError as exc:
             raise JobValidationError("策略 Viewer 启动失败：{}".format(exc)) from exc
         with self._lock:
             self._playback_process = process
             self._playback_task_id = task_id
             self._playback_kind = "strategy"
+            self._playback_stopping = False
         return {"task_id": task_id, "robot": artifacts["robot"], "pid": process.pid,
                 "kind": "strategy", "log": relative_display(log_path, self.settings.agent_root)}
 
     def start_feasibility_view(self, job_id: str) -> Dict[str, Any]:
+        """原子启动可行性 Viewer，复用训练和策略播放器的互斥租约。"""
+        with self._lock:
+            self._assert_accepting()
+            return self._start_feasibility_view_locked(job_id)
+
+    def _start_feasibility_view_locked(self, job_id: str) -> Dict[str, Any]:
         """为当前直线步态可行性报告启动 Isaac Gym 可视化探针。"""
         job = self.get_job(job_id)
         feasibility = job.get("feasibility", {})
@@ -764,7 +1097,7 @@ class JobManager:
                            if item.get("status") in ("queued", "running", "stopping")]
             if active_jobs:
                 raise JobValidationError("训练任务仍在运行，请等待训练结束后再观察可行性探针")
-            if self._playback_process is not None and self._playback_process.poll() is None:
+            if self._viewer_running():
                 raise JobValidationError("已有仿真 Viewer 正在运行，请先关闭当前窗口")
         try:
             duration = min(30.0, max(0.1, float(feasibility.get("duration") or 5.0)))
@@ -778,19 +1111,21 @@ class JobManager:
         environment = os.environ.copy()
         if self.settings.gpu_ids:
             environment["CUDA_VISIBLE_DEVICES"] = str(self.settings.gpu_ids[0])
-        log_path = self.root / "feasibility_view.log"
+        log_path = ensure_within(self.root / "feasibility_view.log", self.root)
         try:
             with log_path.open("a", encoding="utf-8") as output:
                 process = subprocess.Popen(
                     command, cwd=str(self.settings.agent_root), env=environment,
                     stdout=output, stderr=subprocess.STDOUT, shell=False,
                     start_new_session=True)
+                capture_process_group(process)
         except OSError as exc:
             raise JobValidationError("可行性 Viewer 启动失败：{}".format(exc)) from exc
         with self._lock:
             self._playback_process = process
             self._playback_task_id = job["task_id"]
             self._playback_kind = "feasibility"
+            self._playback_stopping = False
         return {"task_id": job["task_id"], "robot": job["robot"], "pid": process.pid,
                 "kind": "feasibility", "log": relative_display(log_path, self.settings.agent_root)}
 
@@ -798,11 +1133,12 @@ class JobManager:
         """返回当前策略 Viewer 是否仍在运行。"""
         with self._lock:
             process = self._playback_process
-            running = process is not None and process.poll() is None
+            running = self._viewer_running()
             if not running:
                 self._playback_process = None
                 self._playback_task_id = None
                 self._playback_kind = None
+                self._playback_stopping = False
             return {"running": running, "task_id": self._playback_task_id if running else None,
                     "pid": process.pid if running else None,
                     "kind": self._playback_kind if running else None}
@@ -811,29 +1147,53 @@ class JobManager:
         """请求停止当前策略播放进程组，超时后强制结束以释放 GPU。"""
         with self._lock:
             process = self._playback_process
-            if process is None or process.poll() is not None:
+            if process is None or (process.poll() is not None and not self._playback_stopping):
                 self._playback_process = None
                 self._playback_task_id = None
                 self._playback_kind = None
+                self._playback_stopping = False
                 return {"running": False, "task_id": None, "pid": None, "kind": None}
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except (AttributeError, ProcessLookupError, PermissionError):
-            process.terminate()
+            if self._playback_stopping:
+                return self.playback_status()
+            self._playback_stopping = True
+        signal_process_group(process, signal.SIGTERM)
         threading.Thread(target=self._ensure_playback_stopped, args=(process,), daemon=True).start()
         return self.playback_status()
 
     def _ensure_playback_stopped(self, process: subprocess.Popen) -> None:
         """等待策略播放器退出；失去响应时终止整个 Viewer 进程组。"""
-        try:
-            process.wait(timeout=8)
-            return
-        except subprocess.TimeoutExpired:
-            pass
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (AttributeError, ProcessLookupError, PermissionError):
-            process.kill()
+        stop_process_group(process, grace_seconds=10.0)
+        identity = getattr(process, "_rl_group_identity", None)
+        while identity is not None and not wait_registered_groups([identity], timeout=1.0):
+            signal_registered_groups([identity], signal.SIGKILL)
+        with self._lock:
+            if self._playback_process is process:
+                self._playback_process = None
+                self._playback_task_id = None
+                self._playback_kind = None
+                self._playback_stopping = False
+
+    def shutdown(self, wait_seconds: float = 12.0) -> None:
+        """先禁止派发并取消全部队列，再同步清理所有本次持有的训练和 Viewer。"""
+        with self._lock:
+            self._closing = True
+            processes = list(self._processes.items())
+            playback = self._playback_process
+            for job in self._jobs.values():
+                if job.get("status") == "queued":
+                    job.update(status="stopped", finished_at=utc_now(), message="界面关闭，等待作业已取消")
+                    self._save_job(job)
+                elif job["job_id"] in self._processes:
+                    job.update(status="stopping", message="界面关闭，正在停止训练")
+                    self._save_job(job)
+        deadline = time.monotonic() + max(0.0, wait_seconds)
+        for job_id, process in processes:
+            groups = self._registered_children(job_id, process)
+            signal_registered_groups(groups, signal.SIGTERM)
+            stop_process_group(process, max(0.0, deadline - time.monotonic()))
+            signal_registered_groups(groups, signal.SIGKILL)
+        if playback is not None:
+            stop_process_group(playback, max(0.0, deadline - time.monotonic()))
 
     def read_log(self, job_id: str, offset: int = 0, limit: int = 65536) -> Dict[str, Any]:
         """从字节偏移量开始增量读取训练日志。"""
@@ -841,7 +1201,7 @@ class JobManager:
         with self._lock:
             if job_id not in self._jobs:
                 raise KeyError(job_id)
-        log_path = self._job_dir(job_id) / "training.log"
+        log_path = self._job_artifact(job_id, "training.log")
         if not log_path.is_file():
             return {"text": "", "next_offset": 0}
         size = log_path.stat().st_size
@@ -907,9 +1267,14 @@ class TrainingUIHandler(BaseHTTPRequestHandler):
 
     manager: JobManager
     static_root: Path
+    session_token: str
+    session_cookie: str
+    allowed_hosts: set
+    allowed_origins: set
     server_version = "RLTrainingUI/1.0"
 
-    def _send_headers(self, status: int, content_type: str, length: int) -> None:
+    def _send_headers(self, status: int, content_type: str, length: int,
+                      initialize_session: bool = False) -> None:
         """发送带有本地界面安全策略的通用响应头。"""
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -919,6 +1284,9 @@ class TrainingUIHandler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'")
+        if initialize_session:
+            self.send_header("Set-Cookie", "%s=%s; Path=/; HttpOnly; SameSite=Strict" %
+                             (self.session_cookie, self.session_token))
         self.end_headers()
 
     def _send_json(self, status: int, value: Any) -> None:
@@ -931,7 +1299,7 @@ class TrainingUIHandler(BaseHTTPRequestHandler):
         """返回格式一致且不暴露调用栈的 API 错误。"""
         self._send_json(status, {"error": message})
 
-    def _send_asset(self, filename: str) -> None:
+    def _send_asset(self, filename: str, initialize_session: bool = False) -> None:
         """仅从固定白名单路由发送内置静态资源。"""
         asset = self.static_root / filename
         if not asset.is_file():
@@ -941,11 +1309,36 @@ class TrainingUIHandler(BaseHTTPRequestHandler):
         content_type = mimetypes.guess_type(asset.name)[0] or "application/octet-stream"
         if content_type.startswith("text/") or content_type == "application/javascript":
             content_type += "; charset=utf-8"
-        self._send_headers(200, content_type, len(body))
+        self._send_headers(200, content_type, len(body), initialize_session)
         self.wfile.write(body)
+
+    def _validate_request_context(self, require_session: bool = False) -> bool:
+        """统一拒绝非法 Host、跨源请求和缺失会话，首页通过后才允许签发凭据。"""
+        hosts = self.headers.get_all("Host", [])
+        origins = self.headers.get_all("Origin", [])
+        if len(hosts) != 1 or hosts[0].lower() not in self.allowed_hosts:
+            self._send_error_json(403, "Host 不在本地界面允许列表中")
+            return False
+        if (len(origins) > 1 or (origins and origins[0] not in self.allowed_origins) or
+                self.headers.get("Sec-Fetch-Site", "") == "cross-site"):
+            self._send_error_json(403, "不允许跨来源操作本地训练界面")
+            return False
+        if require_session:
+            cookies = SimpleCookie()
+            try:
+                cookies.load(self.headers.get("Cookie", ""))
+                token = cookies[self.session_cookie].value if self.session_cookie in cookies else ""
+            except Exception:
+                token = ""
+            if not hmac.compare_digest(token.encode("utf-8"), self.session_token.encode("utf-8")):
+                self._send_error_json(401, "请从本地界面首页初始化会话")
+                return False
+        return True
 
     def _read_json_body(self) -> Any:
         """在固定大小限制内读取并解析请求 JSON。"""
+        if self.headers.get_content_type() != "application/json":
+            raise JobValidationError("变更请求必须使用 application/json")
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError as exc:
@@ -958,10 +1351,19 @@ class TrainingUIHandler(BaseHTTPRequestHandler):
             raise JobValidationError("请求不是有效的 UTF-8 JSON") from exc
 
     def do_GET(self) -> None:
+        """安全处理只读路由，把损坏产物或越界符号链接转换为稳定响应。"""
+        try:
+            self._do_get()
+        except (OSError, ValueError, KeyError):
+            self._send_error_json(404, "产物不存在、无效或不在允许目录中")
+
+    def _do_get(self) -> None:
         """处理首页、静态资源和只读 API。"""
         parsed = urlparse(self.path)
+        if not self._validate_request_context(require_session=parsed.path.startswith("/api/")):
+            return
         if parsed.path in ("/", "/index.html"):
-            self._send_asset("index.html")
+            self._send_asset("index.html", initialize_session=True)
             return
         if parsed.path in ("/app.css", "/app.js"):
             self._send_asset(parsed.path.lstrip("/"))
@@ -999,13 +1401,15 @@ class TrainingUIHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         """处理创建训练、恢复闭环、停止训练与策略播放请求。"""
         parsed = urlparse(self.path)
+        if not self._validate_request_context(require_session=True):
+            return
         try:
+            payload = self._read_json_body()
             if parsed.path == "/api/jobs":
-                job = self.manager.start_job(self._read_json_body())
+                job = self.manager.start_job(payload)
                 self._send_json(201, job)
                 return
             if parsed.path == "/api/play":
-                payload = self._read_json_body()
                 if not isinstance(payload, dict):
                     raise JobValidationError("播放请求必须是 JSON 对象")
                 task_id = str(payload.get("task_id", ""))
@@ -1018,7 +1422,6 @@ class TrainingUIHandler(BaseHTTPRequestHandler):
                 self._send_json(201, result)
                 return
             if parsed.path == "/api/feasibility-view":
-                payload = self._read_json_body()
                 if not isinstance(payload, dict):
                     raise JobValidationError("可行性 Viewer 请求必须是 JSON 对象")
                 result = self.manager.start_feasibility_view(str(payload.get("job_id", "")))
@@ -1054,6 +1457,12 @@ class TrainingUIHandler(BaseHTTPRequestHandler):
 def create_server(host: str = "127.0.0.1", port: int = 8765,
                   manager: Optional[JobManager] = None) -> ThreadingHTTPServer:
     """创建可供 CLI 和测试复用的多线程本地 HTTP 服务。"""
+    try:
+        local_host = host.lower() == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        local_host = False
+    if not local_host:
+        raise JobValidationError("训练界面只允许绑定 loopback；远程访问请使用 SSH 隧道或受控代理")
     selected_manager = manager or JobManager()
     static_root = Path(__file__).resolve().parent / "web"
 
@@ -1062,7 +1471,19 @@ def create_server(host: str = "127.0.0.1", port: int = 8765,
 
     BoundTrainingUIHandler.manager = selected_manager
     BoundTrainingUIHandler.static_root = static_root
-    return ThreadingHTTPServer((host, port), BoundTrainingUIHandler)
+    BoundTrainingUIHandler.session_token = secrets.token_urlsafe(32)
+    class LoopbackTrainingServer(ThreadingHTTPServer):
+        """为 IPv4 或 IPv6 loopback 使用匹配的地址族。"""
+        address_family = socket.AF_INET6 if ":" in host else socket.AF_INET
+
+    server = LoopbackTrainingServer((host, port), BoundTrainingUIHandler)
+    actual_port = server.server_address[1]
+    BoundTrainingUIHandler.session_cookie = "%s_%d" % (SESSION_COOKIE, actual_port)
+    hostnames = ("localhost", "[%s]" % host.lower()) if ":" in host else ("127.0.0.1", "localhost", host.lower())
+    BoundTrainingUIHandler.allowed_hosts = {"%s:%d" % (name, actual_port) for name in hostnames}
+    BoundTrainingUIHandler.allowed_origins = {"http://" + value for value in BoundTrainingUIHandler.allowed_hosts}
+    server.job_manager = selected_manager
+    return server
 
 
 def serve(host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True) -> int:
@@ -1080,5 +1501,6 @@ def serve(host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True) 
     except KeyboardInterrupt:
         print("\n界面服务已关闭。")
     finally:
+        server.job_manager.shutdown()
         server.server_close()
     return 0

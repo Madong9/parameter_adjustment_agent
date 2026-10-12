@@ -41,9 +41,10 @@ class RewardReviewAgent:
             if capabilities.get('require_objective_links'):
                 from ..rewards.quality_gate import audit_objectives
                 candidate_conflicts.extend(audit_objectives(task, plan)['errors'])
-            from ..rewards.validator import validate_plan_execution, RewardValidationError
+            from ..rewards.validator import validate_plan_execution, validate_contact_contract, RewardValidationError
             try:
                 validate_plan_execution(plan)
+                validate_contact_contract(task, plan)
                 from ..rewards.action_normalizer import validate_action_semantics
                 validate_action_semantics(task, plan)
             except RewardValidationError as exc:
@@ -91,5 +92,6 @@ class RewardReviewAgent:
             candidate_results=candidate_results,
             passed_candidate_indexes=passed,
             rejected_candidate_indexes=rejected,
-            notes=["逐候选审查；仅隔离不合格候选，审查 Agent 不修改奖励方案。"],
+            notes=["逐候选审查；仅隔离不合格候选，审查 Agent 不修改奖励方案。",
+                   "禁止接触采用全部非足端刚体；碰撞事件阈值与最大接触力上界分别执行，不能由模型豁免。"],
         )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 import time
 from pathlib import Path
@@ -20,16 +21,23 @@ class EarlyStoppingMonitor:
         self.max_abs_reward = max_abs_reward
 
     def inspect_log(self, path: Path) -> Optional[str]:
-        """检查日志停滞、数值异常、OOM 和进程错误。"""
-        if not path.exists():
+        """限量读取日志尾部，检查停滞、数值异常、OOM 和进程错误。"""
+        try:
+            with path.open("rb") as handle:
+                stat = os.fstat(handle.fileno())
+                if time.time() - stat.st_mtime > self.stale_seconds:
+                    return "log_stale"
+                # UTF-8 每个字符最多四字节，保留原来的十万字符检查窗口。
+                handle.seek(max(0, stat.st_size - 400000))
+                text = handle.read(400000).decode("utf-8", errors="replace")[-100000:]
+        except FileNotFoundError:
             return "missing_log"
-        if time.time() - path.stat().st_mtime > self.stale_seconds:
-            return "log_stale"
-        text = path.read_text(encoding="utf-8", errors="replace")[-100000:]
         for reason, pattern in self.FAILURE_PATTERNS.items():
             if pattern.search(text):
                 return reason
-        rewards = re.findall(r"Mean reward:\s*([-+0-9.eE]+)", text)
+        rewards = re.findall(
+            r"Mean reward:\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
+            r"(?=\s|$)", text)
         if rewards:
             value = float(rewards[-1])
             if not math.isfinite(value) or abs(value) > self.max_abs_reward:
@@ -49,4 +57,3 @@ class EarlyStoppingMonitor:
         if metrics.get("kl", 0.0) > 0.2:
             return "kl_limit"
         return None
-

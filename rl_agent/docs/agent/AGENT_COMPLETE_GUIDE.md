@@ -494,7 +494,7 @@ python -m rl_training_agent memory-query --query "后腿站立行走" --robot go
 - `HUMAN_REVIEW`、Provider 故障和模拟结果不得成为正确长期经验。
 - Sim-to-Real 必须作为独立项目完成域随机化、系统辨识、硬件限幅、急停和人工批准。
 
-## 19. 当前验证状态
+## 19. 历史验证快照（最新结果见实现状态与可靠性修复说明）
 
 - 109 项自动测试通过。
 - Python 编译、前端 JavaScript 语法和补丁空白检查通过。
@@ -503,7 +503,7 @@ python -m rl_training_agent memory-query --query "后腿站立行走" --robot go
 - dry-run 能生成工作与程序记忆，但会被情景记忆门控拒绝。
 - Isaac Gym、CUDA 和真实 PPO 启动曾完成验证。
 - OpenCLI 文本、图片上传和视觉结构化回复曾完成真实验证。
-- 当前仍需在实际工作站重新确认 OpenCLI Browser Bridge 和百炼密钥状态。
+- 运行前应检查已配置角色服务，默认不要求百炼密钥。当前可靠性改动见 [可靠性修复说明](RELIABILITY_FIXES.md)。
 - 尚未完成覆盖多动作、多机器人、多随机种子的真实长时收敛基准。
 
 ## 20. 还需要完善的内容
@@ -532,7 +532,7 @@ python -m rl_training_agent memory-query --query "后腿站立行走" --robot go
 
 #### 20.4 Provider 角色注册表（已实现）
 
-配置已经声明各角色 Provider，但 `MultiAgentProvider` 仍以固定 OpenCLI/百炼组合为主。应增加 Provider 工厂和角色能力声明，启动时验证文本、图片和结构化 JSON 能力。
+`ProviderRegistry` 已实现角色工厂和能力声明，`MultiAgentProvider` 按配置创建实例并验证能力；`doctor` 检查实际角色组合，不固定要求百炼。
 
 完成标准：修改配置即可替换单个角色，能力不匹配时在训练前失败，而不是运行中失败。
 

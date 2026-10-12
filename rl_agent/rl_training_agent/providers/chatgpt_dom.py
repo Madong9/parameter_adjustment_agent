@@ -23,6 +23,50 @@ const attachFiles = (input, transfer) => {
 };
 """
 
+# 只读取站点的可见控件，不把用户消息或模型正文当作登录、验证码、额度证据。
+CHATGPT_ACCESS_STATE_SCRIPT = r"""
+(() => {
+  const visible = node => Boolean(node && node.getClientRects().length &&
+    getComputedStyle(node).visibility !== 'hidden' && getComputedStyle(node).display !== 'none');
+  const messageSelector = '[data-message-author-role], [data-chatgpt-search-unit-key], ' +
+    '[data-content-search-unit-key]';
+  const outsideMessage = node => !node.closest(messageSelector);
+  const controls = Array.from(document.querySelectorAll('button, a, input')).filter(node =>
+    visible(node) && outsideMessage(node));
+  const label = node => (node.getAttribute('aria-label') || node.textContent || '').trim();
+  const composer = Array.from(document.querySelectorAll(
+    '#prompt-textarea, [data-testid="prompt-textarea"], [contenteditable="true"][role="textbox"]'))
+    .find(visible);
+  const account = controls.some(node => /^(profile-button|user-menu-button)$/.test(
+    node.getAttribute('data-testid') || '') ||
+    /^(Open profile menu|Profile|Account|打开个人资料菜单|个人资料|账户菜单)$/i.test(label(node)));
+  const login = controls.filter(node =>
+    /^(Log in|Sign in|Sign up|Log in to ChatGPT|登录|登入|立即登录|登录 ChatGPT|注册)$/i.test(label(node)) ||
+    /^(login-button|signup-button)$/.test(node.getAttribute('data-testid') || '') ||
+    /\/auth\/(login|signup)(?:[/?#]|$)/.test(node.getAttribute('href') || ''));
+  const authForm = Array.from(document.querySelectorAll('input[type="password"], ' +
+    'form input[autocomplete="username"]')).some(node => visible(node) && outsideMessage(node));
+  const authDialog = login.some(node => node.closest('[role="dialog"]'));
+  const challenge = Array.from(document.querySelectorAll(
+    'iframe[src*="challenges.cloudflare.com"], iframe[src*="recaptcha"], ' +
+    '[name="cf-turnstile-response"], #challenge-running, #challenge-stage'))
+    .some(node => visible(node) && outsideMessage(node));
+  const uiNotices = Array.from(document.querySelectorAll(
+    '[role="alert"], [role="dialog"], [data-testid="usage-limit-banner"], ' +
+    '[data-testid="rate-limit-banner"]')).filter(node => visible(node) && outsideMessage(node));
+  const usageNotice = uiNotices.map(node => {
+    const copy = node.cloneNode(true);
+    copy.querySelectorAll(messageSelector + ', textarea, [contenteditable="true"], pre, code')
+      .forEach(item => item.remove());
+    return String(copy.textContent || '').slice(0, 2000);
+  }).join('\n');
+  return JSON.stringify({probe_version: 'chatgpt-access-v1', url: location.href,
+    composer_found: Boolean(composer), account_controls_found: account,
+    login_required: authForm || authDialog || (login.length > 0 && !account),
+    challenge_required: challenge, usage_notice: usageNotice});
+})()
+"""
+
 CHATGPT_SNAPSHOT_SCRIPT = r"""
 (() => {
   const roleOf = node => {

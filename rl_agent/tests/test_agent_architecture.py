@@ -16,6 +16,7 @@ from rl_training_agent.schemas.metrics import EvaluationResult
 from rl_training_agent.schemas.rewards import RewardPlan
 from rl_training_agent.schemas.task import TaskSpec
 from rl_training_agent.settings import BailianSettings, load_settings
+from rl_training_agent.utils.io import write_json
 
 
 class SmallReply(BaseModel):
@@ -40,6 +41,15 @@ def _mock_bundle(instruction="训练 Go2 稳定向前行走"):
     }
     provider = MockLLMReasoningProvider(1)
     return provider, capabilities, provider.design_task_and_rewards(instruction, "go2", capabilities)
+
+
+def _write_curator_evidence(task_dir, task, plan, rollout, evaluation):
+    """以真实 Schema 内容替代空证据，确保记忆晋升确实复核磁盘真值。"""
+    write_json(task_dir / "task_spec.json", task)
+    write_json(task_dir / "final" / "reward_plan.json", plan)
+    write_json(task_dir / "loop_history.json", [{"round": 1}])
+    write_json(task_dir / rollout / "evaluation.json", evaluation)
+    (task_dir / "final" / "checkpoint.pt").write_bytes(b"offline-test-checkpoint")
 
 
 def test_task_intent_context_and_prompt_compiler_are_structured():
@@ -117,13 +127,7 @@ def test_memory_curator_only_promotes_verified_completion(tmp_path):
         "state": "COMPLETED", "selected_experiment": "candidate-v01", "loop_rounds": 1,
         "rollout": rollout, "dry_run": False, "checkpoint": "final/checkpoint.pt",
     }
-    evidence_paths = [
-        tmp_path / "task_spec.json", tmp_path / "final" / "reward_plan.json",
-        tmp_path / "loop_history.json", tmp_path / rollout / "evaluation.json",
-    ]
-    for path in evidence_paths:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{}", encoding="utf-8")
+    _write_curator_evidence(tmp_path, task, plan, rollout, evaluation)
     record = MemoryCuratorAgent().curate(
         intent, task, plan, summary, {"evaluation": evaluation, "physical": {"fall_rate": 0.0}},
         selected, tmp_path)
@@ -162,12 +166,7 @@ def test_memory_requires_multiple_seeds_and_promotes_verified_failure(tmp_path):
         "state": "FAILED", "selected_experiment": "candidate-v01", "loop_rounds": 2,
         "rollout": rollout, "dry_run": False, "checkpoint": "final/checkpoint.pt",
     }
-    for path in (
-        tmp_path / "task_spec.json", tmp_path / "final" / "reward_plan.json",
-        tmp_path / "loop_history.json", tmp_path / rollout / "evaluation.json",
-    ):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{}", encoding="utf-8")
+    _write_curator_evidence(tmp_path, task, plan, rollout, evaluation)
     curator = MemoryCuratorAgent()
     selected = {
         "manifest": SimpleNamespace(git_commit="commit", config_hash="hash"),

@@ -1,12 +1,14 @@
 import json
 import threading
 import time
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
+import yaml
 
-from rl_training_agent.settings import Settings, load_settings
+from rl_training_agent.settings import Settings
 from rl_training_agent.web_ui import (
     JobManager,
     JobValidationError,
@@ -18,9 +20,17 @@ from rl_training_agent.web_ui import (
 )
 
 
+@pytest.fixture(autouse=True)
+def disable_local_env_loading(monkeypatch):
+    """所有界面测试禁止读取真实本地环境文件和凭据。"""
+    monkeypatch.setattr("rl_training_agent.settings._load_local_env_file", lambda: None)
+
+
 def _settings(tmp_path):
     """创建把界面作业和实验隔离到临时目录的测试配置。"""
-    base = load_settings()
+    # 测试只读取无密钥 YAML，不能加载工作区 .env 或真实 Provider 凭据。
+    base = Settings(**yaml.safe_load(
+        (Path(__file__).resolve().parents[1] / "config" / "agent.yaml").read_text()))
     return Settings(**{
         **base.dict(),
         "artifact_root": str(tmp_path / "artifacts"),
@@ -204,6 +214,8 @@ def test_review_job_exposes_reason_and_launches_checkpoint_resume(tmp_path, monk
     }), encoding="utf-8")
     (task_dir / "summary.json").write_text(json.dumps({
         "selected_experiment": "candidate-v03", "reason": "视觉 Provider 暂时不可用",
+        "used_iterations": 1000, "remaining_iterations": 2000,
+        "used_revisions": 0, "max_revisions": 1,
     }), encoding="utf-8")
     captured = {}
 
@@ -290,12 +302,13 @@ def test_http_server_serves_ui_and_rejects_invalid_job(tmp_path):
     try:
         with urlopen(base_url + "/", timeout=3) as response:
             page = response.read().decode("utf-8")
+            cookie = response.headers["Set-Cookie"].split(";", 1)[0]
         assert "强化学习上位机" in page
         assert "动作可行性" in page and "四层记忆" in page
         request = Request(
             base_url + "/api/jobs",
             data=json.dumps({"task": "跑", "robot": "go2", "mode": "dry-run"}).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "Cookie": cookie},
             method="POST",
         )
         with pytest.raises(HTTPError) as error:

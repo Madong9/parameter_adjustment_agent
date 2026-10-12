@@ -9,9 +9,9 @@ from pathlib import Path
 
 from rl_training_agent.training.contact_semantics import (
     nonfoot_indices as contact_indices,
-    COLLISION_FORCE_THRESHOLD,
+    contact_audit_metadata,
+    forbidden_contact_flags,
 )
-
 from rl_training_agent.training.real_train import (
     _ensure_environment_tools_on_path,
     _install_numpy_compatibility_aliases,
@@ -124,6 +124,10 @@ def main() -> int:
     rigid = gymtorch.wrap_tensor(rigid_state).view(1, -1, 13)
     nonfoot_indices = contact_indices(env)
     steps = max(1, int(args.seconds / policy_dt))
+    # 环境 dof_pos_limits 已按奖励 soft_dof_pos_limit 收缩；硬安全限位必须读实际 actor。
+    dof_properties = env.gym.get_actor_dof_properties(env.envs[0], env.actor_handles[0])
+    joint_position_limits = np.column_stack((dof_properties['lower'], dof_properties['upper'])).tolist()
+    joint_torque_limits = dof_properties['effort'].tolist()
     rows, reward_rows = [], []
     override = None if args.command_x is None else (
         float(args.command_x), float(args.command_y or 0.0), float(args.command_yaw or 0.0))
@@ -139,23 +143,25 @@ def main() -> int:
             env.commands[0, 0], env.commands[0, 1], env.commands[0, 2] = override
             obs = env.get_observations()
         env.gym.refresh_rigid_body_state_tensor(env.sim)
-        if step % video_interval != 0:
-            continue
         env.gym.fetch_results(env.sim, True)
-        base = env.base_pos[0].detach().cpu().tolist()
-        yaw = float(env.rpy[0, 2])
-        for name, handle in cameras.items():
-            offset = camera_offsets[name]
-            position, target = _tracked_camera_pose(base, yaw, offset)
-            env.gym.set_camera_location(
-                handle, env.envs[0], gymapi.Vec3(*position), gymapi.Vec3(*target))
-        env.gym.step_graphics(env.sim)
-        env.gym.render_all_camera_sensors(env.sim)
-        for name, handle in cameras.items():
-            rgba = env.gym.get_camera_image(env.sim, env.envs[0], handle, gymapi.IMAGE_COLOR)
-            rgba = np.asarray(rgba).reshape(height, width, 4)
-            writers[name].write(cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR))
+        record_video = step % video_interval == 0
+        frame_index = video_frame if record_video else max(0, video_frame - 1)
+        if record_video:
+            base = env.base_pos[0].detach().cpu().tolist()
+            yaw = float(env.rpy[0, 2])
+            for name, handle in cameras.items():
+                offset = camera_offsets[name]
+                position, target = _tracked_camera_pose(base, yaw, offset)
+                env.gym.set_camera_location(
+                    handle, env.envs[0], gymapi.Vec3(*position), gymapi.Vec3(*target))
+            env.gym.step_graphics(env.sim)
+            env.gym.render_all_camera_sensors(env.sim)
+            for name, handle in cameras.items():
+                rgba = env.gym.get_camera_image(env.sim, env.envs[0], handle, gymapi.IMAGE_COLOR)
+                rgba = np.asarray(rgba).reshape(height, width, 4)
+                writers[name].write(cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR))
         feet = rigid[0, env.feet_indices, :]
+        timed_out = bool(dones[0]) and bool(env.time_out_buf[0])
         contacts = (env.contact_forces[0, env.feet_indices, 2] > 1.0)
         contact_flags = [bool(value) for value in contacts.detach().cpu().tolist()]
         # 四足任务使用 FL/FR/RL/RR；人形任务足端较少时补 False，保证通用轨迹表可写。
@@ -172,9 +178,10 @@ def main() -> int:
             env.contact_forces[0, nonfoot_indices, :], dim=-1)
         nonfoot_contact_force_max = float(torch.max(nonfoot_contact_forces)) \
             if nonfoot_contact_forces.numel() else 0.0
-        forbidden_contact_force_max = nonfoot_contact_force_max
+        collision_flags, forbidden_forces, _ = forbidden_contact_flags(env)
+        forbidden_contact_force_max = float(forbidden_forces[0])
         row = {
-            "sim_time": step * policy_dt, "video_frame": video_frame,
+            "sim_time": step * policy_dt, "video_frame": frame_index,
             "base_x": float(env.base_pos[0, 0]), "base_y": float(env.base_pos[0, 1]), "base_z": float(env.base_pos[0, 2]),
             "quat_x": float(env.base_quat[0, 0]), "quat_y": float(env.base_quat[0, 1]),
             "quat_z": float(env.base_quat[0, 2]), "quat_w": float(env.base_quat[0, 3]),
@@ -187,45 +194,55 @@ def main() -> int:
             "joint_positions": env.dof_pos[0].detach().cpu().tolist(),
             "joint_velocities": env.dof_vel[0].detach().cpu().tolist(),
             "joint_torques": env.torques[0].detach().cpu().tolist(), "actions": env.actions[0].detach().cpu().tolist(),
+            "joint_position_limits": joint_position_limits,
+            "joint_soft_position_limits": env.dof_pos_limits.detach().cpu().tolist(),
+            "joint_torque_limits": joint_torque_limits,
             "feet_positions": feet[:, :3].detach().cpu().tolist(), "feet_velocities": feet[:, 7:10].detach().cpu().tolist(),
             "contact_fl": contact_flags[0], "contact_fr": contact_flags[1],
             "contact_rl": contact_flags[2], "contact_rr": contact_flags[3],
             "contact_forces": env.contact_forces[0, env.feet_indices, :].detach().cpu().tolist(),
-            "command": env.commands[0].detach().cpu().tolist(), "termination_reason": "reset" if bool(dones[0]) else "",
+            "command": env.commands[0].detach().cpu().tolist(),
+            "termination_reason": ('timeout' if timed_out else 'reset') if bool(dones[0]) else '',
             "penalized_contact_force_max": penalized_contact_force_max,
             "termination_contact_force_max": termination_contact_force_max,
             "nonfoot_contact_force_max": nonfoot_contact_force_max,
             "forbidden_contact_force_max": forbidden_contact_force_max,
-            "body_collision": bool(forbidden_contact_force_max > COLLISION_FORCE_THRESHOLD),
-            "fall": bool(abs(float(env.rpy[0, 0])) > 0.8 or abs(float(env.rpy[0, 1])) > 1.0),
+            "body_collision": bool(collision_flags[0]),
+            "fall": bool(dones[0]) and not timed_out,
             "foot_slip": float(torch.max(torch.norm(feet[:, 7:9], dim=-1) * contacts.float())),
             "energy": float(torch.sum(torch.abs(env.torques[0] * env.dof_vel[0])) * policy_dt),
             "base_speed": float(torch.norm(env.base_lin_vel[0, :2])), "reward_total": float(rewards[0]),
         }
         rows.append(row)
-        reward_row = {"sim_time": row["sim_time"], "video_frame": video_frame, "reward_total": row["reward_total"]}
+        reward_row = {"sim_time": row["sim_time"], "video_frame": frame_index, "reward_total": row["reward_total"]}
         for reward_name in env.reward_scales.keys():
             raw = env.last_raw_rewards[reward_name]
             reward_row["raw_" + reward_name] = float(raw[0])
             reward_row["weighted_" + reward_name] = float(raw[0] * env.reward_scales[reward_name])
         reward_rows.append(reward_row)
-        video_frame += 1
+        if record_video:
+            video_frame += 1
     for writer in writers.values():
         writer.release()
     pd.DataFrame(rows).to_parquet(output / "trajectory.parquet", index=False)
     pd.DataFrame(reward_rows).to_parquet(output / "rewards.parquet", index=False)
     metadata = {"video_fps": recorded_fps, "requested_video_fps": args.fps,
+                "trajectory_dt": policy_dt, "trajectory_steps": len(rows),
                 "frame_count": video_frame, "width": width, "height": height,
                 "duration": video_frame / recorded_fps, "simulation_dt": env_cfg.sim.dt,
                 "control_decimation": env_cfg.control.decimation, "video_start_sim_time": 0.0,
                 "camera": "side", "seed": args.seed, "checkpoint": Path(args.checkpoint).name,
                 "camera_tracking": "base_position_and_yaw", "camera_horizontal_fov_deg": 55.0,
-                "body_collision_force_threshold_n": COLLISION_FORCE_THRESHOLD,
-                "body_collision_scope": "all_non_foot_rigid_bodies",
+                "body_collision_force_threshold_n": env._agent_contact_contract['collision_force_threshold_n'],
+                "body_collision_scope": env._agent_contact_contract['scope'],
+                "joint_limit_source": "Isaac Gym actor DOF properties lower/upper",
+                "joint_soft_limit_source": "environment dof_pos_limits; reward soft_dof_pos_limit",
+                "torque_limit_source": "Isaac Gym actor DOF properties effort",
                 "command_override": override,
                 "nonfoot_rigid_body_count": int(nonfoot_indices.numel()),
                 "penalized_contact_patterns": list(env.cfg.asset.penalize_contacts_on),
                 "termination_contact_patterns": list(env.cfg.asset.terminate_after_contacts_on)}
+    metadata.update(contact_audit_metadata(env))
     (output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     return 0
 

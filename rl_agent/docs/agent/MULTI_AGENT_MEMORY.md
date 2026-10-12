@@ -38,9 +38,11 @@ Agent 之间不共享自由聊天记录，而是通过版本化 JSON 和文件�
 - 只包含已验证实验的长期记忆命中；
 - 明确的只读证据和提示注入边界。
 
-`RewardPromptCompiler` 使用仓库内 `reward_design_agent.md`，生成 `reward-design-v2` 提示词和 SHA-256。GLM 无法改变模板版本，也不能把历史检索文字当成系统指令。
+`RewardPromptCompiler` 使用仓库内 `reward_design_agent.md`，生成 `reward-design-v2` 提示词和 SHA-256。模型无法改变模板版本，也不能把历史检索文字当成系统指令。
 
-## 百炼 GLM 配置
+## 可选百炼 GLM 配置
+
+默认奖励设计、诊断、修订与经验总结使用 `opencli`，不需要百炼 API Key；只有显式把奖励或诊断角色改成 `bailian` 时才启用以下配置。
 
 模型和端点配置位于 `config/bailian.yaml`：
 
@@ -79,7 +81,7 @@ Provider 使用 `/chat/completions`、`response_format=json_object` 和 `enable_
 - 水平姿态奖励是否与目标俯仰角冲突；
 - 是否明确记录奖励投机风险。
 
-审查按候选独立给出通过/拒绝及原因，并写入 `reward_review.json`。不合格候选会被隔离，不创建训练目录、不消耗训练预算；同批次通过审查的候选仍会继续编译和训练。只有当所有候选都被拒绝（或没有记录任何奖励投机风险）时，才写入 `blocking_report.json` 并进入 `HUMAN_REVIEW`。审查 Agent 不直接修改奖励方案。
+审查按候选独立给出通过/拒绝及原因，并写入 `reward_review.json`。不合格候选被隔离，不消耗训练预算；同批通过项继续训练。全被拒绝时，回传完整提示词、原始动作、固定 TaskSpec 和逐候选意见，最多重新设计 `reward_design_review_retries` 次（默认 2）；仍失败才进入 `HUMAN_REVIEW`。审查 Agent 不直接修改奖励，重新设计不能改变任务验收合同。
 
 ## 四层记忆生命周期
 
@@ -150,4 +152,6 @@ python -m rl_training_agent doctor
 python -m rl_training_agent opencli-test
 ```
 
-`doctor` 只有在训练环境、CUDA、OpenCLI/ChatGPT 和百炼密钥都满足当前多 Agent 模式时才报告 `production_ready=true`。没有百炼密钥仍可使用上位机“离线演练”，但真实训练会在奖励设计阶段明确失败，不会自动回退到 Mock。
+`doctor` 检查实际角色路由，不固定要求百炼或豆包。训练环境、CUDA、各已配置 Provider 和视觉上传能力满足时才报告 `production_ready=true`；无角色使用百炼时不检查百炼密钥。Mock 不报告生产就绪。
+
+生产记忆检索先硬过滤机器人、环境源码/资产指纹与奖励注册表版本，再计算相关性。无版本旧记忆保留但不进入生产上下文；语义升级也只聚合同版本同机器人证据。见 [可靠性修复说明](RELIABILITY_FIXES.md)。

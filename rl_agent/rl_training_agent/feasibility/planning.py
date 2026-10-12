@@ -215,6 +215,9 @@ class DeterministicMotionPlannerRegistry:
             MotionType.ACROBATIC: common + [
                 "floating_base_ik", "centroidal_dynamics", "inverse_dynamics",
                 "contact_force_optimization", "trajectory_optimization"],
+            MotionType.GROUND_ROLL: common + [
+                "approved_body_contact_schedule", "floating_base_ik", "inverse_dynamics",
+                "contact_force_optimization", "trajectory_optimization"],
             MotionType.MANIPULATION: common + [
                 "end_effector_ik", "collision_check", "trajectory_optimization"],
             MotionType.UNKNOWN: ["clarified_motion_constraints"],

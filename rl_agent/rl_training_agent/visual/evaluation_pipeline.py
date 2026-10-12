@@ -57,30 +57,41 @@ class VisualEvaluationPipeline:
         uniform_indices = FrameSampler.uniform_indices(len(trajectory), 12)
         critical_indices = evidence_builder.critical_indices(len(trajectory), events, radius=3, maximum=48)
         multiview_indices = evidence_builder.multiview_indices(len(trajectory), events, maximum=12)
-        overview_frames = FrameSampler.decode(paths["overview"], uniform_indices)
-        dense_frames = FrameSampler.decode(paths["side"], critical_indices)
+        event_frames = {}
+        for event_name, output_name in (("all_feet_takeoff", "event_takeoff.png"),
+                                        ("all_feet_landing", "event_landing.png")):
+            matching = next((item for item in events if item["name"] == event_name), None)
+            if matching is not None:
+                event_frames[output_name] = matching["frame"]
+        # 同一相机的附件共享解码结果，避免重复打开视频和解码重叠帧。
+        requested = {
+            "front": set(multiview_indices),
+            "side": set(multiview_indices) | set(critical_indices) | set(event_frames.values()),
+            "overview": set(multiview_indices) | set(uniform_indices),
+        }
+        decoded = {camera: dict(FrameSampler.decode(paths[camera], sorted(indices)))
+                   for camera, indices in requested.items()}
+        overview_frames = [(index, decoded["overview"][index]) for index in uniform_indices
+                           if index in decoded["overview"]]
+        dense_frames = [(index, decoded["side"][index]) for index in critical_indices
+                        if index in decoded["side"]]
         annotation = evidence_builder.annotations(trajectory, events)
         builder = ContactSheetBuilder()
         clean = builder.build(overview_frames, rollout_dir / "contact_sheet_clean.png")
         annotated = ContactSheetBuilder(tile_size=(480, 360), columns=3).build(
             dense_frames, rollout_dir / "contact_sheet_annotated.png", annotation)
-        camera_frames = {camera: FrameSampler.decode(paths[camera], multiview_indices)
-                         for camera in ("front", "side", "overview")}
+        camera_frames = {camera: [(index, frames[index]) for index in multiview_indices if index in frames]
+                         for camera, frames in decoded.items()}
         multiview = builder.build_multi_camera(
             camera_frames, rollout_dir / "contact_sheet_multiview.png")
         metadata = read_json(paths["metadata"]) if paths.get("metadata") and paths["metadata"].is_file() else {}
         behavior_evidence = evidence_builder.build(
             task, trajectory, events, rollout_dir / "behavior_evidence.json", metadata)
         event_images: List[Path] = []
-        for event_name, output_name in (("all_feet_takeoff", "event_takeoff.png"),
-                                        ("all_feet_landing", "event_landing.png")):
-            matching = [item for item in events if item["name"] == event_name]
-            if not matching:
-                continue
-            decoded = FrameSampler.decode(paths["side"], [matching[0]["frame"]])
-            if decoded:
+        for output_name, frame_index in event_frames.items():
+            if frame_index in decoded["side"]:
                 output = rollout_dir / output_name
-                if not cv2.imwrite(str(output), decoded[0][1]):
+                if not cv2.imwrite(str(output), decoded["side"][frame_index]):
                     raise IOError("无法写入事件帧：%s" % output.name)
                 event_images.append(output)
         atomic_write_text(rollout_dir / "visual_prompt.txt", task.original_instruction + "\n")

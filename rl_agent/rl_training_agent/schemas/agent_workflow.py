@@ -93,9 +93,12 @@ class LongTermMemoryRecord(BaseModel):
     deterministic_metrics: Dict[str, Any] = Field(default_factory=dict)
     visual_conclusion: Dict[str, Any] = Field(default_factory=dict)
     evidence_sources: List[str] = Field(default_factory=list)
+    evidence_snapshot_root: str = ""
+    evidence_snapshot_hashes: Dict[str, str] = Field(default_factory=dict)
     environment_fingerprint: str = "unknown"
     simulation_platform: str = "unitree_rl_gym / Isaac Gym"
     environment_version: str = "unknown"
+    reward_registry_version: str = "unknown"
     git_commit: str = "unknown"
     checkpoint: str = ""
     seed_count: int = 0
@@ -142,6 +145,8 @@ class SemanticMemoryRecord(BaseModel):
     statement: str
     robot_scope: List[str] = Field(default_factory=list)
     action_scope: List[str] = Field(default_factory=list)
+    environment_version: str = "unknown"
+    reward_registry_version: str = "unknown"
     supporting_memory_ids: List[str] = Field(default_factory=list)
     supporting_task_ids: List[str] = Field(default_factory=list)
     counterevidence_memory_ids: List[str] = Field(default_factory=list)
@@ -168,6 +173,8 @@ class ProceduralMemoryRecord(BaseModel):
     memory_type: Literal["procedural"] = "procedural"
     version: str
     prompt_versions: Dict[str, str] = Field(default_factory=dict)
+    prompt_hashes: Dict[str, str] = Field(default_factory=dict)
+    policy_hashes: Dict[str, str] = Field(default_factory=dict)
     schema_hashes: Dict[str, str] = Field(default_factory=dict)
     validation_rules: List[str] = Field(default_factory=list)
     workflow_states: List[str] = Field(default_factory=list)

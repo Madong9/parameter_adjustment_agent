@@ -6,7 +6,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .evidence_builder import RewardExperienceEvidenceBuilder
 from .schema import RewardExperience, RewardExperienceEvidence
@@ -114,7 +114,8 @@ class RewardExperienceValidator:
         if evidence.task_id != str(actual.get("task_id", evidence.task_id)):
             raise RewardExperienceValidationError("task ID does not match task_spec.json")
 
-    def _verify_training_payload(self, evidence: RewardExperienceEvidence, task_dir: Path) -> None:
+    def _verify_training_payload(self, evidence: RewardExperienceEvidence, task_dir: Path,
+                                 checkpoint_provenance: Optional[Dict[str, Any]] = None) -> None:
         """确认训练状态、配置指纹、随机种子和 checkpoint 路径来自快照及 manifest。"""
         sources = [self._source_for_id(evidence, item)
                    for item in evidence.training_result.get("evidence_ids", [])]
@@ -145,11 +146,25 @@ class RewardExperienceValidator:
         if training.get("seeds") != list(snapshot.get("evaluation_seeds", [])):
             raise RewardExperienceValidationError("evaluation seeds do not match result snapshot")
         checkpoint = training.get("checkpoint")
+        if checkpoint != snapshot.get("checkpoint"):
+            raise RewardExperienceValidationError("checkpoint does not match immutable result snapshot")
         checkpoint_path = task_dir / str(checkpoint or "__missing_checkpoint__")
         if not checkpoint or not self._inside(task_dir, checkpoint_path):
             raise RewardExperienceValidationError("checkpoint path is missing or unsafe")
-        if training.get("checkpoint_exists") != checkpoint_path.is_file():
-            raise RewardExperienceValidationError("checkpoint existence does not match the recorded path")
+        if checkpoint_provenance is None:
+            if training.get("checkpoint_exists") != checkpoint_path.is_file():
+                raise RewardExperienceValidationError("checkpoint existence does not match the recorded path")
+        else:
+            # 历史快照记录的是晋升时的策略摘要，不复制或要求长期保留大型策略文件。
+            source = Path(str(checkpoint_provenance.get("source", "")))
+            if (not source.parts or source.is_absolute() or ".." in source.parts or
+                    checkpoint_provenance.get("recorded_checkpoint") != checkpoint or
+                    checkpoint_provenance.get("task_id") != evidence.task_id or
+                    checkpoint_provenance.get("selected_experiment") != training.get("selected_experiment") or
+                    checkpoint_provenance.get("exists_at_promotion") is not True or
+                    training.get("checkpoint_exists") is not True or
+                    not re.fullmatch(r"[0-9a-f]{64}", str(checkpoint_provenance.get("sha256", "")))):
+                raise RewardExperienceValidationError("checkpoint snapshot provenance is invalid")
 
     def _verify_reward_diffs(self, evidence: RewardExperienceEvidence, task_dir: Path) -> None:
         """重建父子奖励计划链及逐版本差异，拒绝模型编造或篡改。"""
@@ -298,11 +313,12 @@ class RewardExperienceValidator:
                 raise RewardExperienceValidationError("pattern overstates causality")
 
     def validate(self, experience: RewardExperience, evidence: RewardExperienceEvidence,
-                 task_dir: Path) -> None:
+                 task_dir: Path,
+                 checkpoint_provenance: Optional[Dict[str, Any]] = None) -> None:
         """校验来源文件、任务身份、奖励差异和文字结论，失败时抛出异常。"""
         self._verify_sources(evidence, task_dir)
         self._verify_task_payload(evidence, task_dir)
-        self._verify_training_payload(evidence, task_dir)
+        self._verify_training_payload(evidence, task_dir, checkpoint_provenance)
         self._verify_evaluation_payloads(evidence, task_dir)
         from .eligibility import ExperienceEligibilityChecker
         eligibility = ExperienceEligibilityChecker().check(evidence)

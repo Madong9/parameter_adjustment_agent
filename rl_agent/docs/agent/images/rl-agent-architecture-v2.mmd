@@ -31,9 +31,9 @@ flowchart TB
 
     subgraph A[按职责分工的模型 Agent]
         TASK[任务理解 Agent<br/>GPT · OpenCLI 聊天]:::model
-        REWARD[奖励设计 Agent<br/>百炼 GLM API]:::model
+        REWARD[奖励设计 Agent<br/>OpenCLI · ChatGPT<br/>百炼仅为可选角色配置]:::model
         VISION[视觉评估 Agent<br/>GPT · OpenCLI 多模态]:::model
-        DIAG[训练诊断 Agent<br/>百炼 GLM API]:::model
+        DIAG[训练诊断 Agent<br/>OpenCLI · ChatGPT<br/>有限预算奖励修订]:::model
         EXPERIENCE[Reward Experience Agent<br/>诊断 Provider · 仅归纳文字经验]:::model
         DOUBAO[豆包对话<br/>网页 Provider 回退]:::model
     end

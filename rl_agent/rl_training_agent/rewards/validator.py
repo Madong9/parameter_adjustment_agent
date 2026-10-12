@@ -2,6 +2,12 @@ from __future__ import annotations
 
 import ast
 import math
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 from typing import Dict, Iterable, Set
 
 from ..environment.capability_manifest import RewardRegistryItem
@@ -10,6 +16,32 @@ from ..schemas.rewards import RewardPlan
 
 class RewardValidationError(ValueError):
     """奖励计划或隔离实现违反了安全约束。"""
+
+
+def validate_contact_contract(task, plan: RewardPlan) -> Dict:
+    """在训练前核对固定禁触底线、任务阈值和所有课程的碰撞惩罚。"""
+    from ..training.contact_semantics import contact_contract, CONTACT_METRICS, is_body_termination, body_termination_bound
+    from ..training.config_runtime import reward_scales_for_stage
+    try:
+        contract = contact_contract(task.safety_constraints, plan.terminations)
+    except (ValueError, TypeError) as exc:
+        raise RewardValidationError('禁止接触合同无效：' + str(exc)) from exc
+    required = any(metric.required and metric.name in CONTACT_METRICS for metric in task.safety_constraints)
+    if required:
+        config = {'rewards': {'scales': {term.name: term.weight for term in plan.terms},
+                              'terms': [term.dict() for term in plan.terms]},
+                  'curriculum': [stage.dict() for stage in plan.curriculum]}
+        names = [stage.name for stage in plan.curriculum] or [None]
+        if not all(reward_scales_for_stage(config, name).get('collision', 0) < 0 for name in names):
+            raise RewardValidationError('禁止接触硬约束在所有课程都必须有有效负 collision 奖励')
+    for termination in plan.terminations:
+        item = termination.dict()
+        if not termination.enabled or termination.is_timeout or not is_body_termination(item):
+            continue
+        _, limit = body_termination_bound(item)
+        if limit > contract['body_termination_force_threshold_n']:
+            raise RewardValidationError('身体接触终止阈值不得高于任务合同或固定安全底线')
+    return contract
 
 
 def validate_plan_execution(plan: RewardPlan, max_abs_weight: float = 100.0) -> None:
@@ -114,8 +146,14 @@ class RewardCodeValidator:
         """对生成奖励源码执行 AST 白名单检查。"""
         tree = ast.parse(source)
         functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
-        if len(functions) != 1 or functions[0].name != "reward":
+        if len(tree.body) != 1 or len(functions) != 1 or functions[0].name != "reward":
             raise RewardValidationError("generated code must define exactly one reward(tensors) function")
+        function = functions[0]
+        args = function.args
+        if (function.decorator_list or function.returns or args.defaults or args.kw_defaults or
+                args.vararg or args.kwarg or args.kwonlyargs or getattr(args, 'posonlyargs', []) or
+                len(args.args) != 1 or args.args[0].arg != 'tensors' or args.args[0].annotation):
+            raise RewardValidationError("generated reward must be a plain reward(tensors) function")
         for node in ast.walk(tree):
             if isinstance(node, self.FORBIDDEN_NODES):
                 raise RewardValidationError("forbidden AST node: %s" % type(node).__name__)
@@ -123,7 +161,25 @@ class RewardCodeValidator:
                 raise RewardValidationError("forbidden name: %s" % node.id)
             if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
                 raise RewardValidationError("dunder attribute access is forbidden")
+            if isinstance(node, (ast.For, ast.While, ast.AsyncFor, ast.ListComp, ast.SetComp,
+                                 ast.DictComp, ast.GeneratorExp, ast.NamedExpr, ast.Delete,
+                                 ast.AugAssign, ast.AsyncFunctionDef)):
+                raise RewardValidationError("generated reward must be a bounded pure tensor expression")
+            if isinstance(node, ast.FunctionDef) and node is not function:
+                raise RewardValidationError("nested reward functions are forbidden")
+            if isinstance(node, ast.Assign) and any(
+                    not isinstance(target, ast.Name) or target.id in ('torch', 'tensors')
+                    for target in node.targets):
+                raise RewardValidationError("only local variable assignment is allowed")
+            if isinstance(node, ast.AnnAssign):
+                raise RewardValidationError("annotated assignment is forbidden")
+            if isinstance(node, ast.Attribute) and (
+                    not isinstance(node.value, ast.Name) or node.value.id != 'torch' or
+                    node.attr not in self.ALLOWED_TORCH_CALLS):
+                raise RewardValidationError("only whitelisted torch attributes may be used")
             if isinstance(node, ast.Call):
+                if not isinstance(node.func, (ast.Name, ast.Attribute)):
+                    raise RewardValidationError("indirect function calls are forbidden")
                 if isinstance(node.func, ast.Name) and node.func.id not in {"float", "len"}:
                     raise RewardValidationError("function call is not allowed: %s" % node.func.id)
                 if isinstance(node.func, ast.Attribute):
@@ -139,7 +195,39 @@ class RewardCodeValidator:
         return tree
 
     def tensor_smoke_test(self, source: str, batch_size: int = 8) -> Dict[str, float]:
-        """执行生成奖励的形状和有限值张量冒烟测试。"""
+        """在限时、限内存、禁止写文件的独立进程中验证生成奖励。"""
+        self.validate_ast(source)
+        if not isinstance(batch_size, int) or not 1 <= batch_size <= 1024:
+            raise RewardValidationError("batch_size must be within 1..1024")
+        root = str(Path(__file__).resolve().parents[2])
+        script = ("import sys; sys.path.insert(0, %r); "
+                  "from rl_training_agent.rewards.validator import _tensor_smoke_worker; "
+                  "_tensor_smoke_worker()") % root
+        environment = {'PATH': str(Path(sys.executable).parent), 'PYTHONDONTWRITEBYTECODE': '1',
+                       'CUDA_VISIBLE_DEVICES': '', 'OMP_NUM_THREADS': '1',
+                       'OPENBLAS_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1'}
+        try:
+            with tempfile.TemporaryDirectory(prefix='reward-smoke-') as directory:
+                result = subprocess.run(
+                    [sys.executable, '-I', '-c', script],
+                    input=json.dumps({'source': source, 'batch_size': batch_size,
+                                      'allowed_tensors': sorted(self.allowed_tensors)}),
+                    capture_output=True, text=True, cwd=directory, env=environment,
+                    timeout=20, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RewardValidationError("isolated reward smoke test failed or timed out") from exc
+        if result.returncode != 0:
+            raise RewardValidationError("isolated reward smoke test exceeded resource limits or failed")
+        try:
+            payload = json.loads(result.stdout)
+        except (ValueError, TypeError) as exc:
+            raise RewardValidationError("isolated reward worker returned invalid evidence") from exc
+        if 'error' in payload:
+            raise RewardValidationError(str(payload['error']))
+        return payload['stats']
+
+    def _tensor_smoke_in_process(self, source: str, batch_size: int) -> Dict[str, float]:
+        """仅供独立 worker 在资源限制生效后执行受检张量函数。"""
         import numpy as np
         import torch
         # 在进入受限全局命名空间前初始化 Torch 的可选 NumPy 桥接。
@@ -154,3 +242,25 @@ class RewardCodeValidator:
         if not torch.isfinite(result).all():
             raise RewardValidationError("reward output contains NaN or Inf")
         return {"min": float(result.min()), "max": float(result.max()), "mean": float(result.mean())}
+
+
+def _tensor_smoke_worker() -> None:
+    """初始化 CPU Torch 后限制当前 worker 资源，不继承宿主凭据环境。"""
+    import resource
+    import torch
+    import numpy as np
+    request = json.loads(sys.stdin.read())
+    torch.set_num_threads(1)
+    torch.from_numpy(np.zeros(1, dtype=np.float32))
+    with open('/proc/self/statm', encoding='ascii') as handle:
+        virtual_bytes = int(handle.read().split()[0]) * os.sysconf('SC_PAGE_SIZE')
+    resource.setrlimit(resource.RLIMIT_AS, (virtual_bytes + 256 * 1024 * 1024,) * 2)
+    resource.setrlimit(resource.RLIMIT_CPU, (5, 5))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
+    try:
+        stats = RewardCodeValidator(request['allowed_tensors'])._tensor_smoke_in_process(
+            request['source'], request['batch_size'])
+        print(json.dumps({'stats': stats}, allow_nan=False))
+    except Exception as exc:
+        print(json.dumps({'error': str(exc)[:500]}))

@@ -21,9 +21,13 @@ class DeterministicEvaluator:
         incompatible = (threshold.name in scores and threshold.unit not in ("", "1", "score", "ratio"))
         incompatible |= (threshold.name in {"front_leg_forward_speed", "rear_leg_forward_speed"}
                          and threshold.unit != "m/s")
-        physical_units = {"final_roll_angle": "rad", "max_roll_velocity": "rad/s", "feet_air_time": "s"}
+        physical_units = {"final_roll_angle": "rad", "max_roll_velocity": "rad/s", "feet_air_time": "s",
+                          "takeoff_time_spread": "s", "landing_pitch_abs": "rad"}
         incompatible |= (threshold.name in physical_units and threshold.unit != physical_units[threshold.name])
-        passed = not incompatible and math.isfinite(value) and OPERATORS[threshold.operator](value, threshold.value)
+        valid = isinstance(value, (int, float)) and math.isfinite(value)
+        passed = not incompatible and valid and OPERATORS[threshold.operator](value, threshold.value)
+        if not valid:
+            value = float('nan')
         unit = "1" if threshold.name in scores else threshold.unit
         return MetricSummary(name=threshold.name, value=value, unit=unit, passed=passed)
 
@@ -31,12 +35,16 @@ class DeterministicEvaluator:
         """执行视觉与确定性证据的联合评估。"""
         safety = [self._check(item, metrics) for item in task.safety_constraints]
         task_results = [self._check(item, metrics) for item in task.success_metrics]
-        implicit_safety = (metrics.get("nan_count", 0.0) == 0.0 and
-                           metrics.get("joint_limit_violations", 0.0) == 0.0 and
-                           metrics.get("torque_limit_violations", 0.0) == 0.0 and
-                           metrics.get("forbidden_collisions", 0.0) == 0.0 and
-                           metrics.get("abnormal_terminations", 0.0) == 0.0)
-        counterfactual_passed = bool(metrics.get("counterfactual_passed", True))
+        mandatory = ('nan_count', 'joint_limit_violations', 'torque_limit_violations',
+                     'forbidden_collisions', 'abnormal_terminations')
+        implicit_safety = all(isinstance(metrics.get(name), (int, float)) and
+                              math.isfinite(metrics[name]) and metrics[name] == 0.0
+                              for name in mandatory)
+        counterfactual = metrics.get('counterfactual_passed')
+        counterfactual_passed = (counterfactual is True or
+            (type(counterfactual) in (int, float) and math.isfinite(counterfactual) and counterfactual == 1))
+        if 'counterfactual_passed' not in metrics and metrics.get('counterfactual_applicable') is not True:
+            counterfactual_passed = True
         hard = implicit_safety and counterfactual_passed and all(item.passed for item in safety)
         task_passed = bool(task_results) and all(item.passed for item in task_results)
         visual_passed = visual.visual_success and visual.alignment_score >= 0.7 and not visual.requires_human_review
@@ -47,6 +55,9 @@ class DeterministicEvaluator:
         violations = [item.name for item in safety if not item.passed]
         if not implicit_safety:
             violations.append("implicit_simulation_safety")
+            violations.extend("safety_evidence:%s" % name for name in mandatory
+                              if not isinstance(metrics.get(name), (int, float)) or
+                              not math.isfinite(metrics[name]) or metrics[name] != 0.0)
         if not counterfactual_passed:
             violations.append("reward_hacking_counterfactual")
         return EvaluationResult(hard_constraints_passed=hard, task_metrics_passed=task_passed,

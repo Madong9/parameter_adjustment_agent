@@ -59,6 +59,8 @@ class DryRunRolloutRecorder:
                 "angular_velocity": 0.03, "base_wx": 0.03, "base_wy": 0.0, "base_wz": 0.0,
                 "action_rate": 0.1, "joint_positions": [0.0] * 12,
                 "joint_velocities": [0.0] * 12, "joint_torques": [0.1] * 12, "actions": [0.0] * 12,
+                "joint_position_limits": [[-3.0, 3.0]] * 12,
+                "joint_torque_limits": [20.0] * 12,
                 "feet_positions": [[0.0, 0.0, 0.0]] * 4, "feet_velocities": [[0.0, 0.0, 0.0]] * 4,
                 "contact_fl": not airborne, "contact_fr": not airborne, "contact_rl": not airborne,
                 "contact_rr": not airborne, "contact_forces": [0.0 if airborne else 20.0] * 4,

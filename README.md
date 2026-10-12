@@ -2,7 +2,7 @@
 
 面向 Unitree 机器人的自然语言强化学习参数调整与训练编排工具。
 
-本项目把自然语言描述的 Unitree 机器人任务转换为经过校验的奖励候选，执行分阶段训练，生成同步 rollout 证据，并完成视觉评论、确定性评估和可恢复的实验管理。生产环境中的智能推理只能通过 OpenCLI 操作已登录的 ChatGPT 网页完成；项目不使用任何模型 API 或 API Key。
+本项目把自然语言描述的 Unitree 机器人任务转换为经过校验的奖励候选，执行分阶段训练，生成同步 rollout 证据，并完成视觉评论、确定性评估和可恢复的实验管理。默认智能推理通过 OpenCLI 操作已登录的 ChatGPT 网页；任务理解与视觉评价支持配置的豆包回退。默认不需要模型 API Key，百炼仅作为显式配置的可选 Provider。
 
 任务通过视觉、任务指标和硬约束联合验收，保存报告并完成经验整理后，会自动删除该动作任务目录内所有候选、轮次及可行性测试的视频。模型 checkpoint、奖励与训练配置、轨迹和奖励数据、关键帧图片、评估报告、诊断记录及经验数据全部保留。待复核、失败或仍在训练的任务不执行成功清理。删除清单和释放空间记录在 `video_cleanup.json`；恢复已完成任务时会补做或重试清理，不重复训练。
 
@@ -86,14 +86,18 @@ cd parameter_adjustment_agent
 git clone https://github.com/unitreerobotics/unitree_rl_gym.git
 git -C unitree_rl_gym checkout 276801e
 git -C unitree_rl_gym apply ../rl_agent/patches/unitree_rl_gym.patch
+git -C unitree_rl_gym apply ../rl_agent/patches/unitree_numpy_compat.patch
 
 # 按 Unitree 官方说明安装 Isaac Gym 和 rsl_rl 后，安装 Agent
 conda activate rl_agent
+python -m pip install --no-deps --no-build-isolation -e ./unitree_rl_gym
 cd rl_agent
 python -m pip install -e '.[test]'
 ```
 
 补丁内容与用途见 `rl_agent/patches/README.md`。所有纳入版本控制的路径均为相对路径。`config/agent.yaml` 使用 `../unitree_rl_gym` 指向训练项目；公共产物和实验均保存在 Agent 目录内。
+
+NumPy 支持范围统一为 `>=1.20,<2`，当前 Python 3.8 环境验证版本为 `1.24.4`。旧 Isaac Gym 的标量别名由训练入口兼容处理，不应为了上游过时的 `numpy==1.20` 声明强制降级。验收指标、安全证据、浏览器互斥、任务恢复与记忆兼容性见 [可靠性修复说明](rl_agent/docs/agent/RELIABILITY_FIXES.md)。
 
 ## 启动桌面上位机软件
 

@@ -35,6 +35,10 @@ const elements = {
   activeMode: document.querySelector("#activeMode"),
   loopRound: document.querySelector("#loopRound"),
   loopBudget: document.querySelector("#loopBudget"),
+  budgetStatus: document.querySelector("#budgetStatus"),
+  ppoStatus: document.querySelector("#ppoStatus"),
+  acceptanceStatus: document.querySelector("#acceptanceStatus"),
+  budgetNotice: document.querySelector("#budgetNotice"),
   stageTrack: document.querySelector("#stageTrack"),
   reviewReason: document.querySelector("#reviewReason"),
   resumeButton: document.querySelector("#resumeButton"),
@@ -74,9 +78,12 @@ const elements = {
 
 /** 调用本地上位机 API，并把非成功响应转换为可读错误。 */
 async function api(path, options = {}) {
+  const request = options.method === "POST" && options.body === undefined
+    ? { ...options, body: "{}" } : options;
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-    ...options,
+    ...request,
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json", ...(request.headers || {}) },
   });
   const payload = await response.json();
   if (!response.ok) {
@@ -158,9 +165,42 @@ function selectMode(mode) {
 function jobStatusLabel(status) {
   return {
     queued: "正在启动", running: "训练运行中", stopping: "正在停止",
-    completed: "训练完成", review: "等待人工复核", failed: "训练失败",
+    completed: "流程完成", review: "等待人工复核", failed: "训练失败",
     stopped: "已安全停止", interrupted: "服务曾中断",
   }[status] || "等待任务";
+}
+
+/** 将冻结额度、PPO 产物和联合验收分别解释，未知额度不开放继续训练。 */
+function trainingResultPresentation(job) {
+  const budget = job.budget_detail || {};
+  const result = job.result_detail || {};
+  const known = budget.valid === true;
+  const canResume = Boolean(job.can_resume) && known && budget.exhausted === false;
+  const usage = known ? `${budget.used_iterations}/${budget.max_iterations} iter` : "额度未知";
+  const budgetLabel = !known ? "额度未知" : budget.exhausted ? "已耗尽" : "有剩余额度";
+  const trainingLabel = {
+    completed: "PPO 训练已完成", mock_completed: "仅 Mock 训练完成", compiled: "奖励已编译，未完成训练",
+    running: "PPO 训练中", pending: "训练尚未完成", failed: "PPO 训练失败",
+  }[result.training_status] || (result.checkpoint_available ? "策略已保存，PPO 结果待核对" : "尚无已确认策略");
+  const acceptanceLabel = {
+    passed: "联合验收已通过", mock_passed: "仅 Mock 验收", not_passed: "联合验收未通过",
+    pending: "联合验收待完成", unknown: "验收证据待核对",
+  }[result.acceptance_status] || "验收证据待核对";
+  const sourceLabel = {
+    training_execution: "训练执行快照", summary: "实验摘要", loop_status: "闭环快照",
+  }[budget.source] || "持久记录";
+  let notice = known
+    ? `冻结额度（已用/上限）：迭代 ${budget.used_iterations}/${budget.max_iterations} · 修订 ${budget.used_revisions}/${budget.max_revisions}；剩余 ${budget.remaining_iterations} 次迭代 / ${budget.remaining_revisions} 次修订。来源：${sourceLabel}。`
+    : "当前实验的冻结额度尚未确认；不会使用当前配置推算剩余预算或自动扩额。";
+  if (job.resume_block_reason && (job.status === "review" || budget.exhausted)) {
+    notice += ` ${job.resume_block_reason}`;
+  }
+  if (result.checkpoint_available) {
+    const version = Number.isInteger(result.trained_reward_version) ? ` v${result.trained_reward_version}` : "";
+    notice += ` 已保存策略${version}，预算耗尽不会删除已训练结果。`;
+  }
+  if (result.accepted) notice += " 已通过验收的策略仍可播放，不消耗训练额度。";
+  return { canResume, usage, budgetLabel, trainingLabel, acceptanceLabel, notice };
 }
 
 /** 用最新作业数据刷新进度仪表、阶段轨迹和急停能力。 */
@@ -282,7 +322,10 @@ function renderTelemetry(job) {
   elements.telemetryEmpty.classList.add("hidden");
   elements.telemetryContent.classList.remove("hidden");
   elements.runState.className = `run-state ${job.status}`;
-  elements.runState.innerHTML = `<i></i>${escapeHtml(jobStatusLabel(job.status))}`;
+  const resultView = trainingResultPresentation(job);
+  const runLabel = job.result_detail?.accepted ? "联合验收通过"
+    : job.status === "review" && job.budget_detail?.exhausted ? "预算耗尽 · 等待复核" : jobStatusLabel(job.status);
+  elements.runState.innerHTML = `<i></i>${escapeHtml(runLabel)}`;
   elements.progressRing.style.setProperty("--progress", Number(job.progress || 0));
   elements.progressValue.textContent = String(job.progress || 0);
   elements.stageLabel.textContent = job.stage_label || "准备训练";
@@ -291,13 +334,19 @@ function renderTelemetry(job) {
   elements.activeRobot.textContent = String(job.robot).toUpperCase();
   elements.activeMode.textContent = job.mode === "real" ? "真实训练" : "离线演练";
   const loop = job.loop_detail || {};
+  const rewardVersion = job.result_detail?.reward_version || loop.reward_version;
   elements.loopRound.textContent = loop.round
-    ? `第 ${loop.round} 轮 / v${loop.reward_version || 1}` : "尚未评估";
-  elements.loopBudget.textContent = Number.isFinite(Number(loop.remaining_iterations))
-    ? `${loop.remaining_iterations} iter · ${loop.remaining_revisions} 次修订` : "—";
+    ? `第 ${loop.round} 轮${rewardVersion ? ` / v${rewardVersion}` : ""}`
+    : rewardVersion ? `奖励 v${rewardVersion} · 尚未评估` : "尚未评估";
+  elements.loopBudget.textContent = resultView.usage;
+  elements.budgetStatus.textContent = resultView.budgetLabel;
+  elements.ppoStatus.textContent = resultView.trainingLabel;
+  elements.acceptanceStatus.textContent = resultView.acceptanceLabel;
+  elements.budgetNotice.textContent = resultView.notice;
+  elements.budgetNotice.classList.toggle("warning", !job.budget_detail?.valid || Boolean(job.budget_detail?.exhausted));
   elements.stopButton.disabled = !job.can_stop;
-  elements.resumeButton.disabled = !job.can_resume;
-  elements.resumeButton.classList.toggle("hidden", !job.can_resume);
+  elements.resumeButton.disabled = !resultView.canResume;
+  elements.resumeButton.classList.toggle("hidden", !resultView.canResume);
   const hasReviewReason = job.status === "review" && Boolean(job.review_reason);
   elements.reviewReason.textContent = hasReviewReason ? `复核原因：${job.review_reason}` : "";
   elements.reviewReason.classList.toggle("hidden", !hasReviewReason);
@@ -305,7 +354,9 @@ function renderTelemetry(job) {
   elements.launchButton.disabled = active;
   elements.launchButton.querySelector("span").textContent = active ? "训练任务运行中" : "下发训练任务";
   elements.stageTrack.querySelectorAll("[data-threshold]").forEach((stage) => {
-    stage.classList.toggle("done", Number(job.progress) >= Number(stage.dataset.threshold));
+    const acceptedStage = Number(stage.dataset.threshold) === 100;
+    stage.classList.toggle("done", acceptedStage ? Boolean(job.result_detail?.accepted)
+      : Number(job.progress) >= Number(stage.dataset.threshold));
   });
   renderFeasibility(job.feasibility || {});
   renderMemory(state.memory, job.memory_detail || {});
@@ -389,7 +440,7 @@ async function stopJob() {
 
 /** 从人工复核点恢复当前任务，复用既有策略、预算和已采集的评估数据。 */
 async function resumeJob() {
-  if (!state.currentJobId || !state.currentJob?.can_resume) return;
+  if (!state.currentJobId || !trainingResultPresentation(state.currentJob || {}).canResume) return;
   elements.resumeButton.disabled = true;
   try {
     const job = await api(`/api/jobs/${state.currentJobId}/resume`, {

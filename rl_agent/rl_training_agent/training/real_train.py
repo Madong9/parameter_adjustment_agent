@@ -16,6 +16,8 @@ from rl_training_agent.training.config_runtime import (
     install_runtime_terminations,
     prepare_training_env_config,
 )
+from rl_training_agent.training.contact_semantics import contact_audit_metadata
+from rl_training_agent.utils.io import write_json
 
 
 def _install_numpy_compatibility_aliases() -> None:
@@ -86,6 +88,8 @@ def main() -> int:
     original_command_ranges = copy.deepcopy(env.command_ranges)
     log_root = os.path.dirname(config_path)
     runner, _ = task_registry.make_alg_runner(env=env, args=gym_args, train_cfg=train_cfg, log_root=log_root)
+    # 记录实际解析的刚体和生效阈值；不采信奖励计划中的自然语言安全说明。
+    write_json(Path(runner.log_dir) / 'contact_audit.json', contact_audit_metadata(env))
     if args.resume_checkpoint:
         runner.load(args.resume_checkpoint)
     segments = curriculum_segments(data, args.max_iterations)

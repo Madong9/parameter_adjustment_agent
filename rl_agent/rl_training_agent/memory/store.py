@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -16,6 +17,11 @@ from ..schemas.agent_workflow import (
 )
 from ..utils.io import read_json, utc_now, write_json
 from ..utils.paths import relative_display
+from ..utils.paths import ensure_within
+from ..storage.locking import FileLock
+from .evidence_snapshot import SNAPSHOT_MANIFEST, file_sha256, safe_evidence_path
+from .reward_experience.schema import RewardExperience, RewardExperienceEvidence
+from .reward_experience.validator import RewardExperienceValidator
 
 
 class LongTermMemoryStore:
@@ -29,6 +35,72 @@ class LongTermMemoryStore:
         self.semantic_dir = self.root / "semantic"
         self.procedural_dir = self.root / "procedural"
         self.max_context_chars = max_context_chars
+
+    def _record_path(self, directory: Path, identifier: str) -> Path:
+        """校验记忆标识和写入边界，防止不可信历史 ID 产生路径跳转。"""
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", identifier):
+            raise ValueError("不安全的记忆标识")
+        path = safe_evidence_path(self.root, (directory / (identifier + ".json")).relative_to(self.root).as_posix())
+        ensure_within(path, directory)
+        return path
+
+    def evidence_valid(self, record: LongTermMemoryRecord) -> bool:
+        """复核不可变来源哈希与本地验收真值，缺失或损坏快照的记录不得注入。"""
+        if not record.evidence_snapshot_root or not record.evidence_snapshot_hashes:
+            return False
+        try:
+            if record.evidence_snapshot_root != "evidence/" + record.memory_id:
+                return False
+            snapshot = safe_evidence_path(self.root, record.evidence_snapshot_root)
+            hashes = record.evidence_snapshot_hashes
+            if SNAPSHOT_MANIFEST not in hashes or any(
+                    file_sha256(safe_evidence_path(snapshot, source)) != digest
+                    for source, digest in hashes.items()):
+                return False
+            manifest = read_json(snapshot / SNAPSHOT_MANIFEST)
+            if manifest.get("memory_id") != record.memory_id or manifest.get("hashes") != {
+                    key: value for key, value in hashes.items() if key != SNAPSHOT_MANIFEST}:
+                return False
+            task = read_json(snapshot / "task_spec.json")
+            if task.get("task_id") != record.task_id or task.get("robot") != record.robot:
+                return False
+            plan = read_json(safe_evidence_path(snapshot, "final/reward_plan.json"))
+            if plan.get("version") != record.reward_version or record.reward_terms != [{
+                    key: term[key] for key in ("name", "weight", "parameters", "active_phases") if key in term
+                    } for term in plan.get("terms", [])]:
+                return False
+            if record.reward_experience is not None:
+                experience = RewardExperience.parse_obj(record.reward_experience)
+                prefix = "memory/reward_experience/" + str(
+                    experience.task_context.get("training_result", {}).get("selected_experiment", ""))
+                evidence = RewardExperienceEvidence.parse_obj(read_json(
+                    safe_evidence_path(snapshot, prefix + "/evidence.json")))
+                validation = read_json(safe_evidence_path(snapshot, prefix + "/validation.json"))
+                saved = RewardExperience.parse_obj(read_json(safe_evidence_path(snapshot, prefix + "/experience.json")))
+                if validation.get("valid") is not True or saved.dict() != experience.dict():
+                    return False
+                RewardExperienceValidator().validate(
+                    experience, evidence, snapshot,
+                    checkpoint_provenance=manifest.get("checkpoint_provenance", {}))
+                training = evidence.training_result
+                if (record.outcome != ("completed" if experience.outcome == "SUCCESS" else "verified_failure") or
+                        record.final_state != training.get("state") or
+                        record.seed_count != len(set(training.get("seeds", [])))):
+                    return False
+            else:
+                evaluation_sources = [source for source in hashes if source.endswith("/evaluation.json")]
+                if len(evaluation_sources) != 1:
+                    return False
+                evaluation = read_json(safe_evidence_path(snapshot, evaluation_sources[0]))
+                if record.outcome == "completed":
+                    if not all(evaluation.get(field) is True for field in (
+                            "completed", "hard_constraints_passed", "task_metrics_passed", "visual_alignment_passed")):
+                        return False
+                elif record.outcome != "verified_failure" or evaluation.get("completed") is not False or not evaluation.get("violations"):
+                    return False
+            return True
+        except (OSError, ValueError, TypeError, AttributeError, KeyError):
+            return False
 
     @staticmethod
     def _parse_time(value: Optional[str]) -> datetime:
@@ -46,7 +118,12 @@ class LongTermMemoryStore:
             return values
         for path in sorted(self.records_dir.glob("*.json")):
             try:
+                if path.is_symlink():
+                    continue
+                ensure_within(path, self.root)
                 record = LongTermMemoryRecord.parse_obj(read_json(path))
+                if self._record_path(self.records_dir, record.memory_id) != path:
+                    continue
                 if not active_only or record.status == "active":
                     values.append(record)
             except (OSError, ValueError, json.JSONDecodeError):
@@ -60,7 +137,12 @@ class LongTermMemoryStore:
             return values
         for path in sorted(self.semantic_dir.glob("*.json")):
             try:
+                if path.is_symlink():
+                    continue
+                ensure_within(path, self.root)
                 record = SemanticMemoryRecord.parse_obj(read_json(path))
+                if self._record_path(self.semantic_dir, record.semantic_id) != path:
+                    continue
                 if not active_only or record.status == "active":
                     values.append(record)
             except (OSError, ValueError, json.JSONDecodeError):
@@ -69,13 +151,13 @@ class LongTermMemoryStore:
 
     def promote(self, record: LongTermMemoryRecord) -> Path:
         """原子保存已通过晋升门控的情景记忆。"""
-        path = self.records_dir / (record.memory_id + ".json")
+        path = self._record_path(self.records_dir, record.memory_id)
         write_json(path, record)
         return path
 
     def save_semantic(self, record: SemanticMemoryRecord) -> Path:
         """保存候选或活跃语义规律，不覆盖其证据关系。"""
-        path = self.semantic_dir / (record.semantic_id + ".json")
+        path = self._record_path(self.semantic_dir, record.semantic_id)
         write_json(path, record)
         return path
 
@@ -87,21 +169,42 @@ class LongTermMemoryStore:
 
     def save_procedural(self, record: ProceduralMemoryRecord) -> Path:
         """保存当前程序记忆，同时按版本保留不可变快照。"""
-        version_path = self.procedural_dir / (record.procedure_id + ".json")
-        if version_path.is_file():
-            immutable = ProceduralMemoryRecord.parse_obj(read_json(version_path))
-            record.created_at = immutable.created_at
-        else:
-            write_json(version_path, record)
-        write_json(self.procedural_dir / "current.json", record)
+        version_path = self._record_path(self.procedural_dir, record.procedure_id)
+        with FileLock(self.root / ".procedure.lock"):
+            if version_path.is_file():
+                immutable = ProceduralMemoryRecord.parse_obj(read_json(version_path))
+                ignored = {"created_at", "updated_at"}
+                if immutable.dict(exclude=ignored) != record.dict(exclude=ignored):
+                    raise ValueError("同一程序快照 ID 不能覆盖不同执行规则")
+                record.created_at = immutable.created_at
+            else:
+                write_json(version_path, record)
+            write_json(self._record_path(self.procedural_dir, "current"), record)
         return version_path
 
     def retrieve(self, query: str, robot: str, top_k: int = 4,
-                 exclude_task_id: Optional[str] = None) -> Dict[str, Any]:
-        """联合检索活跃情景与语义记忆，并应用可信度和时间衰减。"""
-        episodic = [record for record in self.records(active_only=True)
-                    if not exclude_task_id or record.task_id != exclude_task_id]
-        semantic = self.semantic_records(active_only=True)
+                 exclude_task_id: Optional[str] = None,
+                 environment_version: Optional[str] = None,
+                 reward_registry_version: Optional[str] = None) -> Dict[str, Any]:
+        """先硬过滤机器人、环境与奖励版本，再应用相关性、可信度和时间衰减。"""
+        def compatible(record: Any) -> bool:
+            """指定版本时拒绝未知或不同版本，不让提示词代替确定性兼容判断。"""
+            return ((environment_version is None or record.environment_version == environment_version) and
+                    (reward_registry_version is None or record.reward_registry_version == reward_registry_version))
+
+        all_records = self.records()
+        trusted = {record.memory_id: record for record in all_records if self.evidence_valid(record)}
+        episodic = [record for record in all_records
+                    if record.status == "active" and record.memory_id in trusted and
+                    record.robot == robot and compatible(record) and
+                    (not exclude_task_id or record.task_id != exclude_task_id)]
+        semantic = [record for record in self.semantic_records(active_only=True)
+                    if (not record.robot_scope or robot in record.robot_scope) and compatible(record) and
+                    record.supporting_memory_ids and all(
+                        identifier in trusted and
+                        trusted[identifier].environment_version == record.environment_version and
+                        trusted[identifier].reward_registry_version == record.reward_registry_version
+                        for identifier in record.supporting_memory_ids)]
         objects: List[Tuple[str, Any, str]] = []
         for record in episodic:
             text = " ".join([
@@ -166,6 +269,10 @@ class LongTermMemoryStore:
             "query": query,
             "records": len(episodic),
             "semantic_rules": len(semantic),
+            "unverified_records": sum(record.status == "active" and record.memory_id not in trusted
+                                      for record in all_records),
+            "compatibility": {"robot": robot, "environment_version": environment_version,
+                              "reward_registry_version": reward_registry_version},
             "hits": hits,
         }
 
@@ -223,6 +330,7 @@ class LongTermMemoryStore:
             "normalized_goal": record.normalized_goal, "outcome": record.outcome,
             "lessons": record.lessons, "failure_pattern": record.failure_pattern,
             "reward_experience": compact_experience,
+            "evidence_snapshot_root": getattr(record, "evidence_snapshot_root", ""),
             "confidence": record.confidence,
         }
 
@@ -258,16 +366,20 @@ class LongTermMemoryStore:
         """返回上位机可展示的四层记忆统计。"""
         records = self.records()
         semantic = self.semantic_records()
+        trusted = {record.memory_id for record in records if self.evidence_valid(record)}
+        active = [record for record in records if record.status == "active" and record.memory_id in trusted]
+        trusted_semantic = [record for record in semantic if record.status == "active" and
+                           record.supporting_memory_ids and set(record.supporting_memory_ids).issubset(trusted)]
         current = self.procedural_dir / "current.json"
         return {
             "root": relative_display(self.root, self.agent_root),
-            "records": sum(record.status == "active" for record in records),
-            "episodic_active": sum(record.status == "active" for record in records),
+            "records": len(active),
+            "episodic_active": len(active),
+            "episodic_quarantined": sum(record.status == "active" and record.memory_id not in trusted for record in records),
             "episodic_archived": sum(record.status == "archived" for record in records),
-            "completed": sum(record.outcome == "completed" and record.status == "active" for record in records),
-            "verified_failures": sum(record.outcome == "verified_failure" and record.status == "active"
-                                     for record in records),
-            "semantic_active": sum(record.status == "active" for record in semantic),
+            "completed": sum(record.outcome == "completed" for record in active),
+            "verified_failures": sum(record.outcome == "verified_failure" for record in active),
+            "semantic_active": len(trusted_semantic),
             "semantic_candidates": sum(record.status == "candidate" for record in semantic),
             "procedural_snapshot": relative_display(current, self.agent_root) if current.is_file() else None,
         }

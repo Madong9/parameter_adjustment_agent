@@ -8,6 +8,8 @@
 
 不要预先为任意动态动作指定一套起跳—滚转—恢复配方。仅有 roll_rotation 角速度信号时，不得声称 final_roll_angle 净滚转目标已经被覆盖。LOCAL_METRIC_REWARD_SIGNALS 中空列表明确表示当前缺少已登记的目标训练信号，按共享规则报告 [CAPABILITY_GAP]。
 
+TASK_INTENT_SPEC 的动作与禁止行为必须完整保留。地面侧滚不得改写为腾空侧空翻，腾空侧翻也不得用贴地翻身替代。若计划机体接触与现有全非足端禁触合同冲突，报告能力/接触合同缺口；不得为了生成可训练候选而删除硬约束或偷偷添加其他动作阶段。
+
 只返回符合 OUTPUT_JSON_SCHEMA 的严格 JSON，不返回 Markdown 或 JSON 外说明。
 
 当前本地前/后腿支撑审查要求在清单支持时同时列出对应的 front_leg_stand/front_leg_walk 或 rear_leg_stand/rear_leg_walk。仅要求站立时不要因此增加行走验收或非零行走命令，按动作目标设置有效权重；不能用水平 orientation 与倒立目标对抗。

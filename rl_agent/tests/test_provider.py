@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from rl_training_agent.providers.errors import ProviderError, ProviderNeedsHuman, ProviderResponseError, ProviderTimeout
 from rl_training_agent.providers.fallback import FallbackProvider
 from rl_training_agent.providers.opencli_chatgpt import OpenCLIChatGPTWebProvider, _compact_capabilities
+from rl_training_agent.providers.chatgpt_dom import CHATGPT_ACCESS_STATE_SCRIPT
 from rl_training_agent.providers.opencli_doubao import OpenCLIDoubaoWebProvider
 from rl_training_agent.schemas.experiments import ConversationHandle
 from rl_training_agent.settings import OpenCLISettings, _load_local_env_file
@@ -80,10 +81,14 @@ def test_doctor_timeout_returns_unhealthy_result(monkeypatch):
     assert any("登录状态检查失败" in item for item in health.details)
 
 
-@pytest.mark.parametrize("state", ["Log in to ChatGPT", "Verify you are human CAPTCHA"])
-def test_login_and_captcha_states(state):
-    """验证“login and captcha states”场景的预期行为。"""
-    provider = OpenCLIChatGPTWebProvider(runner=lambda args, timeout: result(state))
+@pytest.mark.parametrize("field", ["login_required", "challenge_required"])
+def test_login_and_captcha_states(field):
+    """真正登录表单或验证码控件才暂停，正文文字不作为证据。"""
+    @chatgpt_page
+    def runner(args, timeout):
+        """返回站点控件探针，保留正常地址验证。"""
+        return result(json.dumps({"probe_version": "chatgpt-access-v1", field: True}))
+    provider = OpenCLIChatGPTWebProvider(runner=runner)
     with pytest.raises(ProviderNeedsHuman):
         provider._state()
 
@@ -95,15 +100,24 @@ def test_login_and_captcha_states(state):
 ])
 def test_usage_limit_state_returns_actionable_error(state):
     """验证 ChatGPT 额度耗尽时立即返回明确提示而不是等待发送或解析超时。"""
-    provider = OpenCLIChatGPTWebProvider(runner=lambda args, timeout: result(state))
+    @chatgpt_page
+    def runner(args, timeout):
+        """仅将提示作为站点额度控件，不模拟整页正文。"""
+        return result(json.dumps({"probe_version": "chatgpt-access-v1", "usage_notice": state}))
+    provider = OpenCLIChatGPTWebProvider(runner=runner)
     with pytest.raises(ProviderNeedsHuman, match="工作用量已耗尽"):
         provider._state()
 
 
 def test_usage_limit_response_is_not_treated_as_invalid_json(monkeypatch):
-    """验证模型用量提示在回复轮询阶段被识别为额度问题。"""
+    """验证轮询时站点额度提示触发暂停，不能从助手文本推断额度耗尽。"""
     provider = OpenCLIChatGPTWebProvider(settings=OpenCLISettings(response_timeout=1))
-    monkeypatch.setattr(provider, "_state", lambda: "ready")
+    @chatgpt_page
+    def runner(args, timeout):
+        """模拟可见额度弹窗。"""
+        return result(json.dumps({"probe_version": "chatgpt-access-v1",
+                                  "usage_notice": "你已达到使用上限，请添加额度。"}))
+    provider.runner = runner
     monkeypatch.setattr(provider, "_latest_assistant", lambda: "你已达到使用上限，请添加额度。")
     with pytest.raises(ProviderNeedsHuman, match="工作用量已耗尽"):
         provider._wait_for_response("")
@@ -517,7 +531,8 @@ def test_send_button_detects_usage_limit_from_full_page_before_click(monkeypatch
         """模拟页面正文显示额度为零，同时记录是否错误执行了点击。"""
         calls.append(args)
         if "eval" in args:
-            return result(json.dumps("你暂时已用完工作用量，可用额度：0"))
+            return result(json.dumps({"probe_version": "chatgpt-access-v1",
+                                      "usage_notice": "你暂时已用完工作用量，可用额度：0"}))
         return result("{}")
 
     provider = OpenCLIChatGPTWebProvider(runner=runner)
@@ -975,6 +990,11 @@ def test_model_request_uses_completed_dom_response_before_repair(monkeypatch):
     monkeypatch.setattr(provider, "new_conversation", lambda title: conversation)
     monkeypatch.setattr(provider, "_send_model_prompt",
                         lambda *args: sends.append(args) or "{")
+    provider._confirmed_user_id = "current-user"
+    provider._last_message_snapshot = {
+        "latest_user_id": "current-user", "assistant_user_id": "current-user",
+        "latest_assistant_id": "current-assistant", "generating": False,
+    }
     monkeypatch.setattr(provider, "_latest_assistant", lambda: '{"ok":true}')
     assert provider._request_model("first", Reply, "stream").ok
     assert len(sends) == 1

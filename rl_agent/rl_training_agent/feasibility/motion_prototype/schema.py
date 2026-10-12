@@ -18,6 +18,7 @@ class MotionType(str, Enum):
     MANIPULATION = "MANIPULATION"
     BALANCE = "BALANCE"
     ACROBATIC = "ACROBATIC"
+    GROUND_ROLL = "GROUND_ROLL"
     UNKNOWN = "UNKNOWN"
 
 

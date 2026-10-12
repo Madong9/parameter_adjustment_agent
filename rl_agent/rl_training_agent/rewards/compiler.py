@@ -9,8 +9,7 @@ from ..environment.capability_manifest import CapabilityManifest
 from ..schemas.rewards import RewardPlan
 from ..utils.io import atomic_write_text, sha256_text, utc_now, write_json
 from .validator import RewardPlanValidator
-from ..training.contact_semantics import (CONTACT_SEMANTICS_VERSION, COLLISION_FORCE_THRESHOLD,
-                                          BODY_TERMINATION_FORCE_THRESHOLD)
+from ..training.contact_semantics import contact_contract
 
 
 class RewardCompiler:
@@ -19,9 +18,14 @@ class RewardCompiler:
         self.manifest = manifest
         self.validator = RewardPlanValidator(manifest.rewards, max_abs_weight)
 
-    def compile(self, plan: RewardPlan, output_dir: Path) -> Dict[str, Any]:
+    def compile(self, plan: RewardPlan, output_dir: Path, task=None) -> Dict[str, Any]:
         """校验奖励计划并生成独立配置、差异和哈希。"""
         self.validator.validate(plan)
+        if task is not None:
+            from .validator import validate_contact_contract
+            validate_contact_contract(task, plan)
+        constraints = [item.dict() for item in task.safety_constraints] if task is not None else []
+        contacts = contact_contract(constraints, plan.terminations)
         output_dir.mkdir(parents=True, exist_ok=True)
         defaults = {item.name: item.default_weight for item in self.manifest.rewards}
         scales = {term.name: term.weight for term in plan.terms}
@@ -40,9 +44,8 @@ class RewardCompiler:
             "success_metrics": [item.dict() for item in plan.success_metrics],
             "objective_links": [item.dict() for item in plan.objective_links],
             "behavior_links": [item.dict() for item in plan.behavior_links],
-            "contact_semantics": {"version": CONTACT_SEMANTICS_VERSION,
-                                  "collision_force_threshold_n": COLLISION_FORCE_THRESHOLD,
-                                  "body_termination_force_threshold_n": BODY_TERMINATION_FORCE_THRESHOLD},
+            "safety_constraints": constraints,
+            "contact_semantics": contacts,
         }
         canonical = json.dumps(compiled, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         config_path = output_dir / "config.yaml"

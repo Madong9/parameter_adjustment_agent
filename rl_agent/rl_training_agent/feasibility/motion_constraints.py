@@ -154,6 +154,16 @@ class MotionConstraintCompiler:
             assumptions.extend(prototype.notes)
             required = ["gait", "contact_schedule", "base_pose", "end_effector"]
             duration = prototype.duration
+        elif kind == MotionType.GROUND_ROLL:
+            duration = cls._duration(intent, 5.0)
+            phases = [MotionConstraintPhase(
+                name="ground_roll_requires_contact_contract", start=0.0, end=duration,
+                goals={"semantic_goal": intent.normalized_goal},
+                constraints=["planned_body_contacts_require_explicit_approval",
+                             "no_automatic_airborne_requirement"],
+            )]
+            required = ["com", "contact_schedule", "base_pose", "end_effector"]
+            assumptions.append("地面侧滚尚无经过验证的机体接触轨迹与求解器；不得用空翻模板代替。")
         elif kind in (MotionType.JUMP, MotionType.ACROBATIC):
             prototype = TrajectoryPrototypeGenerator.generate(intent, kind)
             phases = [

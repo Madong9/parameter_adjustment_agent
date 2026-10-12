@@ -165,12 +165,13 @@ def test_long_visual_analysis_has_bounded_request_scoped_wait(monkeypatch, activ
 
 
 @pytest.mark.parametrize("check,blocked", [
-    ({"blocked": False, "ready": True}, False),
-    ({"blocked": True, "ready": True}, True),
-    ({"blocked": False, "ready": False}, True),
-    (None, True),
+    ({"probe_version": "doubao-access-v1", "challenge_required": False, "composer_found": True}, False),
+    ({"probe_version": "doubao-access-v1", "challenge_required": True, "composer_found": True}, True),
+    ({"probe_version": "doubao-access-v1", "challenge_required": False, "composer_found": False}, False),
+    (None, False),
 ])
 def test_doubao_verification_requires_visible_challenge(monkeypatch, check, blocked):
+    """实际验证码控件才暂停；输入框缺失或探针未知不等于验证码阻断。"""
     import json
     from rl_training_agent.providers.errors import ProviderNeedsHuman
     provider = OpenCLIDoubaoWebProvider()

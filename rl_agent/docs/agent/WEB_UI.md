@@ -45,14 +45,14 @@ python -m rl_training_agent ui --host 127.0.0.1 --port 9000
 
 ### 真实训练
 
-真实训练默认使用多 Agent Provider：GPT/OpenCLI 理解动作并完成视觉评价，百炼 GLM 生成奖励和训练诊断，然后进入 Unitree GPU 仿真训练流程。使用前应完成以下检查：
+真实训练默认使用多 Agent Provider：GPT/OpenCLI 完成动作理解、奖励设计、视觉评价、诊断与经验总结；仅任务理解与视觉角色按配置回退豆包。使用前应完成以下检查：
 
 ```bash
 python -m rl_training_agent doctor
 python -m rl_training_agent opencli-test
 ```
 
-还必须在启动上位机的同一终端设置 `DASHSCOPE_API_KEY`；使用百炼业务空间专属域名时，同时设置 `DASHSCOPE_BASE_URL`。密钥不会写入作业日志。
+默认无需 `DASHSCOPE_API_KEY`。只有显式使用百炼角色时才需要本地 `.env` 或环境变量；密钥不得写入作业日志。
 
 上位机不接受来自浏览器的任意命令、Provider 名称或文件路径。后端只根据经过白名单校验的机型和模式构造固定 CLI 参数数组，并以 `shell=False` 启动训练。
 

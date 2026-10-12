@@ -51,6 +51,6 @@ RAG 使用无需外部服务的中文 BM25 索引。索引范围由白名单控�
 
 训练终态仍由本地数值、硬安全约束和视觉结果决定。终态之后的经验归纳只是记忆整理：LLM 只能写带 evidence ID 的事实、假设和局部模式；初始/最终奖励、reward diff、指标和结局均由 Python 从产物计算。Validator 会复核源文件 hash、真实 reward_plan、数值/视觉评价和任务身份；Provider 故障、训练中断或证据不足记为 `INCONCLUSIVE`，不进入长期 Memory。详细 Schema 和文件布局见 [`REWARD_EXPERIENCE.md`](REWARD_EXPERIENCE.md)。
 
-生产角色由 `MultiAgentProvider` 路由：`opencli-doubao` 用 `FallbackProvider` 包装 `OpenCLIChatGPTWebProvider` 与 `OpenCLIDoubaoWebProvider`，承担任务理解和多模态视觉评价；ChatGPT 每次新会话都强制使用“聊天”，豆包强制使用“对话”。`BailianGLMProvider` 承担奖励设计和训练诊断。`MockLLMReasoningProvider` 只有在显式选择时才可使用，主要服务于测试和 dry-run。兼容命令仍可显式选择单一 `opencli` 或 `doubao` Provider。
+生产角色由 `MultiAgentProvider` 和 `ProviderRegistry` 按配置路由：默认任务理解与视觉评价使用 `opencli-doubao`，奖励设计、诊断、修订与经验总结使用 `opencli`。ChatGPT 强制使用“聊天”，豆包使用“对话”。百炼仅是显式配置的可选角色 Provider；Mock 只用于离线测试。同一浏览器 profile 的完整请求跨进程串行化，同一任务的训练与恢复互斥。
 
 独立视觉评论不会接收 RAG 奖励经验，只读取任务规格和同步视觉证据。这样可以避免视觉裁判因为知道奖励设计而产生确认偏差。RAG 失效时采用失败开放策略：记录错误后继续使用当前任务证据，不会因为索引损坏阻断训练主链路。

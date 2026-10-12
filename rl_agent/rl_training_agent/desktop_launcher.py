@@ -42,12 +42,7 @@ def build_browser_command(executable: str, url: str, profile_dir: Path) -> List[
 
 def stop_active_jobs(manager: JobManager) -> None:
     """在桌面窗口关闭时安全停止仍由本次上位机控制的训练作业。"""
-    for job in manager.list_jobs():
-        if job.get("can_stop"):
-            try:
-                manager.stop_job(job["job_id"])
-            except (KeyError, ValueError):
-                continue
+    manager.shutdown()
 
 
 def serve_desktop() -> int:
@@ -82,4 +77,3 @@ def serve_desktop() -> int:
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=3)
-
