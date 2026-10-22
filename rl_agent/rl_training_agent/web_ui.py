@@ -53,7 +53,7 @@ STATE_PRESENTATION: Dict[str, Tuple[int, str]] = {
     "RAG_RETRIEVING": (19, "检索训练经验"),
     "CONTEXT_BUILDING": (20, "构建任务上下文"),
     "PROMPT_COMPILING": (21, "编译奖励提示词"),
-    "REWARD_DESIGNING": (22, "GLM 设计奖励"),
+    "REWARD_DESIGNING": (22, "设计奖励"),
     "REWARD_REVIEWING": (24, "审查奖励风险"),
     "TASK_DESIGNED": (23, "完成任务设计"),
     "REWARD_CANDIDATES_CREATED": (25, "生成奖励候选"),
@@ -72,9 +72,9 @@ STATE_PRESENTATION: Dict[str, Tuple[int, str]] = {
     "REVISE_CURRICULUM": (42, "修订课程策略"),
     "ROLLBACK": (40, "回滚候选方案"),
     "RESTART": (40, "重新开始训练"),
-    "HUMAN_REVIEW": (100, "等待人工复核"),
+    "HUMAN_REVIEW": (0, "等待人工复核"),
     "COMPLETED": (100, "训练完成"),
-    "FAILED": (100, "训练失败"),
+    "FAILED": (0, "训练失败"),
 }
 
 TRAINING_STAGE_RANGES = {
@@ -104,10 +104,68 @@ def _parse_time(value: str) -> datetime:
         return datetime.min.replace(tzinfo=timezone.utc)
 
 
-def state_presentation(state: str) -> Dict[str, Any]:
-    """把内部状态映射为界面使用的进度和中文阶段名。"""
+def current_run_history(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """从最新运行边界开始展示历史，防止同任务的旧训练污染新作业。"""
+    for index in range(len(history) - 1, -1, -1):
+        if history[index].get("state") == "RECEIVED" and history[index].get("reason") == "new_run":
+            return history[index:]
+    return history
+
+
+def last_working_state(state: str, history: List[Dict[str, Any]]) -> str:
+    """找到本次运行实际到达的工作阶段，终止状态不代表流程完成。"""
+    if state not in ("HUMAN_REVIEW", "FAILED", "COMPLETED", "PENDING"):
+        return state
+    for entry in reversed(current_run_history(history)):
+        value = entry.get("state")
+        if value in STATE_PRESENTATION and value not in ("HUMAN_REVIEW", "FAILED", "COMPLETED"):
+            return value
+    return "PENDING"
+
+
+def state_presentation(state: str, history: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """把阶段映射为流程进度；人工复核或失败保持实际阶段，不显示完成。"""
     progress, label = STATE_PRESENTATION.get(state, (0, "准备训练"))
+    if state in ("HUMAN_REVIEW", "FAILED"):
+        active = last_working_state(state, history or [])
+        progress, active_label = STATE_PRESENTATION.get(active, (0, ""))
+        if active_label:
+            label += " · " + active_label
     return {"state": state or "PENDING", "progress": progress, "stage_label": label}
+
+
+def stage_track_presentation(state: str, history: List[Dict[str, Any]], accepted: bool) -> Dict[str, str]:
+    """根据本次状态历史标注已完成、当前、阻塞和未执行步骤，不依赖百分比。"""
+    groups = {
+        "environment": {"RECEIVED", "ENVIRONMENT_INSPECTED"},
+        "intent": {"TASK_UNDERSTANDING", "TASK_FEASIBILITY_CHECK", "MOTION_PROTOTYPE_GENERATING",
+                   "STATIC_MOTION_VALIDATION", "DYNAMIC_MOTION_VALIDATION"},
+        "reward": {"RAG_RETRIEVING", "CONTEXT_BUILDING", "PROMPT_COMPILING", "REWARD_DESIGNING",
+                   "TASK_DESIGNED", "REWARD_REVIEWING", "REWARD_CANDIDATES_CREATED", "CONFIGS_COMPILED", "VALIDATED"},
+        "smoke": {"SMOKE_TRAINING", "CANDIDATE_SCREENING"},
+        "full": {"FULL_TRAINING", "CONTINUE_TRAINING", "REVISE_REWARD", "REVISE_CURRICULUM", "ROLLBACK", "RESTART"},
+        "visual": {"ROLLOUT_COLLECTING", "VISUAL_EVALUATING"},
+        "acceptance": {"NUMERIC_EVALUATING", "DIAGNOSING", "MEMORY_CURATING"},
+    }
+    completion = {
+        "environment": {"TASK_UNDERSTANDING"},
+        "intent": {"RAG_RETRIEVING", "CONTEXT_BUILDING"},
+        "reward": {"VALIDATED", "SMOKE_TRAINING"},
+        "smoke": {"FULL_TRAINING"},
+        "full": {"ROLLOUT_COLLECTING"},
+        "visual": {"NUMERIC_EVALUATING"},
+        "acceptance": set(),
+    }
+    reached = {entry.get("state") for entry in current_run_history(history)} | {state}
+    active = last_working_state(state, history)
+    blocked = state in ("HUMAN_REVIEW", "FAILED")
+    result = {name: "done" if reached & completion[name] else "pending" for name in groups}
+    for name, states in groups.items():
+        if (active in states and state not in ("COMPLETED", "PENDING") and
+                not (name == "reward" and active == "VALIDATED")):
+            result[name] = "blocked" if blocked else "active"
+    result["acceptance"] = "done" if accepted else result["acceptance"]
+    return result
 
 
 def interpret_job_outcome(state: str, return_code: int, history: List[Dict[str, Any]]) -> Tuple[str, str]:
@@ -117,7 +175,7 @@ def interpret_job_outcome(state: str, return_code: int, history: List[Dict[str, 
     if state == "COMPLETED":
         return "completed", "训练及验收均已完成"
     if state == "HUMAN_REVIEW":
-        entered_training = any(item.get("state") in TRAINING_STAGE_RANGES for item in history)
+        entered_training = any(item.get("state") in TRAINING_STAGE_RANGES for item in current_run_history(history))
         message = "训练未通过最终验收，等待人工复核" if entered_training else "训练尚未开始，任务设计等待人工复核"
         return "review", message
     if state and state != "PENDING":
@@ -602,6 +660,7 @@ class JobManager:
             return {"state": "PENDING", "updated_at": None, "history": []}
         if _parse_time(str(state.get("updated_at", ""))) < _parse_time(job["started_at"]):
             return {"state": "PENDING", "updated_at": None, "history": []}
+        state["history"] = current_run_history(state.get("history", []))
         return state
 
     def _training_progress_for_job(self, job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -738,6 +797,13 @@ class JobManager:
             if parsed is not None:
                 sources.append((name, parsed))
         if not sources:
+            if state.get("history") and last_working_state(str(state.get("state", "PENDING")), state["history"]) in {
+                    "RECEIVED", "ENVIRONMENT_INSPECTED", "TASK_UNDERSTANDING", "TASK_FEASIBILITY_CHECK",
+                    "MOTION_PROTOTYPE_GENERATING", "STATIC_MOTION_VALIDATION", "DYNAMIC_MOTION_VALIDATION",
+                    "RAG_RETRIEVING", "CONTEXT_BUILDING", "PROMPT_COMPILING", "REWARD_DESIGNING",
+                    "TASK_DESIGNED", "REWARD_REVIEWING"}:
+                return dict(unknown, status="not_started",
+                            resume_block_reason="本次训练尚未开始，预算尚未冻结；请先处理任务阻塞原因")
             return unknown
         # 历史摘要可比执行快照更旧：已用取最大、上限取最小，绝不显示退款或扩额。
         budget = dict(sources[0][1])
@@ -807,6 +873,11 @@ class JobManager:
             acceptance_status = "pending"
         else:
             acceptance_status = "unknown"
+        if (state.get("history") and not candidate and not checkpoint_available and
+                not any(entry.get("state") in TRAINING_STAGE_RANGES or entry.get("state") in {
+                    "ROLLOUT_COLLECTING", "VISUAL_EVALUATING", "NUMERIC_EVALUATING", "DIAGNOSING", "MEMORY_CURATING"}
+                    for entry in state["history"])):
+            training_status = acceptance_status = "not_started"
         return {"reward_version": version, "trained_reward_version": manifest.get("reward_version"),
                 "selected_experiment": candidate, "training_status": training_status,
                 "ppo_completed": training_status == "completed", "checkpoint_available": checkpoint_available,
@@ -894,12 +965,17 @@ class JobManager:
             # 动态纠正旧版本仅按退出码保存为 completed 的历史作业。
             job["status"], job["message"] = interpret_job_outcome(
                 str(state.get("state")), int(job.get("return_code") or 0), state.get("history", []))
-        presentation = state_presentation(str(state.get("state", "PENDING")))
+        presentation = state_presentation(str(state.get("state", "PENDING")), state.get("history", []))
+        if job["status"] == "failed" and presentation["state"] not in ("FAILED", "HUMAN_REVIEW", "COMPLETED"):
+            # 旧进程可能在写入终态前退出；展示阻塞的实际阶段，不改写历史记录。
+            presentation = state_presentation("FAILED", state.get("history", []))
         training_detail = self._training_progress_for_job(job)
         loop_detail = self._loop_status_for_job(job)
-        if training_detail and presentation["state"] in TRAINING_STAGE_RANGES:
+        working_state = last_working_state(presentation["state"], state.get("history", []))
+        if (training_detail and presentation["state"] != "COMPLETED" and
+                working_state in TRAINING_STAGE_RANGES):
             presentation["progress"] = training_stage_progress(
-                presentation["state"], training_detail, state.get("context", {}),
+                working_state, training_detail, state.get("context", {}),
                 self.settings.evaluation_seeds)
             presentation["stage_label"] = "{} · {} · {}/{}".format(
                 presentation["stage_label"], training_detail.get("run_name", "训练进程"),
@@ -923,6 +999,8 @@ class JobManager:
         job["loop_detail"] = loop_detail
         job["budget_detail"] = self._budget_for_job(job, state)
         job["result_detail"] = self._result_for_job(job, state, loop_detail)
+        job["stage_detail"] = stage_track_presentation(
+            presentation["state"], state.get("history", []), job["result_detail"]["accepted"])
         job["can_stop"] = job["status"] in ("running", "stopping") and job_id in self._processes
         job["can_resume"] = self._can_resume_job(job, state, job["budget_detail"])
         job["resume_block_reason"] = job["budget_detail"]["resume_block_reason"]

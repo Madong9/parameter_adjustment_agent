@@ -90,6 +90,14 @@ class MultiAgentProvider:
         """将失败后的完整奖励重设计交给奖励角色，独立于原因分析请求。"""
         return self.reward_agent.redesign_rewards(payload)
 
+    def repair_reward_plans(self, payload: Dict[str, Any]) -> Any:
+        """仅由奖励角色修复指定字段。"""
+        from .errors import ProviderError
+        repair = getattr(self.reward_agent, 'repair_reward_plans', None)
+        if not callable(repair):
+            raise ProviderError('当前奖励 Provider 不支持局部补丁修复')
+        return repair(payload)
+
     def summarize_reward_experience(self, payload: Dict[str, Any]) -> Any:
         """由诊断 Provider 承担经验文字归纳，保留单一配置来源。"""
         return self.diagnosis_agent.summarize_reward_experience(payload)

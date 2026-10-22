@@ -35,10 +35,22 @@ def test_initial_design_is_deterministic_and_has_generic_shared_policy():
     first = compiler.compile(intent, {'environment_manifest': {'rewards': []}}, 3)
     second = compiler.compile(intent, {'environment_manifest': {'rewards': []}}, 3)
     assert first == second
-    assert first['version'] == 'reward-design-v6'
+    assert first['version'] == 'reward-design-v12'
     for text in ('objective_links', 'behavior_links', '[CAPABILITY_GAP]', 'CANDIDATE_COUNT: 3',
                  '训练迭代课程', '反例', 'torque_limits', '固定动作语义与验收合同'):
         assert text in first['prompt']
+
+
+def test_front_flip_policy_requires_complete_executable_candidate():
+    """前翻明确对应关系、全程学习门控和参数位置，不把验收指标误认成缺奖励实现。"""
+    from rl_training_agent.rewards.front_flip_baseline import FRONT_FLIP_OBJECTIVES, FRONT_FLIP_WEIGHTS
+    contract = section(render_reward_policy(), 'RUNTIME_REWARD_POLICY')['front_flip_contract']
+    assert contract['objective_reward_terms'] == FRONT_FLIP_OBJECTIVES
+    assert contract['baseline_weights'] == FRONT_FLIP_WEIGHTS
+    assert contract['active_phases'] == ['all']
+    assert 'terms.parameters' in contract['parameter_location']
+    assert '不要放在 curriculum.parameter_changes' in contract['parameter_location']
+    assert '每个候选' in contract['execution_gating']
 
 
 def test_legacy_and_failure_redesign_use_same_policy_without_browser(monkeypatch):

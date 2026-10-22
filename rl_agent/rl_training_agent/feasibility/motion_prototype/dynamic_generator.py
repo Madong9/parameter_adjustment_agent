@@ -5,7 +5,8 @@ import re
 from typing import Optional, Tuple
 
 from ...schemas.agent_workflow import TaskIntentSpec
-from ...utils.task_semantics import RollMotionKind, classify_roll_motion, _positive_motion_text
+from ...utils.task_semantics import (ForwardFlipKind, RollMotionKind, classify_forward_flip,
+                                     classify_roll_motion, _positive_motion_text)
 from .schema import (DynamicMotionPhase, DynamicMotionPrototype, GaitPattern,
                      GaitType, MotionType, VelocityTrajectory, FootTrajectory)
 
@@ -20,6 +21,13 @@ class DynamicMotionPrototypeGenerator:
     @classmethod
     def classify(cls, intent: TaskIntentSpec) -> MotionType:
         """按动作语义规则分类；未知文本不会被猜成可验证动态动作。"""
+        forward = classify_forward_flip(intent.original_instruction)
+        if forward == ForwardFlipKind.AMBIGUOUS:
+            return MotionType.UNKNOWN
+        if forward == ForwardFlipKind.GROUND:
+            return MotionType.GROUND_ROLL
+        if forward == ForwardFlipKind.AERIAL:
+            return MotionType.ACROBATIC
         roll = classify_roll_motion(intent.original_instruction)
         if roll == RollMotionKind.GROUND_ROLL:
             return MotionType.GROUND_ROLL

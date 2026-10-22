@@ -12,12 +12,16 @@ from typing import Any, Dict, Optional, Type, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from ..schemas.agent_workflow import TaskRewardBundle
+from ..schemas.rewards import RewardPlan
+from ..schemas.reward_repairs import RewardRepairBundle
 from ..schemas.decisions import TrainingDiagnosis
 from ..memory.reward_experience.prompts import REWARD_EXPERIENCE_PROMPT
 from ..memory.reward_experience.schema import RewardExperienceNarrative
 from ..settings import BailianSettings, load_bailian_settings
 from ..utils.io import atomic_write_text, json_safe, write_json
 from .errors import ProviderError, ProviderResponseError, ProviderTimeout
+from .schema_repair import (apply_schema_field_patches, merge_schema_repairs, normalize_reward_response,
+                            project_legacy_schema_reply, render_schema_patch_request, repair_preservation_errors)
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
@@ -140,20 +144,75 @@ class BailianGLMProvider:
             raise last_error
         raise ProviderResponseError("百炼响应信封无法解析：%s" % last_error)
 
+    def _parse_schema_candidate(self, raw: str, schema: Type[ModelT], title: str) -> Any:
+        """规范无损奖励表示，并将转换与原始回复一起保留供审计。"""
+        data, adjustments = normalize_reward_response(json.loads(_balanced_json(raw)), schema)
+        if self.record_dir is not None and adjustments:
+            prefix = "%03d_%s" % (self._request_index, title.replace("/", "-")[:60])
+            write_json(self.record_dir / (prefix + "_schema_normalization.json"), {
+                "scope": "lossless_reward_response_types_v3", "adjustments": adjustments,
+            })
+        return data
+
     def request_model(self, prompt: str, schema: Type[ModelT], title: str) -> ModelT:
-        """调用模型并在 Schema 失败时执行一次带原回复的 JSON 修复。"""
+        """无损规范奖励回复；一次格式重试仅能修改校验失败的位置。"""
         raw = self._completion(prompt, title)
+        original_data = None
         try:
-            return schema.parse_obj(json.loads(_balanced_json(raw)))
+            original_data = self._parse_schema_candidate(raw, schema, title)
+            return schema.parse_obj(original_data)
         except (ValueError, ValidationError, json.JSONDecodeError, ProviderResponseError) as exc:
+            validation_errors = exc.errors() if isinstance(exc, ValidationError) else [
+                {"loc": (), "type": "invalid_json"}]
             repair = (
+                prompt + "\n\n修复要求：保持上述原始目标、环境能力和附件约束不变。\n"
+                "只修复 validation_errors 指定的位置；保留其他已有字段、全部候选、课程、奖励 purpose、任务身份和阈值。不得输出简版。\n"
+                "VALIDATION_ERRORS: " + json.dumps(validation_errors, ensure_ascii=False, default=str) + "\n"
                 "修复下面的 JSON，使其严格符合 Schema。只返回 JSON。\n"
                 "Schema: %s\n校验错误: %s\n原回复: %s" %
                 (schema.schema_json(), exc, raw)
             )
-            repaired = self._completion(repair, title + "-repair")
+            patch_request = None
+            if schema in (TaskRewardBundle, RewardPlan) and isinstance(original_data, dict):
+                repair, patch_request = render_schema_patch_request(prompt, original_data, schema, validation_errors)
+            repair_title = title + "-repair"
+            repaired = self._completion(repair, repair_title)
             try:
-                return schema.parse_obj(json.loads(_balanced_json(repaired)))
+                if patch_request is not None:
+                    patch_data = json.loads(_balanced_json(repaired))
+                    if isinstance(patch_data, dict) and ('patches' in patch_data or 'base_sha256' in patch_data):
+                        merged, patch_audit = apply_schema_field_patches(original_data, patch_data, schema, validation_errors)
+                        if self.record_dir is not None:
+                            prefix = '%03d_%s' % (self._request_index, repair_title.replace('/', '-')[:60])
+                            write_json(self.record_dir / (prefix + '_schema_error_patches.json'), patch_audit)
+                        return schema.parse_obj(merged)
+                    repaired_data = self._parse_schema_candidate(repaired, schema, repair_title)
+                    merged, legacy_audit = project_legacy_schema_reply(original_data, repaired_data, schema, validation_errors)
+                    if self.record_dir is not None and legacy_audit['adjustments']:
+                        prefix = '%03d_%s' % (self._request_index, repair_title.replace('/', '-')[:60])
+                        write_json(self.record_dir / (prefix + '_schema_field_repair.json'), legacy_audit)
+                    if not legacy_audit['adjustments'] and legacy_audit['ignored_repair_changes']:
+                        raise ProviderResponseError(str(exc) + '\n已保留最完整来源；拒绝删除或改写有效字段：' +
+                            '；'.join(legacy_audit['ignored_repair_changes'][:8]))
+                    return schema.parse_obj(merged)
+                repaired_data = self._parse_schema_candidate(repaired, schema, repair_title)
+                regressions = repair_preservation_errors(
+                    original_data, repaired_data, schema, validation_errors)
+                if regressions:
+                    merged, patches = merge_schema_repairs(
+                        original_data, repaired_data, schema, validation_errors)
+                    if patches:
+                        result = schema.parse_obj(merged)
+                        if self.record_dir is not None:
+                            prefix = "%03d_%s" % (self._request_index, repair_title.replace("/", "-")[:60])
+                            write_json(self.record_dir / (prefix + "_schema_field_repair.json"), {
+                                "scope": "validated_reward_field_repairs_v1", "adjustments": patches,
+                                "ignored_repair_changes": regressions, "effective_response": merged,
+                            })
+                        return result
+                    raise ProviderResponseError(
+                        str(exc) + "\n已保留最完整来源；拒绝删除或改写有效字段：" + "；".join(regressions[:8]))
+                return schema.parse_obj(repaired_data)
             except (ValueError, ValidationError, json.JSONDecodeError,
                     ProviderResponseError) as repair_exc:
                 raise ProviderResponseError("百炼结构化回复修复失败：%s" % repair_exc) from repair_exc
@@ -162,6 +221,28 @@ class BailianGLMProvider:
         """根据本地编译提示词生成 TaskRewardBundle。"""
         return self.request_model(
             compiled_prompt, TaskRewardBundle, "bailian-reward-design").dict()
+
+    def repair_reward_plans(self, payload: Dict[str, Any]) -> RewardRepairBundle:
+        """使用与网页入口相同的局部补丁协议。"""
+        from ..agents.reward_prompt_policy import render_reward_policy
+        from ..agents.schema_contract import render_schema_contract
+        template = (Path(__file__).parents[1] / 'prompts' / 'reward_field_repair.md').read_text(encoding='utf-8')
+        prompt = template + '\n' + render_reward_policy()
+        prompt += '\nREPAIR_REQUEST: ' + json.dumps(json_safe(payload), ensure_ascii=False, allow_nan=False)
+        prompt += '\nJSON Schema: ' + RewardRepairBundle.schema_json()
+        prompt += '\n' + render_schema_contract(RewardRepairBundle)
+        return self.request_model(prompt, RewardRepairBundle, 'bailian-reward-field-repair')
+
+    def redesign_rewards(self, payload: Dict[str, Any]) -> RewardPlan:
+        """首次训练失败后的新方案仍由本地审核，后续格式/业务修复走补丁接口。"""
+        from ..agents.reward_prompt_policy import render_reward_policy
+        from ..agents.schema_contract import render_schema_contract
+        template = (Path(__file__).parents[1] / 'prompts' / 'failure_reward_redesign.md').read_text(encoding='utf-8')
+        prompt = template + '\n' + render_reward_policy()
+        prompt += '\nEvidence: ' + json.dumps(json_safe(payload), ensure_ascii=False, allow_nan=False)
+        prompt += '\nJSON Schema: ' + RewardPlan.schema_json()
+        prompt += '\n' + render_schema_contract(RewardPlan)
+        return self.request_model(prompt, RewardPlan, 'bailian-failure-reward-redesign')
 
     def diagnose_training(self, payload: Dict[str, Any]) -> TrainingDiagnosis:
         """使用 GLM 融合训练证据并生成结构化修订决策。"""

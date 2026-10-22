@@ -112,6 +112,20 @@ def test_debug_capture_does_not_save_private_page_content(tmp_path, monkeypatch)
     saved = files[0].read_text(encoding="utf-8")
     assert "private-" not in saved and "secret-token" not in saved
     assert json.loads(saved)["page_origin"] == "https://chatgpt.com"
+    assert json.loads(saved)["response_json_complete"] is False
+
+
+def test_timeout_debug_records_json_completeness_without_body(tmp_path, monkeypatch):
+    """完整性布尔值帮助区分网页状态误判与半段回复，诊断仍不保存聊天正文。"""
+    provider = OpenCLIChatGPTWebProvider(record_dir=tmp_path)
+    monkeypatch.setattr(provider, "_submission_snapshot", lambda: {
+        "latest_assistant": '{"private-payload":"secret-value"}', "generating": True})
+    provider._collect_page_debug_artifacts(ConversationHandle(conversation_id="fixture", title_hint="fixture"),
+                                          "timeout")
+    path = next(tmp_path.rglob("*.json"))
+    saved = path.read_text()
+    assert "private-payload" not in saved and "secret-value" not in saved
+    assert json.loads(saved)["response_json_complete"] is True
 
 
 def test_doubao_message_keywords_cannot_expire_page():

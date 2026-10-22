@@ -279,6 +279,25 @@ class RepairingProvider(MockLLMReasoningProvider):
             design["reward_plans"][0]["terms"][0]["name"] = "invented_reward"
         return design
 
+    def repair_reward_plans(self, payload):
+        """只删除未知奖励并补充本地明确允许的信号，不重新生成任务。"""
+        self.calls.append(payload)
+        if self.always_bad:
+            return {'repairs': []}
+        repairs = []
+        for target in payload['targets']:
+            edits = []
+            for grant in target['allowed_patches']:
+                if grant['op'] == 'remove' and grant['path'][0] == 'terms':
+                    edits.append({'op': 'remove', 'path': grant['path']})
+                elif grant['op'] == 'add' and grant['path'] == ['terms', '-']:
+                    name = grant['identity']['name']
+                    item = dict(target['reward_plan']['terms'][0], name=name)
+                    edits.append({'op': 'add', 'path': grant['path'], 'value': item})
+            repairs.append({'candidate_index': target['candidate_index'],
+                            'base_sha256': target['base_sha256'], 'patches': edits})
+        return {'repairs': repairs}
+
 
 def test_business_review_retry_preserves_user_target_and_contract(tmp_path):
     """全部拒绝后回传业务意见重新设计，不消耗训练修订额度、不替换用户目标。"""
@@ -286,9 +305,10 @@ def test_business_review_retry_preserves_user_target_and_contract(tmp_path):
     settings = settings_for(tmp_path)
     result = TrainingOrchestrator(settings, provider).train("稳定向前行走", "go2", True)
     assert result["state"] == "COMPLETED" and len(provider.calls) == 2
-    feedback = provider.calls[1]["reward_review_feedback"]
-    assert feedback["review"]["rejected_candidate_indexes"] == [1]
-    assert feedback["fixed_task_spec"]["original_instruction"] == "稳定向前行走"
+    feedback = provider.calls[1]
+    assert [target['candidate_index'] for target in feedback['targets']] == [1]
+    assert feedback['targets'][0]['reward_plan']['terms'][0]['name'] == 'invented_reward'
+    assert feedback['immutable_task']['original_instruction'] == '稳定向前行走'
     task_dir = settings.experiments_path / result["task_id"]
     task = json.loads((task_dir / "task_spec.json").read_text())
     assert task["original_instruction"] == "稳定向前行走"
@@ -296,7 +316,7 @@ def test_business_review_retry_preserves_user_target_and_contract(tmp_path):
     assert (task_dir / "reward_review_attempt_01.json").is_file()
     original = json.loads((task_dir / "design_response_attempt_00.json").read_text())
     assert original["reward_plans"][0]["terms"][0]["name"] == "invented_reward"
-    assert (task_dir / "plan_normalization_attempt_01.json").is_file()
+    assert (task_dir / 'reward_repairs/patch_audit_01.json').is_file()
 
 
 def test_business_review_retry_is_bounded_and_never_trains_rejected_rewards(tmp_path):

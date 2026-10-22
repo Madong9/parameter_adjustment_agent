@@ -8,7 +8,8 @@ import subprocess
 
 import pytest
 
-from rl_training_agent.providers.chatgpt_dom import CHATGPT_ATTACH_FILES_SCRIPT, CHATGPT_SNAPSHOT_SCRIPT
+from rl_training_agent.providers.chatgpt_dom import (CHATGPT_ATTACH_FILES_SCRIPT,
+    CHATGPT_GENERATION_SCRIPT, CHATGPT_SNAPSHOT_SCRIPT)
 from rl_training_agent.providers.opencli_chatgpt import OpenCLIChatGPTWebProvider
 
 
@@ -103,6 +104,54 @@ document.querySelector('#probe-result').textContent = JSON.stringify(results);
         assert item["remaining"] == 0
         assert item["received"] == ["requirements.md", "frame.png"]
         assert item["result"] == {"ok": True, "count": 2, "names": item["received"]}
+
+
+def test_generation_probe_ignores_idle_modes_and_inactive_controls(tmp_path):
+    """真实 DOM 上排除闲置 Thinking 模式、隐藏/禁用按钮及消息内的停止文字。"""
+    fixtures = [
+        '<button aria-label="Thinking">Thinking</button>',
+        '<button aria-label="正在思考">正在思考</button>',
+        '<button data-testid="stop-button" style="display:none"></button>',
+        '<div style="display:none"><button aria-label="Stop"></button></div>',
+        '<button aria-label="停止回答" style="visibility:hidden"></button>',
+        '<button data-testid="stop-button" disabled></button>',
+        '<button aria-label="Stop generating" aria-disabled="true"></button>',
+        '<div data-message-author-role="assistant"><button aria-label="Stop"></button></div>',
+        '<div data-chatgpt-search-unit-key="t:assistant"><button data-testid="stop-button"></button></div>',
+        '<button aria-label="停止听写"></button>',
+        '<button data-testid="stop-button" aria-label="Thinking"></button>',
+        '<button aria-label="Stop generating"></button>',
+        '<button aria-label="停止"></button>',
+    ]
+    script = (
+        "const results=[];for(const fixture of " + json.dumps(fixtures) + ") {"
+        "document.body.innerHTML=fixture;results.push([JSON.parse(eval(" +
+        json.dumps(CHATGPT_GENERATION_SCRIPT) + ")),JSON.parse(eval(" +
+        json.dumps(CHATGPT_SNAPSHOT_SCRIPT) + ")).generating]);}"
+        "document.body.innerHTML='<pre id=\"probe-result\"></pre>';"
+        "document.querySelector('#probe-result').textContent=JSON.stringify(results);")
+    assert _run_dom_script(script, tmp_path) == [[False, False]] * 10 + [[True, True]] * 3
+
+
+def test_complete_reply_with_idle_thinking_mode_returns_without_timeout(tmp_path, monkeypatch):
+    """完整本轮 JSON 与闲置 Thinking 控件共存时，等待器接受稳定回复且不重发。"""
+    fixture = ('<div data-message-author-role="user" data-message-id="u2">请求</div>'
+               '<div data-message-author-role="assistant" data-message-id="a2"><pre>{"ok":true}</pre></div>'
+               '<button aria-label="Thinking">Thinking</button>')
+    script = (
+        "document.body.innerHTML=" + json.dumps(fixture) + ";"
+        "const result=JSON.parse(eval(" + json.dumps(CHATGPT_SNAPSHOT_SCRIPT) + "));"
+        "document.body.innerHTML='<pre id=\"probe-result\"></pre>';"
+        "document.querySelector('#probe-result').textContent=JSON.stringify(result);")
+    snapshot = _run_dom_script(script, tmp_path)
+    provider = OpenCLIChatGPTWebProvider()
+    provider._confirmed_user_id = "u2"
+    provider._submission_baseline = {"latest_assistant_id": "a1"}
+    monkeypatch.setattr(provider, "_state", lambda: "ready")
+    monkeypatch.setattr(provider, "_submission_snapshot", lambda: snapshot)
+    monkeypatch.setattr(provider, "_browser", lambda *args, **kwargs: json.dumps(snapshot["generating"]))
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    assert provider._wait_for_response("") == '{"ok":true}'
 
 
 def test_document_preview_rejects_old_message_and_unrelated_image(tmp_path):

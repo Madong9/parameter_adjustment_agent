@@ -112,6 +112,14 @@ class FallbackProvider:
         """执行编译后的奖励设计兼容接口。"""
         return self._call("design_task_bundle", compiled_prompt)
 
+    def repair_reward_plans(self, payload: Any) -> Any:
+        """主备均使用相同补丁请求，不退回整份奖励生成。"""
+        return self._call('repair_reward_plans', payload)
+
+    def redesign_rewards(self, payload: Any) -> Any:
+        """首次失败后重设计的高层请求保持相同上下文。"""
+        return self._call('redesign_rewards', payload)
+
     def design_task_and_rewards(self, instruction: str, robot: str, capabilities: Any) -> Any:
         """执行旧版任务和奖励联合设计兼容接口。"""
         return self._call("design_task_and_rewards", instruction, robot, capabilities)

@@ -9,7 +9,7 @@ from rl_training_agent.orchestration.budget import BudgetTracker
 from rl_training_agent.orchestration.orchestrator import TrainingOrchestrator
 from rl_training_agent.orchestration.state_machine import AgentState, PersistentStateMachine
 from rl_training_agent.providers.mock_provider import MockLLMReasoningProvider
-from rl_training_agent.providers.errors import ProviderTimeout
+from rl_training_agent.providers.errors import ProviderNeedsHuman, ProviderResponseError, ProviderTimeout
 from rl_training_agent.rewards.validator import RewardValidationError
 from rl_training_agent.schemas.decisions import DiagnosisItem, EvidenceItem, RewardChange, TrainingDiagnosis
 from rl_training_agent.schemas.agent_workflow import TaskIntentSpec
@@ -106,6 +106,54 @@ def test_task_understanding_provider_failure_is_persisted_as_human_review(tmp_pa
     assert persisted["state"] == "HUMAN_REVIEW"
     assert blocking == result
     assert not (task_dir / "feasibility_report.json").exists()
+
+
+@pytest.mark.parametrize("bundle_api", [False, True])
+@pytest.mark.parametrize("failure", [ProviderTimeout, ProviderNeedsHuman, ProviderResponseError])
+def test_initial_reward_provider_failure_blocks_before_ppo(tmp_path, bundle_api, failure):
+    """新旧奖励设计接口的超时/人工恢复均保存真实阶段，不冻结预算或启动训练。"""
+    class BrokenRewardProvider(MockLLMReasoningProvider):
+        """任务理解正常，只在奖励设计时模拟网页推理故障。"""
+
+        def design_task_and_rewards(self, instruction, robot, capabilities):
+            """在旧接口报告不可用，检查编排不会自动重发已确认消息。"""
+            raise failure("本轮网页回复超时或等待页面恢复")
+
+    class BrokenBundleProvider(BrokenRewardProvider):
+        """现代固定提示词接口使用同一种可恢复故障。"""
+
+        def design_task_bundle(self, compiled_prompt):
+            """在现代接口报告不可用，不访问真实模型。"""
+            raise failure("本轮网页回复超时或等待页面恢复")
+
+    base = load_settings()
+    settings = Settings(**{**base.dict(), "experiment_root": str(tmp_path / "experiments"),
+                          "artifact_root": str(tmp_path / "artifacts"), "memory_enabled": False})
+    provider = BrokenBundleProvider(1) if bundle_api else BrokenRewardProvider(1)
+    result = TrainingOrchestrator(settings, provider).train("稳定站立", "go2", dry_run=True)
+    task_dir = settings.experiments_path / result["task_id"]
+    state = json.loads((task_dir / "state.json").read_text())
+    assert result["state"] == state["state"] == "HUMAN_REVIEW"
+    assert result["stage"] == "REWARD_DESIGNING"
+    if failure is ProviderResponseError:
+        assert '回复结构不合格' in result['reason'] and result['failure_kind'] == 'response_schema'
+    else:
+        assert '奖励设计 Provider' in result['reason'] and result['failure_kind'] == 'provider_unavailable'
+    assert result["restart_required"] is True and result["resume_allowed"] is False
+    assert "尚未启动 PPO" in result["recovery_hint"]
+    assert json.loads((task_dir / "blocking_report.json").read_text()) == result
+    assert state["history"][-2]["state"] == "REWARD_DESIGNING"
+    assert (task_dir / "task_intent.json").is_file()
+    assert (task_dir / "design_request.json").is_file()
+    assert not (task_dir / "acceptance_contract.json").exists()
+    assert not (task_dir / "design_response.json").exists()
+    assert not list(task_dir.rglob("*.pt"))
+    events = [json.loads(line) for line in (task_dir / "events.jsonl").read_text().splitlines()]
+    errors = [event for event in events if event["event_type"] == "provider_call" and not event["ok"]]
+    assert len(errors) == 1 and errors[0]["error_type"] == failure.__name__
+    from rl_training_agent.web_ui import interpret_job_outcome, stage_track_presentation
+    assert interpret_job_outcome(state["state"], 0, state["history"])[0] == "review"
+    assert stage_track_presentation(state["state"], state["history"], accepted=False)["reward"] == "blocked"
 
 
 def test_orchestrator_trains_only_candidates_approved_by_reviewer(tmp_path):

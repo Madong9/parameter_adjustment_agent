@@ -3,11 +3,27 @@ import re
 import math
 
 from ..schemas.rewards import CurriculumStage, RewardTerm
-from ..utils.task_semantics import is_side_flip_text
+from ..utils.task_semantics import ForwardFlipKind, classify_forward_flip, is_side_flip_text
 from ..training.action_rewards import ACTION_REWARDS
 
 
 def validate_action_semantics(task, plan):
+    """前翻与侧翻分别检查轴向信号及不可兼容的普通姿态终止。"""
+    if classify_forward_flip(task.original_instruction) == ForwardFlipKind.AERIAL:
+        from .validator import RewardValidationError
+        required = {'takeoff_velocity', 'airborne_duration', 'pitch_rotation', 'net_pitch_progress', 'front_flip_recovery'}
+        positive = {term.name for term in plan.terms if term.weight > 0}
+        if not required <= positive:
+            raise RewardValidationError('前空翻缺少起跳、腾空、正向横轴净旋转或完成后恢复信号：' + ', '.join(sorted(required - positive)))
+        if positive & {'net_roll_progress', 'roll_rotation'}:
+            raise RewardValidationError('前空翻不能使用纵轴侧翻奖励')
+        from .quality_gate import effective_scales
+        if not all(all(values.get(name, 0) > 0 for name in required) for values in effective_scales(plan).values()):
+            raise RewardValidationError('前空翻门控奖励必须在全部学习课程有效，动作阶段由接触状态判定')
+        for termination in plan.terminations:
+            if termination.enabled and not termination.is_timeout and re.search(r'abs\((?:pitch|roll)\)', termination.condition):
+                raise RewardValidationError('完整前空翻与普通欧拉 roll/pitch 跌倒终止冲突；保留禁触、关节和力矩硬约束')
+        return
     if not is_side_flip_text((task.original_instruction, task.task_name)):
         return
     from .validator import RewardValidationError

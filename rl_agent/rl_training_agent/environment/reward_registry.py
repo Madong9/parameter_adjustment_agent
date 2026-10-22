@@ -127,8 +127,10 @@ class RewardRegistry:
             items.append(RewardRegistryItem(
                 name=name, implementation="rl_training_agent/training/action_rewards.py:_reward_" + name,
                 config_key="rewards.scales." + name,
-                expected_raw_range=([-100., 100.] if name == 'net_roll_progress' else [0., 1.]),
+                expected_raw_range=([-100., 100.] if name in ('net_roll_progress', 'net_pitch_progress') else [0., 1.]),
                 parameters=({'min_air_time_threshold': 0.} if name == 'airborne_duration' else
-                            {'net_roll_target': 2 * math.pi} if name == 'net_roll_progress' else {}),
+                            {'net_roll_target': 2 * math.pi} if name == 'net_roll_progress' else
+                            {'net_pitch_target': 2 * math.pi} if name in ('net_pitch_progress', 'front_flip_recovery') else
+                            {'pitch_rate_target': 6., 'pitch_rate_sigma': 4.} if name == 'pitch_rotation' else {}),
                 default_weight=0., sign="positive", dependencies=dependencies))
         return items

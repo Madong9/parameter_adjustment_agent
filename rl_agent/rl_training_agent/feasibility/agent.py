@@ -102,6 +102,18 @@ class FeasibilityPipeline:
                 limitations=semantic.issues, recommendations=[semantic.question or
                     "修正任务理解与用户原始动作之间的冲突后重新预检。"],
                 recommended_next_step=semantic.question or "重新确认动作语义")
+        capabilities = manifest.dict() if hasattr(manifest, "dict") else manifest
+        gaps = TaskSemanticValidator.action_capability_gaps(intent, capabilities or {})
+        if gaps:
+            self._emit_stage("action_capability_check", "blocked", capability_gaps=gaps)
+            return CompleteFeasibilityReport(
+                status=FeasibilityStatus.CONDITIONAL, task=intent.normalized_goal,
+                validation_level="CAPABILITY_ONLY",
+                motion_type=DynamicMotionPrototypeGenerator.classify(intent).value,
+                missing_requirements=gaps,
+                capability_report={"status": "UNKNOWN", "missing_requirements": gaps},
+                limitations=["当前前翻的接触/旋转训练信号与验收实现尚未补齐；不表示动作不可学习"],
+                recommended_next_step="补齐缺失的前翻实现后重新预检")
         assessment = self.capability_checker.assess(intent, manifest)
         self._emit_stage("capability_check", "completed", result_status=assessment.status.value)
         use_mjcf = str(getattr(self.simulation_validator, "backend", "")).lower() == "mujoco"

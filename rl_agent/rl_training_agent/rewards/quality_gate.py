@@ -18,8 +18,10 @@ METRIC_SIGNALS = {
     'feet_air_time': {'airborne_duration'},  # 验收要求全足同时腾空，步态单足时长不能替代。
     'max_roll_velocity': {'roll_rotation'},
     'final_roll_angle': {'net_roll_progress'},
-    'landing_stability': {'landing_stability', 'landing_recovery'},
-    'stable_stand_duration': {'stable_support', 'landing_recovery'},
+    'final_pitch_angle': {'net_pitch_progress'},
+    'pitch_axis_error': {'pitch_rotation'},
+    'landing_stability': {'landing_stability', 'landing_recovery', 'front_flip_recovery'},
+    'stable_stand_duration': {'stable_support', 'landing_recovery', 'front_flip_recovery'},
     'front_leg_stand_duration': {'front_leg_stand'},
     'rear_leg_stand_duration': {'rear_leg_stand'},
     'rear_stand_duration': {'rear_leg_stand'},
@@ -36,7 +38,7 @@ SAFETY_SIGNALS = {
     'joint_limit_violations': 'dof_pos_limits', 'torque_limit_violations': 'torque_limits',
 }
 METRIC_SIGNAL_OVERRIDES = {
-    (metric, aggregation): {'landing_recovery'}
+    (metric, aggregation): {'landing_recovery', 'front_flip_recovery'}
     for metric in ('stable_stand_duration', 'landing_stability')
     for aggregation in ('continuous_after_last_landing', 'post_last_airborne_recovery_mean')
 }
@@ -77,7 +79,11 @@ def audit_objectives(task, plan):
         usable = supported & active
         link = links.get(metric.name)
         if not usable:
-            errors.append('关键目标缺少已实现且有效的训练信号：' + metric.name)
+            if supported:
+                errors.append('候选未启用关键目标对应的训练信号：%s（可用奖励：%s）' % (
+                    metric.name, ', '.join(sorted(supported))))
+            else:
+                errors.append('关键目标缺少已实现的训练信号：' + metric.name)
         if link is None or not link.rationale.strip() or not any(c.strip() for c in link.counterexamples):
             errors.append('缺少目标—奖励—反例对应表：' + metric.name)
         elif not link.reward_terms or not set(link.reward_terms) <= usable:
@@ -96,6 +102,15 @@ def audit_objectives(task, plan):
         target = net_term.parameters.get('net_roll_target', 2 * math.pi)
         if not isinstance(target, (int, float)) or not math.isfinite(target) or target <= 0 or target < target_metric.value:
             errors.append('净滚转奖励封顶目标不得低于验收目标')
+    pitch_term = next((t for t in plan.terms if t.name == 'net_pitch_progress'), None)
+    pitch_metric = next((m for m in task.success_metrics if m.name == 'final_pitch_angle' and m.required), None)
+    if pitch_term is not None and pitch_metric is not None:
+        target = pitch_term.parameters.get('net_pitch_target', 2 * math.pi)
+        if not isinstance(target, (int, float)) or not math.isfinite(target) or target <= 0 or target < pitch_metric.value:
+            errors.append('前翻净旋转奖励封顶目标不得低于验收目标')
+        recovery = next((t for t in plan.terms if t.name == 'front_flip_recovery'), None)
+        if recovery is not None and recovery.parameters.get('net_pitch_target', 2 * math.pi) != target:
+            errors.append('前翻进度与恢复必须使用相同的净旋转目标')
     return {'passed': not errors, 'errors': errors, 'coverage': coverage,
             'effective_scales': scales, 'scope': '实现覆盖审核，非动作可行性或学习成功证明'}
 

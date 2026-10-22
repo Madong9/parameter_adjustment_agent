@@ -19,12 +19,14 @@ from pydantic import BaseModel, ValidationError
 
 from ..agents.context_builder import ContextBuilder
 from ..agents.reward_prompt_policy import render_reward_policy
+from ..agents.schema_contract import render_schema_contract
 from ..schemas.agent_workflow import TaskIntentSpec, TaskRewardBundle
 from ..feasibility.motion_prototype.schema import MotionPrototype
 from ..feasibility.prompts import MOTION_PROTOTYPE_PROMPT
 from ..schemas.decisions import TrainingDiagnosis, GPTTrainingDiagnosis
 from ..schemas.experiments import ConversationHandle, ProviderHealth
 from ..schemas.rewards import RewardPlan
+from ..schemas.reward_repairs import RewardRepairBundle
 from ..schemas.task import TaskSpec
 from ..schemas.visual import VisualBehaviorReport
 from ..memory.reward_experience.prompts import REWARD_EXPERIENCE_PROMPT
@@ -32,8 +34,11 @@ from ..memory.reward_experience.schema import RewardExperienceNarrative
 from ..settings import OpenCLISettings, load_opencli_settings
 from ..utils.io import atomic_write_text, json_safe
 from .errors import ProviderError, ProviderNeedsHuman, ProviderResponseError, ProviderTimeout
-from .chatgpt_dom import CHATGPT_ACCESS_STATE_SCRIPT, CHATGPT_ATTACH_FILES_SCRIPT, CHATGPT_SNAPSHOT_SCRIPT
+from .chatgpt_dom import (CHATGPT_ACCESS_STATE_SCRIPT, CHATGPT_ATTACH_FILES_SCRIPT,
+                         CHATGPT_GENERATION_SCRIPT, CHATGPT_SNAPSHOT_SCRIPT)
 from .browser_lease import BrowserLease, serialize_browser_operation
+from .schema_repair import (apply_schema_field_patches, merge_schema_repairs, normalize_reward_response,
+                            project_legacy_schema_reply, render_schema_patch_request, repair_preservation_errors)
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 Runner = Callable[[Sequence[str], int], subprocess.CompletedProcess]
@@ -122,6 +127,7 @@ class OpenCLIChatGPTWebProvider:
         self._submission_baseline: Dict[str, Any] = {}
         self._confirmed_user_id = ""
         self._last_message_snapshot: Dict[str, Any] = {}
+        self._last_schema_normalization: List[Dict[str, Any]] = []
         self._browser_lease = BrowserLease()
 
     def _run(self, args: Sequence[str], timeout: Optional[int] = None, allow_failure: bool = False) -> str:
@@ -550,6 +556,8 @@ class OpenCLIChatGPTWebProvider:
                 "user_count", "assistant_count", "composer_found", "generating", "extraction_version")}
             for key in ("latest_user", "latest_assistant", "composer_text"):
                 safe[key + "_length"] = len(str(snapshot.get(key, "")))
+            safe["response_json_complete"] = self._response_contains_complete_json(
+                str(snapshot.get("latest_assistant", "")))
             for key in ("latest_user_id", "latest_assistant_id", "assistant_user_id"):
                 value = str(snapshot.get(key, ""))
                 safe[key + "_hash"] = hashlib.sha256(value.encode()).hexdigest()[:16] if value else ""
@@ -755,16 +763,7 @@ class OpenCLIChatGPTWebProvider:
 
     def _is_generating(self) -> bool:
         """检测 ChatGPT 是否仍在思考、调用视觉工具或流式生成回复。"""
-        script = """
-(() => {
-  if (document.querySelector('button[data-testid="stop-button"]')) return JSON.stringify(true);
-  return JSON.stringify(Array.from(document.querySelectorAll('button')).some(button => {
-    const label = button.getAttribute('aria-label') || '';
-    return /Stop generating|Stop responding|停止生成|停止回答|Thinking|正在思考|^(?:停止|Stop)$/i.test(label.trim());
-  }));
-})()
-"""
-        output = self._browser(["eval", script], allow_failure=True)
+        output = self._browser(["eval", CHATGPT_GENERATION_SCRIPT], allow_failure=True)
         return self._parse_eval_result(output) is True
 
     @serialize_browser_operation
@@ -813,38 +812,132 @@ class OpenCLIChatGPTWebProvider:
         return response
 
     def _upload_text_documents(self, files: List[Path]) -> None:
-        """在页面内构造文本文件对象并附加，绕过扩展对本地文件路径的限制。"""
+        """按有界块上传原始文档字节，避免长提示词超过命令行单参数限制。"""
+        if not files:
+            return
         mime_types = {
             ".md": "text/markdown", ".txt": "text/plain", ".json": "application/json",
             ".yaml": "application/yaml", ".yml": "application/yaml",
         }
-        documents = [{"name": path.name, "type": mime_types.get(path.suffix.lower(), "text/plain"),
-                      "content": path.read_text(encoding="utf-8")} for path in files]
-        payload = json.dumps(documents, ensure_ascii=False)
-        script = """
+        token_json = json.dumps("rl_agent_text_%s" % uuid.uuid4().hex)
+        expected_names = [path.name for path in files]
+        stage = "初始化文档上传"
+
+        def evaluate(script: str) -> Any:
+            """限制每次 eval 的字节数并解析网页确认结果。"""
+            # Linux 的单参数上限通常为 128 KiB，额外留出 OpenCLI 包装余量。
+            if len(script.encode("utf-8")) > 64 * 1024:
+                raise ProviderError("文档上传脚本超过 64 KiB 单参数预算")
+            return self._parse_eval_result(self._browser(["eval", script]))
+
+        try:
+            initialized = evaluate("""
 (() => {
+  window.__rlAgentFileUploads = window.__rlAgentFileUploads || {};
+  window.__rlAgentFileUploads[%s] = {files: []};
+  return JSON.stringify({ok: true});
+})()
+""" % token_json)
+            if not (isinstance(initialized, dict) and initialized.get("ok") is True):
+                raise ProviderError("页面未确认文档上传初始化：%s" % str(initialized)[-1000:])
+
+            # 36 KiB 原始字节编码为 48 KiB base64，且块大小为 3 的倍数。
+            # 中间块没有填充字符，浏览器可安全拼接后统一解码，包括跨块 UTF-8 字符。
+            for file_index, path in enumerate(files):
+                stage = "注册文档 %s" % path.name
+                descriptor = {
+                    "name": path.name,
+                    "type": mime_types.get(path.suffix.lower(), "text/plain"),
+                    "size": path.stat().st_size, "chunks": [],
+                }
+                registered = evaluate("""
+(() => {
+  const upload = window.__rlAgentFileUploads && window.__rlAgentFileUploads[%s];
+  if (!upload) return JSON.stringify({ok: false, reason: 'upload_session_missing'});
+  upload.files.push(%s);
+  return JSON.stringify({ok: true, files: upload.files.length});
+})()
+""" % (token_json, json.dumps(descriptor, ensure_ascii=False)))
+                if not (isinstance(registered, dict) and registered.get("ok") is True and
+                        registered.get("files") == file_index + 1):
+                    raise ProviderError("页面未确认文档登记：%s" % str(registered)[-1000:])
+                with path.open("rb") as document:
+                    chunk_count = 0
+                    while True:
+                        raw = document.read(36 * 1024)
+                        if not raw:
+                            break
+                        chunk_count += 1
+                        stage = "传输文档 %s 第 %d 块" % (path.name, chunk_count)
+                        encoded = base64.b64encode(raw).decode("ascii")
+                        appended = evaluate("""
+(() => {
+  const upload = window.__rlAgentFileUploads && window.__rlAgentFileUploads[%s];
+  if (!upload || !upload.files[%d]) {
+    return JSON.stringify({ok: false, reason: 'upload_session_missing'});
+  }
+  upload.files[%d].chunks.push(%s);
+  return JSON.stringify({ok: true, chunks: upload.files[%d].chunks.length});
+})()
+""" % (token_json, file_index, file_index, json.dumps(encoded), file_index))
+                        if not (isinstance(appended, dict) and appended.get("ok") is True and
+                                appended.get("chunks") == chunk_count):
+                            raise ProviderError("页面未确认文档分块：%s" % str(appended)[-1000:])
+
+            stage = "附加文档 " + ", ".join(expected_names)
+            committed = evaluate("""
+(() => {
+  const uploads = window.__rlAgentFileUploads || {};
+  const upload = uploads[%s];
+  if (!upload) return JSON.stringify({ok: false, reason: 'upload_session_missing'});
   const input = document.querySelector('#upload-files') ||
     Array.from(document.querySelectorAll('input[type=file]')).find(item =>
       !String(item.getAttribute('accept') || '').toLowerCase().includes('image/'));
   if (!input) return JSON.stringify({ok: false, reason: 'general_file_input_not_found'});
-  const documents = %s;
   const transfer = new DataTransfer();
-  for (const document of documents) {
-    transfer.items.add(new File([document.content], document.name, {type: document.type}));
+  for (const item of upload.files) {
+    const binary = atob(item.chunks.join(''));
+    if (binary.length !== item.size) {
+      return JSON.stringify({ok: false, reason: 'document_size_mismatch', name: item.name});
+    }
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    transfer.items.add(new File([bytes], item.name, {type: item.type}));
   }
   %s
   return JSON.stringify(attachFiles(input, transfer));
 })()
-""" % (payload, CHATGPT_ATTACH_FILES_SCRIPT)
-        output = self._browser(["eval", script])
-        parsed = _json_from_output(output)
-        if isinstance(parsed, str):
-            parsed = _json_from_output(parsed)
-        expected_names = [path.name for path in files]
-        if not (isinstance(parsed, dict) and parsed.get("ok") and
-                int(parsed.get("count", 0)) == len(files) and parsed.get("names") == expected_names):
-            raise ProviderError("ChatGPT 页面未确认需求文档附件：%s" % output[-2000:])
-        self._wait_for_upload_preview(expected_names, allow_media=False)
+""" % (token_json, CHATGPT_ATTACH_FILES_SCRIPT))
+            if not (isinstance(committed, dict) and committed.get("ok") is True and
+                    committed.get("count") == len(files) and committed.get("names") == expected_names):
+                raise ProviderError("页面未确认需求文档附件：%s" % str(committed)[-2000:])
+            stage = "等待文档附件预览 " + ", ".join(expected_names)
+            # 文件名很多时也限制预览探针参数；正文始终不进入预览脚本。
+            batch: List[str] = []
+            batch_size = 2
+            for name in expected_names:
+                name_size = len(json.dumps(name, ensure_ascii=False).encode("utf-8")) + 2
+                if batch and batch_size + name_size > 32 * 1024:
+                    self._wait_for_upload_preview(batch, allow_media=False)
+                    batch, batch_size = [], 2
+                batch.append(name)
+                batch_size += name_size
+            if batch:
+                self._wait_for_upload_preview(batch, allow_media=False)
+        except Exception as exc:
+            raise ProviderError("ChatGPT 需求文档分块上传失败（%s）：%s" %
+                                (stage[:1000], str(exc)[-2000:])) from exc
+        finally:
+            # 清理失败不能覆盖原始上传失败，也不能把未确认上传当作成功。
+            try:
+                self._browser(["eval", """
+(() => {
+  if (window.__rlAgentFileUploads) delete window.__rlAgentFileUploads[%s];
+  return JSON.stringify({ok: true});
+})()
+""" % token_json], allow_failure=True)
+            except Exception:
+                pass
 
     @staticmethod
     def _recoverable_file_upload_error(error: Exception) -> bool:
@@ -1114,9 +1207,32 @@ class OpenCLIChatGPTWebProvider:
     def parse_json_response(self, raw_response: str, schema: Type[ModelT]) -> ModelT:
         """提取并校验网页回复中的结构化 JSON。"""
         try:
-            return schema.parse_obj(self._parse_candidate(raw_response))
+            data, adjustments = normalize_reward_response(self._parse_candidate(raw_response), schema)
+            self._last_schema_normalization = adjustments
+            return schema.parse_obj(data)
         except (ValueError, ValidationError) as exc:
             raise ProviderResponseError(str(exc)) from exc
+
+    def _inspect_schema_candidate(self, raw: str, schema: Type[ModelT]):
+        """取得格式修复的结构化错误和来源对象，不修改 Schema 或补造必填字段。"""
+        try:
+            data, _ = normalize_reward_response(self._parse_candidate(raw), schema)
+        except ValueError as exc:
+            return None, [{'loc': (), 'type': 'invalid_json'}], str(exc)
+        try:
+            schema.parse_obj(data)
+        except ValidationError as exc:
+            return data, exc.errors(), str(exc)
+        return data, [], ''
+
+    def _record_schema_normalization(self, conversation: ConversationHandle) -> None:
+        """记录无损回复类型转换，原始模型回复仍由请求记录保留。"""
+        if self.record_dir is None or not self._last_schema_normalization:
+            return
+        path = self.record_dir / conversation.conversation_id / (
+            'schema_normalization_%03d.json' % self._request_index)
+        atomic_write_text(path, json.dumps({'scope': 'lossless_reward_response_types_v3',
+            'adjustments': self._last_schema_normalization}, ensure_ascii=False, indent=2))
 
     @serialize_browser_operation
     def _request_model(self, prompt: str, schema: Type[ModelT], title: str,
@@ -1139,10 +1255,63 @@ class OpenCLIChatGPTWebProvider:
                 time.sleep(1.0)
         if conversation is None:
             raise ProviderResponseError("ChatGPT 会话未创建")
+        best_raw = raw
+        best_data, best_errors, best_detail = self._inspect_schema_candidate(raw, schema)
+        best_normalizations = []
+        if best_data is not None:
+            _, best_normalizations = normalize_reward_response(self._parse_candidate(raw), schema)
+        regression_errors: List[str] = []
         for attempt in range(self.settings.max_retries + 1):
             try:
-                return self.parse_json_response(raw, schema)
+                result = self.parse_json_response(raw, schema)
+                candidate_data, _, _ = self._inspect_schema_candidate(raw, schema)
+                regressions = repair_preservation_errors(best_data, candidate_data, schema, best_errors)
+                if regressions:
+                    raise ProviderResponseError('格式修复改变或丢失已有有效字段：' + '；'.join(regressions[:8]))
+                self._record_schema_normalization(conversation)
+                return result
             except ProviderResponseError as exc:
+                candidate_data, candidate_errors, candidate_detail = self._inspect_schema_candidate(raw, schema)
+                regressions = repair_preservation_errors(best_data, candidate_data, schema, best_errors)
+                if regressions:
+                    regression_errors = regressions
+                    merged, patches = merge_schema_repairs(best_data, candidate_data, schema, best_errors)
+                    if patches:
+                        try:
+                            merged_result = schema.parse_obj(merged)
+                            merged_errors, merged_detail = [], ''
+                        except ValidationError as merged_exc:
+                            merged_result = None
+                            merged_errors, merged_detail = merged_exc.errors(), str(merged_exc)
+                        if len(merged_errors) < len(best_errors):
+                            patch_paths = [tuple(item['path']) for item in patches]
+                            applied_normalizations = [item for item in self._last_schema_normalization
+                                if any(tuple(item['path'])[:len(path)] == path or
+                                       path[:len(item['path'])] == tuple(item['path']) for path in patch_paths)]
+                            # 只采用验证失败字段的修复，有效字段由本地来源恢复，
+                            # 不因模型重写风险说明、课程或奖励权重而耗尽重试。
+                            if self.record_dir is not None:
+                                path = self.record_dir / conversation.conversation_id / (
+                                    'schema_field_repair_%03d_%02d.json' % (self._request_index, attempt))
+                                atomic_write_text(path, json.dumps({
+                                    'scope': 'validated_reward_field_repairs_v1',
+                                    'adjustments': patches,
+                                    'source_normalizations': best_normalizations,
+                                    'repair_normalizations': applied_normalizations,
+                                    'ignored_repair_changes': regressions,
+                                    'remaining_validation_errors': merged_errors,
+                                    'effective_response': merged,
+                                }, ensure_ascii=False, indent=2, default=str))
+                            best_normalizations = best_normalizations + applied_normalizations
+                            if merged_result is not None:
+                                self._last_schema_normalization = best_normalizations
+                                self._record_schema_normalization(conversation)
+                                return merged_result
+                            best_raw = json.dumps(merged, ensure_ascii=False)
+                            best_data, best_errors, best_detail = merged, merged_errors, merged_detail
+                elif candidate_data is not None and (best_data is None or len(candidate_errors) < len(best_errors)):
+                    best_raw, best_data, best_errors, best_detail = raw, candidate_data, candidate_errors, candidate_detail
+                    best_normalizations = list(self._last_schema_normalization)
                 # 页面 DOM 可能在 OpenCLI 返回后又补齐了流式回复。发送修复消息前
                 # 再读取一次；若已成为合法结果，直接使用，避免重复消息与额度消耗。
                 latest = ""
@@ -1159,17 +1328,32 @@ class OpenCLIChatGPTWebProvider:
                     not snapshot.get("generating"))
                 if latest and len(latest) > len(raw) and belongs_to_request:
                     try:
-                        return self.parse_json_response(latest, schema)
+                        result = self.parse_json_response(latest, schema)
+                        latest_data, _, _ = self._inspect_schema_candidate(latest, schema)
+                        if repair_preservation_errors(best_data, latest_data, schema, best_errors):
+                            raise ProviderResponseError('补读回复改变了已有有效字段')
+                        self._record_schema_normalization(conversation)
+                        return result
                     except ProviderResponseError:
                         # 页面可能仍停留在上一项任务的较长回复。它不满足本次 Schema
                         # 就不能覆盖本次原始响应，否则恢复会把旧会话内容发给新任务。
                         pass
                 if attempt >= self.settings.max_retries:
-                    raise
+                    detail = best_detail or str(exc)
+                    if regression_errors:
+                        detail += '\n已保留最完整来源；拒绝删除或改写有效字段：' + '；'.join(regression_errors[:8])
+                    raise ProviderResponseError(detail) from exc
                 repair = (prompt + '\n\n修复要求：保持上述原始目标、环境能力和附件约束不变。\n' +
+                          '只修复 validation_errors 指定的位置；保留其他已有字段、全部候选、课程、奖励 purpose、任务身份和阈值。不得输出简版。\n' +
+                          'VALIDATION_ERRORS: ' + json.dumps(best_errors, ensure_ascii=False, default=str) + '\n' +
+                          'REJECTED_REPAIR_REGRESSIONS: ' + json.dumps(regression_errors[:20], ensure_ascii=False) + '\n' +
                           "Return only corrected strict JSON matching this JSON Schema. Validation error: %s\nSchema: %s\n"
                           "Do not add commentary.\nInvalid JSON response to repair:\n%s" %
-                          (exc, schema.schema_json(), raw))
+                          (best_detail or str(exc), schema.schema_json(), best_raw))
+                patch_request = None
+                if schema in (TaskRewardBundle, RewardPlan) and isinstance(best_data, dict):
+                    repair, patch_request = render_schema_patch_request(
+                        prompt, best_data, schema, best_errors, regression_errors[:20])
                 repair_title = "%s-repair-%02d" % (title, attempt + 1)
                 try:
                     raw = self._send_model_prompt(conversation, repair, repair_title, files)
@@ -1180,15 +1364,60 @@ class OpenCLIChatGPTWebProvider:
                     # 可避免重复点击同一会话，同时保留严格 Schema 修复能力。
                     conversation = self.new_conversation(repair_title + "-recovery")
                     raw = self._send_model_prompt(conversation, repair, repair_title + "-recovery", files)
+                if patch_request is not None:
+                    try:
+                        patch_data = self._parse_candidate(raw)
+                        if isinstance(patch_data, dict) and ('patches' in patch_data or 'base_sha256' in patch_data):
+                            merged, patch_audit = apply_schema_field_patches(best_data, patch_data, schema, best_errors)
+                            patch_audit['source_normalizations'] = best_normalizations
+                            if self.record_dir is not None:
+                                path = self.record_dir / conversation.conversation_id / (
+                                    'schema_error_patches_%03d_%02d.json' % (self._request_index, attempt + 1))
+                                atomic_write_text(path, json.dumps(patch_audit, ensure_ascii=False, indent=2))
+                            raw = json.dumps(merged, ensure_ascii=False)
+                        else:
+                            merged, legacy_audit = project_legacy_schema_reply(best_data, patch_data, schema, best_errors)
+                            if legacy_audit['ignored_repair_changes']:
+                                regression_errors = legacy_audit['ignored_repair_changes']
+                            try:
+                                schema.parse_obj(merged)
+                                legacy_audit['remaining_validation_errors'] = []
+                            except ValidationError as remaining:
+                                legacy_audit['remaining_validation_errors'] = remaining.errors()
+                            progress = len(legacy_audit['remaining_validation_errors']) < len(best_errors)
+                            if legacy_audit['adjustments'] and progress and self.record_dir is not None:
+                                legacy_audit['source_normalizations'] = best_normalizations
+                                path = self.record_dir / conversation.conversation_id / (
+                                    'schema_field_repair_%03d_%02d.json' % (self._request_index, attempt + 1))
+                                atomic_write_text(path, json.dumps(legacy_audit, ensure_ascii=False, indent=2))
+                            if progress:
+                                best_normalizations += legacy_audit['repair_normalizations']
+                            self._last_schema_normalization = best_normalizations
+                            if legacy_audit['adjustments'] and progress:
+                                self._record_schema_normalization(conversation)
+                            raw = json.dumps(merged if progress else best_data, ensure_ascii=False)
+                    except (ValueError, TypeError, KeyError, IndexError) as patch_exc:
+                        regression_errors = ['局部格式补丁被拒绝：' + str(patch_exc)]
+                        if self.record_dir is not None:
+                            path = self.record_dir / conversation.conversation_id / (
+                                'schema_patch_rejection_%03d_%02d.json' % (self._request_index, attempt + 1))
+                            atomic_write_text(path, json.dumps({'error': str(patch_exc),
+                                'base_sha256': patch_request['base_sha256'], 'raw_response': raw}, ensure_ascii=False, indent=2))
+                        raw = best_raw
         raise ProviderResponseError("unreachable response validation state")
 
     def design_task_and_rewards(self, instruction: str, robot: str, capabilities: Dict[str, Any]) -> Dict[str, Any]:
         """依据任务描述和环境能力生成任务规格与奖励候选。"""
         template = (Path(__file__).parents[1] / "prompts" / "task_reward_design.md").read_text(encoding="utf-8")
         compact_capabilities = _compact_capabilities(capabilities)
-        prompt = (template + "\n" + render_reward_policy() + "\nRobot: %s\nInstruction: %s\nENVIRONMENT_MANIFEST: %s\nJSON Schema: %s" %
+        identity = {'task_id': 'task-' + hashlib.sha1((robot + instruction).encode('utf-8')).hexdigest()[:10],
+                    'robot': robot, 'original_instruction': instruction}
+        prompt = (template + "\n" + render_reward_policy() + '\nCURRENT_TASK_IDENTITY: ' +
+                  json.dumps(identity, ensure_ascii=False) +
+                  '\n当前身份来自用户请求，所有 task_id 必须与此一致，不得复制历史实验编号。\n' +
+                  "\nRobot: %s\nInstruction: %s\nENVIRONMENT_MANIFEST: %s\nJSON Schema: %s" %
                   (robot, instruction, json.dumps(compact_capabilities, ensure_ascii=False, separators=(",", ":")),
-                   TaskRewardBundle.schema_json()))
+                   TaskRewardBundle.schema_json()) + '\n' + render_schema_contract(TaskRewardBundle))
         return self._request_model(prompt, TaskRewardBundle, "task-reward-design").dict()
 
     def understand_task(self, instruction: str, robot: str) -> TaskIntentSpec:
@@ -1214,7 +1443,17 @@ class OpenCLIChatGPTWebProvider:
         template = (Path(__file__).parents[1] / "prompts" / "failure_reward_redesign.md").read_text(encoding="utf-8")
         prompt = template + "\n" + render_reward_policy() + "\nEvidence: " + json.dumps(json_safe(payload), ensure_ascii=False, allow_nan=False)
         prompt += "\nJSON Schema: " + RewardPlan.schema_json()
+        prompt += "\n" + render_schema_contract(RewardPlan)
         return self._request_model(prompt, RewardPlan, "failure-reward-redesign")
+
+    def repair_reward_plans(self, payload: Dict[str, Any]) -> RewardRepairBundle:
+        """只请求已授权候选和字段的补丁，不让模型重新生成完整奖励。"""
+        template = (Path(__file__).parents[1] / 'prompts' / 'reward_field_repair.md').read_text(encoding='utf-8')
+        prompt = template + '\n' + render_reward_policy()
+        prompt += '\nREPAIR_REQUEST: ' + json.dumps(json_safe(payload), ensure_ascii=False, allow_nan=False)
+        prompt += '\nJSON Schema: ' + RewardRepairBundle.schema_json()
+        prompt += '\n' + render_schema_contract(RewardRepairBundle)
+        return self._request_model(prompt, RewardRepairBundle, 'reward-field-repair')
 
     @serialize_browser_operation
     def design_visual_evaluation(self, task: TaskSpec) -> Dict[str, Any]:

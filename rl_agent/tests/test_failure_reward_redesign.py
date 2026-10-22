@@ -41,9 +41,21 @@ def setup_redesign(tmp_path, proposals):
         if proposals[len(calls) - 1] == 'weaken':
             result.success_metrics[0].value *= .5
         return result
+    def repair(payload):
+        calls.append(dict(payload))
+        target = payload['targets'][0]
+        edits = []
+        for grant in target['allowed_patches']:
+            if grant['path'][0] == 'success_metrics' and 'required_value' in grant:
+                value = grant['required_value']
+                if proposals[len(calls) - 1] == 'weaken':
+                    value *= .5
+                edits.append(dict(op=grant['op'], path=grant['path'], value=value))
+        return {'repairs': [{'candidate_index': target['candidate_index'],
+                            'base_sha256': target['base_sha256'], 'patches': edits}]}
     orchestrator = object.__new__(TrainingOrchestrator)
     orchestrator.settings = settings
-    orchestrator.provider = SimpleNamespace(redesign_rewards=redesign)
+    orchestrator.provider = SimpleNamespace(redesign_rewards=redesign, repair_reward_plans=repair)
     orchestrator.reward_reviewer = RewardReviewAgent()
     return orchestrator, task, selected, diagnosis, manifest, calls
 
@@ -68,11 +80,14 @@ def test_redesign_retries_with_feedback_without_weakening_acceptance(tmp_path):
     assert len(calls) == 2
     assert '验收指标' in calls[1]['validation_feedback']
     assert revised.success_metrics == task.success_metrics
+    assert calls[1]['targets'][0]['reward_plan']['terms'][0]['weight'] == selected['plan'].terms[0].weight * 1.5
+    assert revised.terms[0].weight == selected['plan'].terms[0].weight * 1.5
+    assert calls[1]['targets'][0]['reward_plan']['version'] == revised.version
 
 
 def test_repeated_invalid_design_stops_without_creating_training_candidate(tmp_path):
     orchestrator, task, selected, diagnosis, manifest, calls = setup_redesign(tmp_path, ['weaken', 'weaken'])
-    with pytest.raises(RewardValidationError, match='验收指标'):
+    with pytest.raises(RewardValidationError, match='补丁|验收指标'):
         orchestrator._redesign_failed_rewards(task, tmp_path, selected, diagnosis, 1, manifest)
     assert len(calls) == 2
     assert not (tmp_path / 'candidates').exists()

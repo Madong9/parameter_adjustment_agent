@@ -231,6 +231,24 @@ assert.equal(context.trainingResultPresentation({...base,
 const accepted = context.trainingResultPresentation({...base, result_detail:{...base.result_detail,
   accepted:true, acceptance_status:'passed'}});
 assert(accepted.notice.includes('仍可播放'));
+const early = {status:'review', progress:100, budget_detail:{valid:false,status:'not_started'},
+  result_detail:{training_status:'not_started',acceptance_status:'not_started',accepted:false},
+  stage_detail:{environment:'done',intent:'blocked',reward:'pending',smoke:'pending',full:'pending',visual:'pending'}};
+const earlyView = context.trainingResultPresentation(early);
+assert.equal(earlyView.usage, '尚未冻结');
+assert.equal(earlyView.budgetLabel, '尚未进入训练');
+assert.equal(earlyView.trainingLabel, '尚未启动 PPO');
+assert.equal(earlyView.acceptanceLabel, '尚未进入验收');
+assert.equal(earlyView.canResume, false);
+assert(!earlyView.notice.includes('缺失或无效'));
+assert.equal(context.stageStatus(early, 'environment'), 'done');
+assert.equal(context.stageStatus(early, 'intent'), 'blocked');
+for (const name of ['reward','smoke','full','visual','acceptance']) {
+  assert.equal(context.stageStatus(early, name), 'pending');
+}
+assert.equal(context.stageStatus({progress:100,status:'completed'}, 'full'), 'pending');
+assert.equal(context.stageStatus({stage_detail:{acceptance:'done'},result_detail:{accepted:false}}, 'acceptance'), 'pending');
+assert.equal(context.stageStatus({result_detail:{accepted:true}}, 'acceptance'), 'done');
 """
     result = subprocess.run([node, "-e", code, str(script_path)], text=True, capture_output=True, timeout=5)
     assert result.returncode == 0, result.stderr

@@ -17,6 +17,7 @@ REWARD_PARAMETER_NAMES = {
     "takeoff_velocity_target", "roll_rate_target", "roll_rate_sigma",
     "min_air_time_threshold",
     "net_roll_target",
+    "net_pitch_target", "pitch_rate_target", "pitch_rate_sigma",
 }
 COMMAND_RANGE_NAMES = {"lin_vel_x", "lin_vel_y", "ang_vel_yaw", "heading"}
 
@@ -156,7 +157,8 @@ def prepare_training_env_config(env_cfg: Any, config: Dict[str, Any]) -> None:
         for name in ACTION_REWARDS:
             setattr(env_cfg.rewards.scales, name, 0.0)
         for name, value in {"takeoff_velocity_target": .8, "roll_rate_target": 6., "roll_rate_sigma": 4.,
-                            "min_air_time_threshold": 0., "net_roll_target": 2 * math.pi}.items():
+                            "min_air_time_threshold": 0., "net_roll_target": 2 * math.pi,
+                            "net_pitch_target": 2 * math.pi, "pitch_rate_target": 6., "pitch_rate_sigma": 4.}.items():
             setattr(env_cfg.rewards, name, value)
     # 显式计划是全部有效权重，不能继承未审核的默认奖励。
     for name in dir(env_cfg.rewards.scales):
@@ -208,8 +210,12 @@ def prepare_evaluation_env_config(env_cfg: Any, config: Dict[str, Any]) -> None:
 def install_runtime_terminations(env: Any, config: Dict[str, Any]) -> None:
     """安装同源接触硬约束和配置声明的 roll、pitch 终止检查。"""
     install_velocity_tracking(env, config)
+    from .reward_statistics import install_observed_episode_statistics
+    install_observed_episode_statistics(env)
     from .contact_semantics import resolve_contact_contract, forbidden_contact_flags
     env._agent_contact_contract = resolve_contact_contract(config)
+    from .front_flip_contract import resolve_front_flip_contract
+    env._agent_front_flip_contract = resolve_front_flip_contract(config)
     pitch_limit = roll_limit = None
     body_contact = False
     for item in _enabled_terminations(config):
@@ -232,8 +238,20 @@ def install_runtime_terminations(env: Any, config: Dict[str, Any]) -> None:
     original = env.check_termination
 
     def check_termination_with_orientation(self: Any) -> None:
-        """运行项目原生终止检查，并追加配置声明的姿态限制。"""
-        original()
+        """前翻只豁免原生普通欧拉姿态终止，原生其他检查及共同硬约束继续执行。"""
+        if self._agent_front_flip_contract is not None:
+            # 原生 Go2 check_termination 同时检查身体接触、普通姿态和超时。
+            # 只向本次调用提供零姿态，不能清空其返回的接触/超时标志。
+            rpy = self.rpy
+            neutral = rpy.clone()
+            neutral[:, :2] = 0.
+            self.rpy = neutral
+            try:
+                original()
+            finally:
+                self.rpy = rpy
+        else:
+            original()
         if contact_checks:
             _, _, terminated = forbidden_contact_flags(self)
             self.reset_buf |= terminated

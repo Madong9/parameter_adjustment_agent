@@ -8,7 +8,7 @@ from typing import Any, Dict
 from ..environment.capability_manifest import CapabilityManifest
 from ..schemas.rewards import RewardPlan
 from ..utils.io import atomic_write_text, sha256_text, utc_now, write_json
-from .validator import RewardPlanValidator
+from .validator import RewardPlanValidator, RewardValidationError
 from ..training.contact_semantics import contact_contract
 
 
@@ -22,8 +22,12 @@ class RewardCompiler:
         """校验奖励计划并生成独立配置、差异和哈希。"""
         self.validator.validate(plan)
         if task is not None:
+            if plan.task_id != task.task_id or task.robot != self.manifest.robot:
+                raise RewardValidationError('编译任务、奖励编号或机器人与当前合同不一致')
             from .validator import validate_contact_contract
             validate_contact_contract(task, plan)
+        from ..training.front_flip_contract import compile_front_flip_contract
+        front_flip = compile_front_flip_contract(task, plan)
         constraints = [item.dict() for item in task.safety_constraints] if task is not None else []
         contacts = contact_contract(constraints, plan.terminations)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -47,6 +51,8 @@ class RewardCompiler:
             "safety_constraints": constraints,
             "contact_semantics": contacts,
         }
+        if front_flip is not None:
+            compiled['front_flip_semantics'] = front_flip
         canonical = json.dumps(compiled, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         config_path = output_dir / "config.yaml"
         atomic_write_text(config_path, canonical)

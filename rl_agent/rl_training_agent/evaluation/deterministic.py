@@ -7,6 +7,7 @@ from typing import Dict, List
 from ..schemas.metrics import EvaluationResult, MetricSummary
 from ..schemas.task import MetricThreshold, TaskSpec
 from ..schemas.visual import VisualBehaviorReport
+from ..utils.units import is_dimensionless_unit
 
 
 OPERATORS = {">": operator.gt, ">=": operator.ge, "<": operator.lt, "<=": operator.le, "==": operator.eq}
@@ -17,11 +18,12 @@ class DeterministicEvaluator:
         """用任务阈值检查一项确定性指标。"""
         value = metrics.get(threshold.name, float("nan"))
         scores = {"tracking_lin_vel", "front_leg_walk_velocity_tracking",
-                  "rear_leg_walk_velocity_tracking", "walking_speed_tracking", "orientation", "landing_stability"}
-        incompatible = (threshold.name in scores and threshold.unit not in ("", "1", "score", "ratio"))
+                  "rear_leg_walk_velocity_tracking", "walking_speed_tracking", "orientation", "landing_stability", "pitch_axis_error"}
+        incompatible = (threshold.name in scores and threshold.unit != "score"
+                        and not is_dimensionless_unit(threshold.unit))
         incompatible |= (threshold.name in {"front_leg_forward_speed", "rear_leg_forward_speed"}
                          and threshold.unit != "m/s")
-        physical_units = {"final_roll_angle": "rad", "max_roll_velocity": "rad/s", "feet_air_time": "s",
+        physical_units = {"final_roll_angle": "rad", "final_pitch_angle": "rad", "max_roll_velocity": "rad/s", "feet_air_time": "s",
                           "takeoff_time_spread": "s", "landing_pitch_abs": "rad"}
         incompatible |= (threshold.name in physical_units and threshold.unit != physical_units[threshold.name])
         valid = isinstance(value, (int, float)) and math.isfinite(value)

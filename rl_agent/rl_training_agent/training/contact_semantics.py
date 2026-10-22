@@ -8,6 +8,7 @@ CONTACT_SEMANTICS_VERSION = 'all-non-foot-v2'
 CONTACT_SCOPE = 'all_non_foot_rigid_bodies'
 CONTACT_FORCE_METRICS = {'forbidden_contact_force', 'forbidden_body_contact', 'body_contact_force'}
 CONTACT_METRICS = CONTACT_FORCE_METRICS | {'forbidden_collisions'}
+_CHINESE_BODY_FORCE = r'非足端(?:刚体|身体)?接触力'
 
 
 def _dictionary(item):
@@ -39,7 +40,7 @@ def contact_contract(safety_constraints=(), terminations=()):
             if operator == '<' and value == 0:
                 raise ValueError('接触力范数不能小于零，合同不可执行')
             if metric.get('unit', '') not in ('', 'N'):
-                raise ValueError('禁止接触力合同必须使用 N 单位')
+                raise ValueError('禁止接触力合同必须使用 N 单位：%s；碰撞计数请使用 forbidden_collisions（count/frames），不能直接更换单位' % metric['name'])
             if value < force_limit or (value == force_limit and operator == '<'):
                 force_limit = float(value)
                 force_operator = '>=' if operator == '<' else '>'
@@ -73,7 +74,8 @@ def is_body_termination(item):
     name = str(item.get('name', '')).lower()
     condition = str(item.get('condition', '')).lower()
     return (any(token in name for token in ('body_contact', 'body_collision', 'forbidden_contact')) or
-            any(token in condition for token in ('body contact', 'body_contact', 'forbidden_contact_force')))
+            any(token in condition for token in ('body contact', 'body_contact', 'forbidden_contact_force')) or
+            re.search(_CHINESE_BODY_FORCE, condition) is not None)
 
 
 def body_termination_bound(item):
@@ -82,7 +84,20 @@ def body_termination_bound(item):
     subject = r'(?:(?:forbidden[ _]+)?body[ _]+contact(?:[ _]+force)?|forbidden[ _]+contact[ _]+force)'
     match = re.fullmatch(subject + r'\s*(>=|>)\s*([0-9]+(?:\.[0-9]+)?)\s*n?', condition)
     if match is None:
-        raise ValueError('身体接触终止条件必须为 body contact > 数值 N（可使用 >=）')
+        # 仅支持明确的单一非足端接触力比较；保持原文、数值和严格/非严格方向，
+        # 不从“超过安全阈值”等缺失数字的说明中推测执行条件。
+        match = re.fullmatch(
+            _CHINESE_BODY_FORCE + r'\s*(大于等于|达到或超过|不小于|超过|大于)\s*'
+            r'(?:(?:现有|当前)?安全(?:策略|合同)的\s*)?'
+            r'([0-9]+(?:\.[0-9]+)?)\s*n\s*(?:阈值)?[。.]?', condition)
+        if match is not None:
+            value = float(match.group(2))
+            if not math.isfinite(value):
+                raise ValueError('身体接触终止阈值必须有限')
+            operator = '>' if match.group(1) in ('超过', '大于') else '>='
+            return operator, value
+    if match is None:
+        raise ValueError('身体接触终止条件必须为 body contact > 数值 N（可使用 >=），或明确的非足端接触力中文比较')
     value = float(match.group(2))
     if not math.isfinite(value):
         raise ValueError('身体接触终止阈值必须有限')
@@ -164,8 +179,12 @@ def contact_audit_metadata(env):
     names = getattr(env, 'body_names', None)
     if names is None and hasattr(env, 'gym'):
         names = env.gym.get_actor_rigid_body_names(env.envs[0], env.actor_handles[0])
-    return {'contact_semantics': dict(env_contact_contract(env)),
+    result = {'contact_semantics': dict(env_contact_contract(env)),
             'rigid_body_count': int(env.num_bodies),
             'forbidden_rigid_body_indices': indices,
             'forbidden_rigid_body_names': [names[index] for index in indices] if names is not None else [],
             'foot_rigid_body_indices': [int(index) for index in env.feet_indices.detach().cpu().tolist()]}
+    if getattr(env, '_agent_front_flip_contract', None) is not None:
+        result['front_flip_semantics'] = env._agent_front_flip_contract
+        result['native_orientation_termination'] = 'reviewed_front_flip_exemption'
+    return result

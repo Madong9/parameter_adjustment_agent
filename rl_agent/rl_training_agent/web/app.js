@@ -157,7 +157,7 @@ function selectMode(mode) {
     button.setAttribute("aria-checked", String(active));
   });
   elements.modeNote.innerHTML = mode === "real"
-    ? "<span aria-hidden=\"true\">◇</span><p><b>真实训练模式</b>将由 GPT 理解动作、百炼 GLM 设计奖励，再启动 GPU 仿真。实体机器人部署不在此界面范围内。</p>"
+    ? "<span aria-hidden=\"true\">◇</span><p><b>真实训练模式</b>将由配置的模型理解动作、设计并审查奖励，通过任务校验后启动 GPU 仿真。</p>"
     : "<span aria-hidden=\"true\">◇</span><p><b>离线安全模式</b>将生成模拟训练结果，用于检查 Agent 全链路，不会启动实际 GPU 训练。</p>";
 }
 
@@ -175,24 +175,26 @@ function trainingResultPresentation(job) {
   const budget = job.budget_detail || {};
   const result = job.result_detail || {};
   const known = budget.valid === true;
+  const notStarted = budget.status === "not_started";
   const canResume = Boolean(job.can_resume) && known && budget.exhausted === false;
-  const usage = known ? `${budget.used_iterations}/${budget.max_iterations} iter` : "额度未知";
-  const budgetLabel = !known ? "额度未知" : budget.exhausted ? "已耗尽" : "有剩余额度";
+  const usage = known ? `${budget.used_iterations}/${budget.max_iterations} iter` : notStarted ? "尚未冻结" : "额度未知";
+  const budgetLabel = notStarted ? "尚未进入训练" : !known ? "额度未知" : budget.exhausted ? "已耗尽" : "有剩余额度";
   const trainingLabel = {
     completed: "PPO 训练已完成", mock_completed: "仅 Mock 训练完成", compiled: "奖励已编译，未完成训练",
-    running: "PPO 训练中", pending: "训练尚未完成", failed: "PPO 训练失败",
+    running: "PPO 训练中", pending: "训练尚未完成", failed: "PPO 训练失败", not_started: "尚未启动 PPO",
   }[result.training_status] || (result.checkpoint_available ? "策略已保存，PPO 结果待核对" : "尚无已确认策略");
   const acceptanceLabel = {
     passed: "联合验收已通过", mock_passed: "仅 Mock 验收", not_passed: "联合验收未通过",
-    pending: "联合验收待完成", unknown: "验收证据待核对",
+    pending: "联合验收待完成", unknown: "验收证据待核对", not_started: "尚未进入验收",
   }[result.acceptance_status] || "验收证据待核对";
   const sourceLabel = {
     training_execution: "训练执行快照", summary: "实验摘要", loop_status: "闭环快照",
   }[budget.source] || "持久记录";
   let notice = known
     ? `冻结额度（已用/上限）：迭代 ${budget.used_iterations}/${budget.max_iterations} · 修订 ${budget.used_revisions}/${budget.max_revisions}；剩余 ${budget.remaining_iterations} 次迭代 / ${budget.remaining_revisions} 次修订。来源：${sourceLabel}。`
-    : "当前实验的冻结额度尚未确认；不会使用当前配置推算剩余预算或自动扩额。";
-  if (job.resume_block_reason && (job.status === "review" || budget.exhausted)) {
+    : notStarted ? "本次训练尚未开始，预算尚未冻结。请先处理任务阻塞原因，再下发明确的动作目标。"
+      : "当前实验的冻结额度尚未确认；不会使用当前配置推算剩余预算或自动扩额。";
+  if (!notStarted && job.resume_block_reason && (job.status === "review" || budget.exhausted)) {
     notice += ` ${job.resume_block_reason}`;
   }
   if (result.checkpoint_available) {
@@ -201,6 +203,16 @@ function trainingResultPresentation(job) {
   }
   if (result.accepted) notice += " 已通过验收的策略仍可播放，不消耗训练额度。";
   return { canResume, usage, budgetLabel, trainingLabel, acceptanceLabel, notice };
+}
+
+/** 只依据后端的本次阶段证据点亮步骤，百分比或终止状态不能冒充完成。 */
+function stageStatus(job, name) {
+  if (name === "acceptance") {
+    if (job.result_detail?.accepted) return "done";
+    return ["active", "blocked"].includes(job.stage_detail?.[name]) ? job.stage_detail[name] : "pending";
+  }
+  const status = job.stage_detail?.[name];
+  return ["done", "active", "blocked"].includes(status) ? status : "pending";
 }
 
 /** 用最新作业数据刷新进度仪表、阶段轨迹和急停能力。 */
@@ -353,10 +365,12 @@ function renderTelemetry(job) {
   const active = ["queued", "running", "stopping"].includes(job.status);
   elements.launchButton.disabled = active;
   elements.launchButton.querySelector("span").textContent = active ? "训练任务运行中" : "下发训练任务";
-  elements.stageTrack.querySelectorAll("[data-threshold]").forEach((stage) => {
-    const acceptedStage = Number(stage.dataset.threshold) === 100;
-    stage.classList.toggle("done", acceptedStage ? Boolean(job.result_detail?.accepted)
-      : Number(job.progress) >= Number(stage.dataset.threshold));
+  elements.stageTrack.querySelectorAll("[data-stage]").forEach((stage) => {
+    const status = stageStatus(job, stage.dataset.stage);
+    stage.classList.toggle("done", status === "done");
+    stage.classList.toggle("active", status === "active");
+    stage.classList.toggle("blocked", status === "blocked");
+    stage.title = {done: "已完成", active: "进行中", blocked: "已阻塞", pending: "尚未完成"}[status];
   });
   renderFeasibility(job.feasibility || {});
   renderMemory(state.memory, job.memory_detail || {});

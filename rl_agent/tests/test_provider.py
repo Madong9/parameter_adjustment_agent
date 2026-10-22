@@ -833,12 +833,17 @@ def test_mixed_visual_request_uploads_document_and_images_separately(monkeypatch
             return result('{"uploaded":true,"files":1}')
         if "eval" in args:
             script = args[-1]
-            if "const documents" in script:
+            if "upload.files.push(" in script:
+                return result('{"ok":true,"files":1}')
+            if ".chunks.push(" in script:
+                return result('{"ok":true,"chunks":1}')
+            if "new File" in script:
                 return result('{"ok":true,"count":1,"names":["visual_需求文档.md"]}')
             if "media.length" in script:
                 assert ('contact_sheet.png' in script or
                         ('visual_需求文档.md' in script and 'if (!false)' in script))
                 return result("true")
+            return result('{"ok":true}')
         return result("{}")
 
     provider = OpenCLIChatGPTWebProvider(runner=runner)
@@ -869,7 +874,13 @@ def test_document_upload_uses_in_page_file_object(monkeypatch, tmp_path):
         if "eval" in args:
             if "media.length" in args[-1]:
                 return result("true")
-            return result('{"ok":true,"count":1,"names":["requirements.md"]}')
+            if "upload.files.push(" in args[-1]:
+                return result('{"ok":true,"files":1}')
+            if ".chunks.push(" in args[-1]:
+                return result('{"ok":true,"chunks":1}')
+            if "new File" in args[-1]:
+                return result('{"ok":true,"count":1,"names":["requirements.md"]}')
+            return result('{"ok":true}')
         return result("{}")
 
     provider = OpenCLIChatGPTWebProvider(runner=runner)

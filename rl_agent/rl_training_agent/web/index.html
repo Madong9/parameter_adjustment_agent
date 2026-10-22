@@ -121,12 +121,13 @@
             </div>
             <p class="budget-notice" id="budgetNotice" role="status">当前实验的冻结额度尚未确认。</p>
             <div class="stage-track" id="stageTrack" aria-label="训练阶段">
-              <div data-threshold="10"><i></i><span>环境检查</span></div>
-              <div data-threshold="25"><i></i><span>奖励设计</span></div>
-              <div data-threshold="48"><i></i><span>冒烟训练</span></div>
-              <div data-threshold="74"><i></i><span>完整训练</span></div>
-              <div data-threshold="89"><i></i><span>视觉评估</span></div>
-              <div data-threshold="100"><i></i><span>联合验收通过</span></div>
+              <div data-stage="environment"><i></i><span>环境检查</span></div>
+              <div data-stage="intent"><i></i><span>动作理解与预检</span></div>
+              <div data-stage="reward"><i></i><span>奖励设计</span></div>
+              <div data-stage="smoke"><i></i><span>冒烟训练</span></div>
+              <div data-stage="full"><i></i><span>完整训练</span></div>
+              <div data-stage="visual"><i></i><span>视觉评估</span></div>
+              <div data-stage="acceptance"><i></i><span>联合验收通过</span></div>
             </div>
             <div class="review-reason hidden" id="reviewReason" role="status"></div>
             <div class="training-controls">

@@ -31,19 +31,25 @@ class RewardReviewAgent:
         risks: Set[str] = {str(item) for item in global_risks if str(item).strip()}
         candidate_results: List[RewardCandidateReview] = []
         registered = {item.get("name") for item in capabilities.get("rewards", [])}
+        registry = {item['name']: item for item in capabilities.get('rewards', []) if item.get('name')}
         required_metrics = {item.name for item in task.success_metrics if item.required}
         if not plans:
             omissions.append("奖励设计没有候选方案")
         for index, plan in enumerate(plans, start=1):
             candidate_omissions: List[str] = []
             candidate_conflicts: List[str] = []
+            if plan.task_id != task.task_id:
+                candidate_conflicts.append('奖励候选的任务编号与当前 TaskSpec 不一致')
             names = {item.name for item in plan.terms}
             if capabilities.get('require_objective_links'):
                 from ..rewards.quality_gate import audit_objectives
                 candidate_conflicts.extend(audit_objectives(task, plan)['errors'])
-            from ..rewards.validator import validate_plan_execution, validate_contact_contract, RewardValidationError
+            from ..rewards.validator import (validate_plan_execution, validate_contact_contract,
+                                             validate_registered_weights, RewardValidationError)
             try:
-                validate_plan_execution(plan)
+                limit = capabilities.get('max_abs_reward_weight', 100.)
+                validate_plan_execution(plan, limit)
+                validate_registered_weights(plan, registry, limit, ignore_unknown=True)
                 validate_contact_contract(task, plan)
                 from ..rewards.action_normalizer import validate_action_semantics
                 validate_action_semantics(task, plan)

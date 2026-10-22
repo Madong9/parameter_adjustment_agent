@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import sys
 from pathlib import Path
+from types import MethodType
 
 from rl_training_agent.training.contact_semantics import (
     nonfoot_indices as contact_indices,
@@ -57,6 +59,98 @@ def _tracked_camera_pose(base, yaw, offset):
     position = (world_x, world_y, float(base[2]) + float(offset[2]))
     target = (float(base[0]), float(base[1]), float(base[2]))
     return position, target
+
+
+def _install_terminal_state_capture(env, collect, on_terminal=None):
+    """仅给单环境采集器安装终止前快照，原生重置始终执行且普通 PPO 不受影响。"""
+    if env.num_envs != 1:
+        raise ValueError('terminal state capture requires a single rollout environment')
+    original = env.reset_idx
+    env._agent_rollout_terminal_snapshot = None
+
+    def reset_with_terminal_capture(self, env_ids):
+        """在奖励已计算而原生物理重置尚未执行时保存同一步证据及视频。"""
+        if len(env_ids) == 0 or not bool((env_ids == 0).any()):
+            return original(env_ids)
+        try:
+            snapshot = copy.deepcopy(collect())
+            snapshot['trajectory']['terminal_state_preserved'] = True
+            self._agent_rollout_terminal_snapshot = snapshot
+            if on_terminal is not None:
+                on_terminal(snapshot)
+        finally:
+            result = original(env_ids)
+        return result
+
+    env.reset_idx = MethodType(reset_with_terminal_capture, env)
+
+
+def _sample_after_step(env, collect, done):
+    """终止步必须使用重置前快照，不能把新姿态与旧奖励拼成合法采样。"""
+    snapshot = env._agent_rollout_terminal_snapshot
+    if done:
+        if snapshot is None or not snapshot['trajectory'].get('terminal_state_preserved'):
+            raise ValueError('rollout terminal step has no synchronized pre-reset snapshot')
+        return snapshot
+    if snapshot is not None:
+        raise ValueError('rollout terminal snapshot disagrees with the returned done flag')
+    return collect()
+
+
+def _sample_current_state(env, rigid, nonfoot_indices, joint_position_limits, joint_torque_limits):
+    """从当前物理步统一采集姿态、关节、接触、奖励和终止状态，返回独立标量列表。"""
+    import torch
+    env.gym.fetch_results(env.sim, True)
+    env.gym.refresh_rigid_body_state_tensor(env.sim)
+    feet = rigid[0, env.feet_indices, :]
+    done = bool(env.reset_buf[0])
+    timed_out = done and bool(env.time_out_buf[0])
+    contacts = env.contact_forces[0, env.feet_indices, 2] > 1.0
+    contact_flags = (contacts.detach().cpu().tolist() + [False, False, False, False])[:4]
+
+    def maximum_force(indices):
+        """读取指定刚体集合的真实最大接触力，空集合保持零。"""
+        forces = torch.norm(env.contact_forces[0, indices, :], dim=-1)
+        return float(torch.max(forces)) if forces.numel() else 0.0
+
+    collision_flags, forbidden_forces, _ = forbidden_contact_flags(env)
+    row = {
+        'episode_step': int(env.episode_length_buf[0]), 'terminal_state_preserved': False,
+        'base_x': float(env.base_pos[0, 0]), 'base_y': float(env.base_pos[0, 1]), 'base_z': float(env.base_pos[0, 2]),
+        'quat_x': float(env.base_quat[0, 0]), 'quat_y': float(env.base_quat[0, 1]),
+        'quat_z': float(env.base_quat[0, 2]), 'quat_w': float(env.base_quat[0, 3]),
+        'roll': float(env.rpy[0, 0]), 'pitch': float(env.rpy[0, 1]), 'yaw': float(env.rpy[0, 2]),
+        'base_vx': float(env.base_lin_vel[0, 0]), 'base_vy': float(env.base_lin_vel[0, 1]),
+        'base_vz': float(env.base_lin_vel[0, 2]), 'angular_velocity': float(torch.norm(env.base_ang_vel[0])),
+        'base_wx': float(env.base_ang_vel[0, 0]), 'base_wy': float(env.base_ang_vel[0, 1]),
+        'base_wz': float(env.base_ang_vel[0, 2]),
+        'joint_positions': env.dof_pos[0].detach().cpu().tolist(),
+        'joint_velocities': env.dof_vel[0].detach().cpu().tolist(),
+        'joint_torques': env.torques[0].detach().cpu().tolist(), 'actions': env.actions[0].detach().cpu().tolist(),
+        'joint_position_limits': joint_position_limits,
+        'joint_soft_position_limits': env.dof_pos_limits.detach().cpu().tolist(),
+        'joint_torque_limits': joint_torque_limits,
+        'feet_positions': feet[:, :3].detach().cpu().tolist(), 'feet_velocities': feet[:, 7:10].detach().cpu().tolist(),
+        'contact_fl': bool(contact_flags[0]), 'contact_fr': bool(contact_flags[1]),
+        'contact_rl': bool(contact_flags[2]), 'contact_rr': bool(contact_flags[3]),
+        'contact_forces': env.contact_forces[0, env.feet_indices, :].detach().cpu().tolist(),
+        'command': env.commands[0].detach().cpu().tolist(),
+        'termination_reason': ('timeout' if timed_out else 'reset') if done else '',
+        'penalized_contact_force_max': maximum_force(env.penalised_contact_indices),
+        'termination_contact_force_max': maximum_force(env.termination_contact_indices),
+        'nonfoot_contact_force_max': maximum_force(nonfoot_indices),
+        'forbidden_contact_force_max': float(forbidden_forces[0]),
+        'body_collision': bool(collision_flags[0]), 'fall': done and not timed_out,
+        'foot_slip': float(torch.max(torch.norm(feet[:, 7:9], dim=-1) * contacts.float())),
+        'energy': float(torch.sum(torch.abs(env.torques[0] * env.dof_vel[0])) * env.dt),
+        'base_speed': float(torch.norm(env.base_lin_vel[0, :2])), 'reward_total': float(env.rew_buf[0]),
+    }
+    reward_row = {'reward_total': row['reward_total']}
+    for name, scale in env.reward_scales.items():
+        raw = env.last_raw_rewards[name]
+        reward_row['raw_' + name] = float(raw[0])
+        reward_row['weighted_' + name] = float(raw[0] * scale)
+    return {'trajectory': row, 'rewards': reward_row}
 
 
 def main() -> int:
@@ -129,97 +223,62 @@ def main() -> int:
     joint_position_limits = np.column_stack((dof_properties['lower'], dof_properties['upper'])).tolist()
     joint_torque_limits = dof_properties['effort'].tolist()
     rows, reward_rows = [], []
+
+    def collect_current_sample():
+        """采集正常步或重置钩子调用时尚未被覆盖的同一步状态。"""
+        return _sample_current_state(env, rigid, nonfoot_indices, joint_position_limits, joint_torque_limits)
+
+    def record_frame(sample):
+        """按照当前同步状态定位相机，终止帧在原生重置前完成渲染。"""
+        row = sample['trajectory']
+        base = [row['base_x'], row['base_y'], row['base_z']]
+        for name, handle in cameras.items():
+            position, target = _tracked_camera_pose(base, row['yaw'], camera_offsets[name])
+            env.gym.set_camera_location(handle, env.envs[0], gymapi.Vec3(*position), gymapi.Vec3(*target))
+        env.gym.step_graphics(env.sim)
+        env.gym.render_all_camera_sensors(env.sim)
+        for name, handle in cameras.items():
+            rgba = env.gym.get_camera_image(env.sim, env.envs[0], handle, gymapi.IMAGE_COLOR)
+            rgba = np.asarray(rgba).reshape(height, width, 4)
+            writers[name].write(cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR))
+
+    record_video = False
+
+    def record_terminal_frame(sample):
+        """仅在本步应输出视频时保存终止前画面，其余步不额外渲染。"""
+        if record_video:
+            record_frame(sample)
+
+    _install_terminal_state_capture(env, collect_current_sample, record_terminal_frame)
     override = None if args.command_x is None else (
         float(args.command_x), float(args.command_y or 0.0), float(args.command_yaw or 0.0))
     if override is not None:
         env.commands[0, 0], env.commands[0, 1], env.commands[0, 2] = override
     obs = env.get_observations()
     video_frame = 0
+    episode_id = 0
     for step in range(steps):
+        record_video = step % video_interval == 0
+        env._agent_rollout_terminal_snapshot = None
         with torch.inference_mode():
             actions = policy(obs.detach())
         obs, _, rewards, dones, infos = env.step(actions.detach())
+        done = bool(dones[0])
+        sample = _sample_after_step(env, collect_current_sample, done)
         if override is not None:
             env.commands[0, 0], env.commands[0, 1], env.commands[0, 2] = override
             obs = env.get_observations()
-        env.gym.refresh_rigid_body_state_tensor(env.sim)
-        env.gym.fetch_results(env.sim, True)
-        record_video = step % video_interval == 0
         frame_index = video_frame if record_video else max(0, video_frame - 1)
-        if record_video:
-            base = env.base_pos[0].detach().cpu().tolist()
-            yaw = float(env.rpy[0, 2])
-            for name, handle in cameras.items():
-                offset = camera_offsets[name]
-                position, target = _tracked_camera_pose(base, yaw, offset)
-                env.gym.set_camera_location(
-                    handle, env.envs[0], gymapi.Vec3(*position), gymapi.Vec3(*target))
-            env.gym.step_graphics(env.sim)
-            env.gym.render_all_camera_sensors(env.sim)
-            for name, handle in cameras.items():
-                rgba = env.gym.get_camera_image(env.sim, env.envs[0], handle, gymapi.IMAGE_COLOR)
-                rgba = np.asarray(rgba).reshape(height, width, 4)
-                writers[name].write(cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR))
-        feet = rigid[0, env.feet_indices, :]
-        timed_out = bool(dones[0]) and bool(env.time_out_buf[0])
-        contacts = (env.contact_forces[0, env.feet_indices, 2] > 1.0)
-        contact_flags = [bool(value) for value in contacts.detach().cpu().tolist()]
-        # 四足任务使用 FL/FR/RL/RR；人形任务足端较少时补 False，保证通用轨迹表可写。
-        contact_flags = (contact_flags + [False, False, False, False])[:4]
-        penalized_contact_forces = torch.norm(
-            env.contact_forces[0, env.penalised_contact_indices, :], dim=-1)
-        penalized_contact_force_max = float(torch.max(penalized_contact_forces)) \
-            if penalized_contact_forces.numel() else 0.0
-        termination_contact_forces = torch.norm(
-            env.contact_forces[0, env.termination_contact_indices, :], dim=-1)
-        termination_contact_force_max = float(torch.max(termination_contact_forces)) \
-            if termination_contact_forces.numel() else 0.0
-        nonfoot_contact_forces = torch.norm(
-            env.contact_forces[0, nonfoot_indices, :], dim=-1)
-        nonfoot_contact_force_max = float(torch.max(nonfoot_contact_forces)) \
-            if nonfoot_contact_forces.numel() else 0.0
-        collision_flags, forbidden_forces, _ = forbidden_contact_flags(env)
-        forbidden_contact_force_max = float(forbidden_forces[0])
-        row = {
-            "sim_time": step * policy_dt, "video_frame": frame_index,
-            "base_x": float(env.base_pos[0, 0]), "base_y": float(env.base_pos[0, 1]), "base_z": float(env.base_pos[0, 2]),
-            "quat_x": float(env.base_quat[0, 0]), "quat_y": float(env.base_quat[0, 1]),
-            "quat_z": float(env.base_quat[0, 2]), "quat_w": float(env.base_quat[0, 3]),
-            "roll": float(env.rpy[0, 0]), "pitch": float(env.rpy[0, 1]), "yaw": float(env.rpy[0, 2]),
-            "base_vx": float(env.base_lin_vel[0, 0]), "base_vy": float(env.base_lin_vel[0, 1]),
-            "base_vz": float(env.base_lin_vel[0, 2]), "angular_velocity": float(torch.norm(env.base_ang_vel[0])),
-            "base_wx": float(env.base_ang_vel[0, 0]),
-            "base_wy": float(env.base_ang_vel[0, 1]),
-            "base_wz": float(env.base_ang_vel[0, 2]),
-            "joint_positions": env.dof_pos[0].detach().cpu().tolist(),
-            "joint_velocities": env.dof_vel[0].detach().cpu().tolist(),
-            "joint_torques": env.torques[0].detach().cpu().tolist(), "actions": env.actions[0].detach().cpu().tolist(),
-            "joint_position_limits": joint_position_limits,
-            "joint_soft_position_limits": env.dof_pos_limits.detach().cpu().tolist(),
-            "joint_torque_limits": joint_torque_limits,
-            "feet_positions": feet[:, :3].detach().cpu().tolist(), "feet_velocities": feet[:, 7:10].detach().cpu().tolist(),
-            "contact_fl": contact_flags[0], "contact_fr": contact_flags[1],
-            "contact_rl": contact_flags[2], "contact_rr": contact_flags[3],
-            "contact_forces": env.contact_forces[0, env.feet_indices, :].detach().cpu().tolist(),
-            "command": env.commands[0].detach().cpu().tolist(),
-            "termination_reason": ('timeout' if timed_out else 'reset') if bool(dones[0]) else '',
-            "penalized_contact_force_max": penalized_contact_force_max,
-            "termination_contact_force_max": termination_contact_force_max,
-            "nonfoot_contact_force_max": nonfoot_contact_force_max,
-            "forbidden_contact_force_max": forbidden_contact_force_max,
-            "body_collision": bool(collision_flags[0]),
-            "fall": bool(dones[0]) and not timed_out,
-            "foot_slip": float(torch.max(torch.norm(feet[:, 7:9], dim=-1) * contacts.float())),
-            "energy": float(torch.sum(torch.abs(env.torques[0] * env.dof_vel[0])) * policy_dt),
-            "base_speed": float(torch.norm(env.base_lin_vel[0, :2])), "reward_total": float(rewards[0]),
-        }
+        if record_video and not done:
+            record_frame(sample)
+        row = sample['trajectory']
+        row.update(sim_time=step * policy_dt, video_frame=frame_index, episode_id=episode_id)
         rows.append(row)
-        reward_row = {"sim_time": row["sim_time"], "video_frame": frame_index, "reward_total": row["reward_total"]}
-        for reward_name in env.reward_scales.keys():
-            raw = env.last_raw_rewards[reward_name]
-            reward_row["raw_" + reward_name] = float(raw[0])
-            reward_row["weighted_" + reward_name] = float(raw[0] * env.reward_scales[reward_name])
+        reward_row = sample['rewards']
+        reward_row.update(sim_time=row['sim_time'], video_frame=frame_index, episode_id=episode_id)
         reward_rows.append(reward_row)
+        if done:
+            episode_id += 1
         if record_video:
             video_frame += 1
     for writer in writers.values():
@@ -239,6 +298,9 @@ def main() -> int:
                 "joint_soft_limit_source": "environment dof_pos_limits; reward soft_dof_pos_limit",
                 "torque_limit_source": "Isaac Gym actor DOF properties effort",
                 "command_override": override,
+                "state_sampling": "post_reward_before_native_reset_on_terminal_steps",
+                "terminal_frames_preserved": sum(row['terminal_state_preserved'] for row in rows),
+                "rollout_episode_count": episode_id + int(not bool(dones[0])),
                 "nonfoot_rigid_body_count": int(nonfoot_indices.numel()),
                 "penalized_contact_patterns": list(env.cfg.asset.penalize_contacts_on),
                 "termination_contact_patterns": list(env.cfg.asset.terminate_after_contacts_on)}

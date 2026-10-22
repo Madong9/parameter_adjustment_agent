@@ -67,8 +67,26 @@ CHATGPT_ACCESS_STATE_SCRIPT = r"""
 })()
 """
 
-CHATGPT_SNAPSHOT_SCRIPT = r"""
-(() => {
+# “Thinking”也用于闲置的模型模式选择器，不能单独证明回复仍在生成。
+CHATGPT_GENERATION_CHECK_SCRIPT = r"""
+const isChatGPTGenerating = () => Array.from(document.querySelectorAll('button')).some(button => {
+  const style = getComputedStyle(button);
+  if (!button.getClientRects().length || style.visibility === 'hidden' || style.display === 'none' ||
+      button.disabled || button.getAttribute('aria-disabled') === 'true' ||
+      button.closest('[data-message-author-role], [data-chatgpt-search-unit-key], ' +
+        '[data-content-search-unit-key]')) return false;
+  return button.getAttribute('data-testid') === 'stop-button' ||
+    /^(?:Stop generating|Stop responding|停止生成|停止回答|停止|Stop)$/i.test(
+      (button.getAttribute('aria-label') || '').trim());
+});
+"""
+
+CHATGPT_GENERATION_SCRIPT = (
+    "(() => {\n" + CHATGPT_GENERATION_CHECK_SCRIPT +
+    "return JSON.stringify(isChatGPTGenerating());\n})()"
+)
+
+CHATGPT_SNAPSHOT_SCRIPT = "(() => {\n" + CHATGPT_GENERATION_CHECK_SCRIPT + r"""
   const roleOf = node => {
     const explicit = node.getAttribute('data-message-author-role');
     if (explicit === 'user' || explicit === 'assistant') return explicit;
@@ -124,11 +142,8 @@ CHATGPT_SNAPSHOT_SCRIPT = r"""
     composer_found: Boolean(composer),
     composer_text: composer ? (composer.isContentEditable ?
       (composer.innerText || composer.textContent || '') : String(composer.value || '')) : '',
-    url: location.href, extraction_version: 'chatgpt-dom-v2',
-    generating: Boolean(document.querySelector('button[data-testid="stop-button"]')) ||
-      Array.from(document.querySelectorAll('button')).some(button =>
-        /Stop generating|Stop responding|停止生成|停止回答|Thinking|正在思考|^(?:停止|Stop)$/i.test(
-          (button.getAttribute('aria-label') || '').trim()))
+    url: location.href, extraction_version: 'chatgpt-dom-v3',
+    generating: isChatGPTGenerating()
   });
 })()
 """

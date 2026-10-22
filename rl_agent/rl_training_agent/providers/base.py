@@ -10,6 +10,7 @@ from ..feasibility.motion_prototype.schema import MotionPrototype
 from ..schemas.decisions import TrainingDiagnosis
 from ..schemas.experiments import ConversationHandle, ProviderHealth
 from ..schemas.rewards import RewardPlan
+from ..schemas.reward_repairs import RewardRepairBundle
 from ..schemas.task import TaskSpec
 from ..schemas.visual import VisualBehaviorReport
 
@@ -46,6 +47,12 @@ class LLMReasoningProvider(Protocol):
         ...
     def design_task_bundle(self, compiled_prompt: str) -> Dict[str, Any]:
         """执行本地固定模板编译后的奖励设计请求。"""
+        ...
+    def repair_reward_plans(self, payload: Dict[str, Any]) -> RewardRepairBundle:
+        """仅修复请求允许的候选字段，返回与来源哈希绑定的补丁。"""
+        ...
+    def redesign_rewards(self, payload: Dict[str, Any]) -> RewardPlan:
+        """依据训练失败证据设计新提案，提案问题通过局部补丁修复。"""
         ...
     def design_visual_evaluation(self, task: TaskSpec) -> Dict[str, Any]:
         """为任务生成视觉评估输入与事件设计。"""

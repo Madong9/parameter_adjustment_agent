@@ -15,6 +15,7 @@ from rl_training_agent.web_ui import (
     create_server,
     interpret_job_outcome,
     state_presentation,
+    stage_track_presentation,
     training_stage_progress,
     validate_job_request,
 )
@@ -62,6 +63,79 @@ def test_state_presentation_uses_chinese_stages():
     assert state_presentation("TASK_FEASIBILITY_CHECK")["stage_label"] == "预检动作可行性"
     assert state_presentation("MEMORY_CURATING")["progress"] == 99
     assert state_presentation("COMPLETED")["progress"] == 100
+
+
+@pytest.mark.parametrize("state", ["HUMAN_REVIEW", "FAILED"])
+def test_blocked_or_failed_progress_stays_at_reached_stage(state):
+    """正常结束或失败都不能把尚未训练的任务进度推进到百分之百。"""
+    history = [{"state": "RECEIVED"}, {"state": "ENVIRONMENT_INSPECTED"},
+               {"state": "TASK_UNDERSTANDING"}, {"state": state}]
+    presentation = state_presentation(state, history)
+    assert presentation["progress"] == 13
+    assert "理解动作" in presentation["stage_label"]
+    assert state_presentation(state)["progress"] == 0
+
+
+def test_new_run_does_not_inherit_old_training_progress_or_stage_lights():
+    """同任务的历史 PPO 与视觉评估不污染本次动作理解阶段的阻塞显示。"""
+    history = [{"state": "FULL_TRAINING"}, {"state": "ROLLOUT_COLLECTING"},
+               {"state": "VISUAL_EVALUATING"}, {"state": "NUMERIC_EVALUATING"},
+               {"state": "RECEIVED", "reason": "new_run", "run_id": "new"},
+               {"state": "ENVIRONMENT_INSPECTED"}, {"state": "TASK_UNDERSTANDING"},
+               {"state": "HUMAN_REVIEW"}]
+    assert state_presentation("HUMAN_REVIEW", history)["progress"] == 13
+    stages = stage_track_presentation("HUMAN_REVIEW", history, False)
+    assert stages == {"environment": "done", "intent": "blocked", "reward": "pending",
+                      "smoke": "pending", "full": "pending", "visual": "pending", "acceptance": "pending"}
+    assert interpret_job_outcome("HUMAN_REVIEW", 0, history)[1] == "训练尚未开始，任务设计等待人工复核"
+
+
+def test_stage_track_distinguishes_running_training_from_completed_training():
+    """进入完整训练不能冒充完整训练已完成，采集回放后才有完成证据。"""
+    history = [{"state": "SMOKE_TRAINING"}, {"state": "FULL_TRAINING"}]
+    stages = stage_track_presentation("FULL_TRAINING", history, False)
+    assert stages["smoke"] == "done" and stages["full"] == "active"
+    assert stages["visual"] == "pending" and stages["acceptance"] == "pending"
+    history += [{"state": "ROLLOUT_COLLECTING"}, {"state": "VISUAL_EVALUATING"},
+                {"state": "HUMAN_REVIEW"}]
+    stages = stage_track_presentation("HUMAN_REVIEW", history, False)
+    assert stages["full"] == "done" and stages["visual"] == "blocked"
+    assert stages["acceptance"] == "pending"
+
+
+def test_stage_track_requires_acceptance_evidence_for_final_light():
+    """终止状态和模型诊断不能替代联合验收证据，真实通过才能点亮最终步骤。"""
+    history = [{"state": "NUMERIC_EVALUATING"}, {"state": "DIAGNOSING"}]
+    assert stage_track_presentation("HUMAN_REVIEW", history, False)["acceptance"] == "blocked"
+    assert stage_track_presentation("COMPLETED", history, False)["acceptance"] == "pending"
+    assert stage_track_presentation("COMPLETED", history, True)["acceptance"] == "done"
+
+
+def test_early_review_job_shows_unstarted_training_and_unfrozen_budget(tmp_path):
+    """复现截图里的澄清任务，API 保留真实进度且不显示预算记录损坏。"""
+    manager = JobManager(_settings(tmp_path))
+    job_id, task_id = "012345abcdef", "task-clarify"
+    manager._jobs[job_id] = {
+        "job_id": job_id, "task_id": task_id, "task": "向前翻跟头", "robot": "go2", "mode": "real",
+        "status": "review", "return_code": 0, "created_at": "2026-01-02T00:00:00+00:00",
+        "started_at": "2026-01-02T00:00:00+00:00", "finished_at": "2026-01-02T00:01:00+00:00",
+        "message": "训练尚未开始，任务设计等待人工复核"}
+    root = manager.settings.experiments_path / task_id
+    root.mkdir(parents=True)
+    (root / "state.json").write_text(json.dumps({
+        "state": "HUMAN_REVIEW", "updated_at": "2026-01-02T00:00:30+00:00",
+        "history": [{"state": "FULL_TRAINING", "at": "2026-01-01T00:00:00+00:00"},
+                    {"state": "RECEIVED", "reason": "new_run", "run_id": "current"},
+                    {"state": "ENVIRONMENT_INSPECTED"}, {"state": "TASK_UNDERSTANDING"},
+                    {"state": "HUMAN_REVIEW"}]}), encoding="utf-8")
+    result = manager.get_job(job_id)
+    assert result["progress"] == 13 and result["stage_detail"]["intent"] == "blocked"
+    assert result["stage_detail"]["full"] == "pending"
+    assert len(result["history"]) == 4
+    assert result["budget_detail"]["status"] == "not_started"
+    assert not result["budget_detail"]["valid"] and not result["can_resume"]
+    assert result["result_detail"]["training_status"] == "not_started"
+    assert result["result_detail"]["acceptance_status"] == "not_started"
 
 
 def test_config_payload_exposes_multi_agent_and_memory_status(tmp_path):
@@ -162,6 +236,31 @@ def test_old_completed_job_is_dynamically_corrected_to_review(tmp_path):
         "history": [{"state": "TASK_DESIGNED", "at": "2026-01-01T00:00:20+00:00"}],
     }))
     assert manager.get_job(job_id)["status"] == "review"
+
+
+def test_failed_reward_process_does_not_display_design_as_active(tmp_path):
+    """旧作业退出而状态未更新时只读展示实际阻塞阶段，历史和训练证据保持原样。"""
+    settings = _settings(tmp_path)
+    manager = JobManager(settings)
+    job_id, task_id = "012345abcdef", "task-stalled-reward"
+    manager._jobs[job_id] = {
+        "job_id": job_id, "task_id": task_id, "task": "向前腾空翻跟头", "robot": "go2",
+        "mode": "real", "status": "failed", "return_code": 2,
+        "created_at": "2026-01-01T00:00:00+00:00", "started_at": "2026-01-01T00:00:00+00:00",
+        "finished_at": "2026-01-01T00:16:00+00:00", "message": "训练异常退出"}
+    task_dir = settings.experiments_path / task_id
+    task_dir.mkdir(parents=True)
+    state_path = task_dir / "state.json"
+    saved = json.dumps({"state": "REWARD_DESIGNING", "updated_at": "2026-01-01T00:01:00+00:00",
+        "history": [{"state": value} for value in (
+            "RECEIVED", "TASK_UNDERSTANDING", "TASK_FEASIBILITY_CHECK", "CONTEXT_BUILDING", "REWARD_DESIGNING")]})
+    state_path.write_text(saved)
+    job = manager.get_job(job_id)
+    assert job["state"] == "FAILED" and job["progress"] < 30
+    assert "奖励" in job["stage_label"] and job["stage_detail"]["reward"] == "blocked"
+    assert job["stage_detail"]["full"] == "pending"
+    assert job["budget_detail"]["status"] == "not_started" and not job["can_resume"]
+    assert state_path.read_text() == saved
 
 
 def test_job_exposes_closed_loop_round_and_reward_version(tmp_path):

@@ -8,8 +8,81 @@ ACTION_REWARDS = {
     "landing_recovery": ["contact_forces", "rpy", "base_lin_vel", "base_ang_vel"],
     "stable_support": ["contact_forces", "rpy", "base_lin_vel", "base_ang_vel"],
     "net_roll_progress": ["rpy", "contact_forces"],
+    "pitch_rotation": ["base_ang_vel", "contact_forces"],
+    "net_pitch_progress": ["base_quat", "contact_forces"],
+    "front_flip_recovery": ["base_quat", "contact_forces", "rpy", "base_lin_vel", "base_ang_vel"],
 }
 RUNTIME_SAFETY_REWARDS = {'torque_limits': ['torques', 'torque_limits']}
+
+
+def _update_front_flip_progress(env):
+    """每个控制步仅更新一次首个腾空区间的有方向旋转，重复起跳与重置不叠加。"""
+    import torch
+    from ..utils.rotation import quaternion_increment_torch
+    stamp = getattr(env, 'common_step_counter', None)
+    steps = env.episode_length_buf
+    contacts = _contacts(env)
+    airborne = ~contacts.any(dim=1)
+    if not hasattr(env, '_agent_pitch_previous'):
+        env._agent_pitch_previous = env.base_quat.clone()
+        env._agent_pitch_steps = steps.clone()
+        env._agent_pitch_airborne = airborne.clone()
+        env._agent_pitch_grounded = contacts.all(dim=1)
+        env._agent_pitch_flights = torch.zeros_like(steps)
+        env._agent_pitch_net = torch.zeros_like(env.base_ang_vel[:, 1])
+        env._agent_pitch_peak = torch.zeros_like(env._agent_pitch_net)
+        env._agent_pitch_valid = torch.ones_like(airborne)
+        env._agent_pitch_reward = torch.zeros_like(env._agent_pitch_net)
+        env._agent_pitch_stamp = stamp
+        return
+    if stamp is not None and stamp == env._agent_pitch_stamp:
+        return
+    updated = torch.ones_like(airborne) if stamp is not None else steps != env._agent_pitch_steps
+    fresh = (steps <= 1) & updated
+    rotation, valid = quaternion_increment_torch(env._agent_pitch_previous, env.base_quat)
+    previous_air = env._agent_pitch_airborne & ~fresh
+    grounded = torch.where(fresh, contacts.all(dim=1), env._agent_pitch_grounded | contacts.all(dim=1))
+    flights = torch.where(fresh, torch.zeros_like(steps), env._agent_pitch_flights)
+    flights += (updated & ~fresh & airborne & ~previous_air & grounded).long()
+    in_flight = updated & ~fresh & (airborne | previous_air) & (flights == 1) & grounded
+    net = torch.where(fresh, torch.zeros_like(env._agent_pitch_net), env._agent_pitch_net)
+    old_progress = torch.clamp(net / env.cfg.rewards.net_pitch_target, 0., 1.)
+    net += torch.where(in_flight & valid, rotation[:, 1], torch.zeros_like(net))
+    progress = torch.clamp(net / env.cfg.rewards.net_pitch_target, 0., 1.)
+    peak = torch.where(fresh, torch.zeros_like(env._agent_pitch_peak), env._agent_pitch_peak)
+    episode_valid = torch.where(fresh, torch.ones_like(valid), env._agent_pitch_valid)
+    episode_valid &= ~(in_flight & ~valid)
+    gain = torch.clamp(progress - peak, min=0.)
+    backtrack = torch.clamp(progress - old_progress, max=0.)
+    env._agent_pitch_reward = torch.where(in_flight & episode_valid, gain + backtrack, torch.zeros_like(net)) / env.dt
+    env._agent_pitch_previous = torch.where(updated[:, None], env.base_quat, env._agent_pitch_previous).clone()
+    env._agent_pitch_steps = steps.clone()
+    env._agent_pitch_airborne = torch.where(updated, airborne, env._agent_pitch_airborne)
+    env._agent_pitch_grounded, env._agent_pitch_flights = grounded, flights
+    env._agent_pitch_net, env._agent_pitch_peak = net, torch.maximum(peak, progress)
+    env._agent_pitch_valid, env._agent_pitch_stamp = episode_valid, stamp
+
+
+def _reward_net_pitch_progress(self):
+    """奖励首个腾空动作的正向横轴净旋转，正收益封顶，回摆不重复刷分。"""
+    _update_front_flip_progress(self)
+    return self._agent_pitch_reward
+
+
+def _reward_pitch_rotation(self):
+    """只在腾空时跟踪正向俯仰角速度，错误方向和其他轴速度增加误差。"""
+    import torch
+    error = ((self.base_ang_vel[:, 1] - self.cfg.rewards.pitch_rate_target) ** 2 +
+             self.base_ang_vel[:, 0] ** 2 + self.base_ang_vel[:, 2] ** 2)
+    return (~_contacts(self).any(dim=1)).float() * torch.exp(-error / self.cfg.rewards.pitch_rate_sigma)
+
+
+def _reward_front_flip_recovery(self):
+    """先完成首个正向横轴净旋转，再奖励全足落地后的低姿态误差和稳定支撑。"""
+    _update_front_flip_progress(self)
+    completed = (self._agent_pitch_valid & (self._agent_pitch_flights == 1) &
+                 (self._agent_pitch_net >= self.cfg.rewards.net_pitch_target - 1e-3))
+    return completed.float() * _reward_stable_support(self)
 
 
 def _reward_net_roll_progress(self):

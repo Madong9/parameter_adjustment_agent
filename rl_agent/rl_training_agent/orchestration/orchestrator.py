@@ -43,7 +43,7 @@ from ..memory.reward_experience.evidence_builder import RewardExperienceEvidence
 from ..memory.reward_experience.validator import RewardExperienceValidationError, RewardExperienceValidator
 from ..observability.events import JsonlEventRecorder
 from ..providers.base import LLMReasoningProvider
-from ..providers.errors import ProviderError
+from ..providers.errors import ProviderError, ProviderResponseError
 from ..providers.mock_provider import MockLLMReasoningProvider
 from ..providers.multi_agent import MultiAgentProvider
 from ..providers.opencli_chatgpt import OpenCLIChatGPTWebProvider
@@ -67,7 +67,7 @@ from ..training.controller import TrainingController
 from ..training.process_manager import process_identity
 from ..utils.io import atomic_write_text, read_json, utc_now, write_json
 from ..utils.paths import relative_display
-from ..utils.task_semantics import is_front_leg_support_text
+from ..utils.task_semantics import ForwardFlipKind, classify_forward_flip, is_front_leg_support_text
 from ..visual.evaluation_pipeline import VisualEvaluationPipeline
 from ..visual.ensemble import ConservativeVisualAggregator
 from ..visual.rollout_recorder import DryRunRolloutRecorder
@@ -211,9 +211,12 @@ class TrainingOrchestrator:
             return None
         reason = ('动作目标需要澄清：' if report.status == 'NEEDS_CLARIFICATION' else
                   '动作语义不一致，已禁止启动训练：') + '；'.join(report.issues)
+        if report.question:
+            reason += '；' + report.question
         result = {'task_id': task_dir.name, 'state': AgentState.HUMAN_REVIEW.value,
                   'result': 'human_review', 'reason': reason,
-                  'semantic_check': report.dict(), 'requires_clarification': True}
+                  'semantic_check': report.dict(),
+                  'requires_clarification': report.status == 'NEEDS_CLARIFICATION'}
         write_json(task_dir / 'blocking_report.json', result)
         state.transition(AgentState.HUMAN_REVIEW, {'reason': reason},
                          operation_id='semantic-block:%s:%s' % (
@@ -221,6 +224,117 @@ class TrainingOrchestrator:
         self._write_working_memory(task_dir, state)
         print('[任务语义] %s' % reason, flush=True)
         return result
+
+    def _repair_reward_candidates(self, task, task_dir, plans, review, manifest,
+                                  record_root, attempt, extra_context=None, require_objective_links=True):
+        """仅为本地定位的问题请求补丁；不重新生成任务或完整候选。"""
+        from ..rewards.repair_scope import build_repair_scope
+        from ..rewards.patches import apply_reward_repairs, reward_plan_sha256
+        targets, blocked = [], []
+        for candidate in review.candidate_results:
+            if candidate.approved:
+                continue
+            index = candidate.candidate_index
+            plan = plans[index - 1]
+            scope = build_repair_scope(task, plan, dict(manifest.dict(), require_objective_links=require_objective_links,
+                                                      max_abs_reward_weight=self.settings.max_abs_reward_weight))
+            blocked.extend({'candidate_index': index, 'issue': issue} for issue in scope.get('blocked', []))
+            if scope['allowed_patches']:
+                targets.append({'candidate_index': index, 'base_sha256': reward_plan_sha256(plan),
+                    'reward_plan': plan.dict(), 'allowed_patches': scope['allowed_patches'],
+                    'issues': scope['issues'], 'review': candidate.dict()})
+        payload = {'immutable_task': task.dict(), 'environment_manifest': manifest.dict(),
+                   'targets': targets, 'blocked': blocked, 'attempt': attempt}
+        if extra_context:
+            payload.update(extra_context)
+        record_root.mkdir(parents=True, exist_ok=True)
+        write_json(record_root / ('request_%02d.json' % attempt), payload)
+        if not targets:
+            raise RewardValidationError('没有可安全定位的奖励字段修复范围；保留原始候选')
+        repair = getattr(self.provider, 'repair_reward_plans', None)
+        if not callable(repair):
+            raise RewardValidationError('当前奖励 Provider 不支持局部补丁修复；保留原始候选')
+        raw = self._provider_call(task_dir, 'reward_designer', 'repair_reward_plans',
+                                  lambda: repair(payload))
+        write_json(record_root / ('response_%02d.json' % attempt), raw)
+        revised, audit = apply_reward_repairs(plans, targets, raw)
+        write_json(record_root / ('patch_audit_%02d.json' % attempt), audit)
+        write_json(record_root / ('effective_plans_%02d.json' % attempt), [plan.dict() for plan in revised])
+        if not audit['accepted']:
+            reasons = '；'.join(item['reason'] for item in audit['rejected'])
+            raise RewardValidationError('奖励补丁没有产生有效局部修改：' + (reasons or '空补丁或内容未改变'))
+        return revised, audit
+
+    def _block_initial_provider_failure(self, task_dir: Path, state: PersistentStateMachine,
+                                        role: str, error: ProviderError) -> Dict[str, Any]:
+        """保存训练前推理故障及重新下发方式，防止进程退出后仍显示正在设计。"""
+        stage = state.record.state.value
+        label = {AgentState.TASK_UNDERSTANDING.value: "任务理解",
+                 AgentState.REWARD_DESIGNING.value: "奖励设计"}[stage]
+        detail = re.sub(r"\s+", " ", str(error)).strip()
+        if len(detail) > 1000:
+            detail = detail[:997] + "..."
+        failure_kind = 'response_schema' if isinstance(error, ProviderResponseError) else 'provider_unavailable'
+        reason = ("%s回复结构不合格：%s" if failure_kind == 'response_schema' else
+                  "%s Provider 不可用：%s") % (label, detail or error.__class__.__name__)
+        report = {"task_id": task_dir.name, "state": AgentState.HUMAN_REVIEW.value,
+                  "result": "human_review", "stage": stage, "recoverable": True,
+                  "failure_kind": failure_kind,
+                  "resume_allowed": False, "restart_required": True, "reason": reason,
+                  "recovery_hint": ("本轮尚未启动 PPO；回复格式未通过校验，修复结构后可重新下发原始任务。"
+                                    if failure_kind == 'response_schema' else
+                                    "本轮尚未启动 PPO；检查推理页面或连接后重新下发原始任务。")}
+        write_json(task_dir / "blocking_report.json", report)
+        state.transition(AgentState.HUMAN_REVIEW, {"reason": reason, "provider_stage": role},
+                         operation_id="initial-provider-failure:%s:%s" % (
+                             state.record.context.get("run_id"), role))
+        self._write_working_memory(task_dir, state)
+        print("[%s] %s" % (label, reason), flush=True)
+        return report
+
+    def _check_action_capabilities(self, task_dir: Path, state: PersistentStateMachine,
+                                   intent: TaskIntentSpec, capabilities: Dict[str, Any]
+                                   ) -> Optional[Dict[str, Any]]:
+        """在动作求解和奖励请求前报告前翻的本地能力缺口。"""
+        gaps = TaskSemanticValidator.action_capability_gaps(intent, capabilities)
+        if not gaps:
+            return None
+        reason = "动作所需本地实现尚未补齐，已禁止启动训练：" + "；".join(gaps)
+        report = {'task_id': task_dir.name, 'state': AgentState.HUMAN_REVIEW.value,
+                  'result': 'human_review', 'stage': 'action_capability_check',
+                  'reason': reason, 'capability_gaps': gaps, 'requires_local_implementation': True,
+                  'requires_clarification': False}
+        write_json(task_dir / 'action_capability_check.json', report)
+        write_json(task_dir / 'blocking_report.json', report)
+        state.events.emit('action_capability_check', report)
+        state.transition(AgentState.HUMAN_REVIEW, {'reason': reason})
+        self._write_working_memory(task_dir, state)
+        print('[动作能力] %s' % reason, flush=True)
+        return report
+
+    def _check_task_contract(self, task_dir: Path, state: PersistentStateMachine,
+                             task: TaskSpec) -> Optional[Dict[str, Any]]:
+        """冻结验收前检查任务接触单位，不能让奖励重试修复不可修改的坏合同。"""
+        from ..training.contact_semantics import contact_contract
+        try:
+            contact_contract(task.safety_constraints)
+        except ValueError as exc:
+            detail = str(exc)
+            report = {'task_id': task_dir.name, 'state': AgentState.HUMAN_REVIEW.value,
+                      'result': 'human_review', 'stage': 'task_contract_check',
+                      'approved': False,
+                      'reason': '任务接触合同无效，须修正任务设计：' + detail,
+                      'errors': [detail], 'requires_task_redesign': True,
+                      'requires_clarification': False}
+            write_json(task_dir / 'task_contract_check.json', report)
+            write_json(task_dir / 'blocking_report.json', report)
+            state.events.emit('task_contract_check', report)
+            state.transition(AgentState.HUMAN_REVIEW, {'reason': report['reason']})
+            self._write_working_memory(task_dir, state)
+            print('[任务合同] %s' % report['reason'], flush=True)
+            return report
+        write_json(task_dir / 'task_contract_check.json', {'approved': True, 'errors': []})
+        return None
 
     @staticmethod
     def _normalize_plan_for_task(task: TaskSpec, plan: RewardPlan) -> List[str]:
@@ -548,7 +662,10 @@ class TrainingOrchestrator:
                      "loop_history.json", "loop_blocking_error.txt", "feasibility_report.json",
                      "training_admission.json", "training_readiness.json", "environment_health.json",
                      "acceptance_contract.json", "evaluation_protocol.json", "training_execution.json",
-                     "intent_semantic_check.json", "task_semantic_check.json"):
+                     "intent_semantic_check.json", "task_semantic_check.json",
+                     "action_capability_check.json", "task_contract_check.json",
+                     "local_reward_baseline.json", "reward_review_before_baseline.json",
+                     "reward_review_with_baseline.json", "task_identity_normalization.json"):
             path = task_dir / name
             if path.is_file():
                 path.unlink()
@@ -960,7 +1077,7 @@ class TrainingOrchestrator:
         semantics = TaskSemanticValidator.assess_task(intent, task)
         if semantics.status != 'CONSISTENT':
             raise RuntimeError('恢复被拒绝：原动作语义需要澄清或与验收合同冲突；%s。'
-                               '请明确贴地侧滚或腾空侧翻后建立新实验，不能改写旧合同恢复。%s' % (
+                               '请明确动作、旋转轴与接触方式后建立新实验，不能改写旧合同恢复。%s' % (
                                    '；'.join(semantics.issues), semantics.question or ''))
         loop_records = read_json(task_dir / "loop_history.json") \
             if (task_dir / "loop_history.json").is_file() else []
@@ -1148,29 +1265,7 @@ class TrainingOrchestrator:
                     retrieval_keywords=[robot, instruction],
                 )
         except ProviderError as exc:
-            # 推理服务异常不能伪装成“仍在检查动作可行性”。持久化真实阶段和
-            # 可恢复终态，让上位机结束轮询，并允许用户修复页面后重新下发。
-            detail = re.sub(r"\s+", " ", str(exc)).strip()
-            if len(detail) > 1000:
-                detail = detail[:997] + "..."
-            reason = "任务理解 Provider 不可用：%s" % (detail or exc.__class__.__name__)
-            report = {
-                "task_id": task_id,
-                "state": AgentState.HUMAN_REVIEW.value,
-                "result": "human_review",
-                "stage": AgentState.TASK_UNDERSTANDING.value,
-                "recoverable": True,
-                "reason": reason,
-            }
-            write_json(task_dir / "blocking_report.json", report)
-            state.transition(
-                AgentState.HUMAN_REVIEW,
-                {"reason": reason, "provider_stage": "task_planner"},
-                operation_id="task-understanding-provider-failure:" + run_id,
-            )
-            self._write_working_memory(task_dir, state)
-            print("[任务理解] %s" % reason, flush=True)
-            return report
+            return self._block_initial_provider_failure(task_dir, state, "task_planner", exc)
         # 用户输入和上位机选择是任务身份的唯一来源，模型不得改写机器人或原始指令。
         intent.original_instruction = instruction
         intent.robot = robot
@@ -1178,6 +1273,9 @@ class TrainingOrchestrator:
         semantic_block = self._check_task_semantics(task_dir, state, intent)
         if semantic_block is not None:
             return semantic_block
+        capability_block = self._check_action_capabilities(task_dir, state, intent, manifest.dict())
+        if capability_block is not None:
+            return capability_block
         self._write_working_memory(task_dir, state)
 
         state.transition(AgentState.TASK_FEASIBILITY_CHECK, {
@@ -1305,6 +1403,8 @@ class TrainingOrchestrator:
         state.transition(AgentState.CONTEXT_BUILDING, {"agent_role": "context_builder"})
         context = self.context_builder.build(
             intent, manifest.dict(), rag_context, memory_context)
+        context['current_task_identity'] = {'task_id': task_id, 'robot': robot,
+                                            'original_instruction': instruction}
         context["training_admission"] = admission.dict()
         context["motion_constraints"] = feasibility_report.motion_constraint_spec
         context["robot_capability"] = {
@@ -1322,7 +1422,7 @@ class TrainingOrchestrator:
 
         state.transition(AgentState.PROMPT_COMPILING, {"agent_role": "prompt_compiler"})
         compiled_prompt = self.prompt_compiler.compile(
-            intent, context, self.settings.num_reward_candidates)
+            intent, context, self.settings.num_reward_candidates, task_id=task_id)
         atomic_write_text(task_dir / "prompts" / "reward_design_prompt.md",
                           compiled_prompt["prompt"] + "\n")
         write_json(task_dir / "prompts" / "reward_design_prompt.json", {
@@ -1333,6 +1433,7 @@ class TrainingOrchestrator:
         augmented_capabilities["retrieved_experience"] = rag_context
         augmented_capabilities["long_term_memory"] = memory_context
         augmented_capabilities["task_intent"] = intent.dict()
+        augmented_capabilities['current_task_identity'] = context['current_task_identity']
         augmented_capabilities["training_admission"] = admission.dict()
         augmented_capabilities["motion_constraints"] = feasibility_report.motion_constraint_spec
         augmented_capabilities["robot_capability"] = context["robot_capability"]
@@ -1352,18 +1453,26 @@ class TrainingOrchestrator:
         }
         write_json(task_dir / "design_request.json", design_request)
         state.transition(AgentState.REWARD_DESIGNING, {"agent_role": "reward_designer"})
-        if hasattr(self.provider, "design_task_bundle"):
-            design = self._provider_call(
-                task_dir, "reward_designer", "design_task_bundle",
-                lambda: self.provider.design_task_bundle(compiled_prompt["prompt"]))
-        else:
-            design = self._provider_call(
-                task_dir, "reward_designer", "design_task_and_rewards",
-                lambda: self.provider.design_task_and_rewards(
-                    instruction, robot, augmented_capabilities))
+        try:
+            if hasattr(self.provider, "design_task_bundle"):
+                design = self._provider_call(
+                    task_dir, "reward_designer", "design_task_bundle",
+                    lambda: self.provider.design_task_bundle(compiled_prompt["prompt"]))
+            else:
+                design = self._provider_call(
+                    task_dir, "reward_designer", "design_task_and_rewards",
+                    lambda: self.provider.design_task_and_rewards(
+                        instruction, robot, augmented_capabilities))
+        except ProviderError as exc:
+            return self._block_initial_provider_failure(task_dir, state, "reward_designer", exc)
         write_json(task_dir / "design_response.json", design)
         write_json(task_dir / "design_response_attempt_00.json", design)
         task = TaskSpec.parse_obj(design["task_spec"])
+        write_json(task_dir / 'task_identity_normalization.json', {
+            'provided': {'task_id': task.task_id, 'robot': task.robot,
+                         'original_instruction': task.original_instruction},
+            'effective': context['current_task_identity'], 'source': 'user_request',
+            'reward_plan_task_ids': [plan.get('task_id') for plan in design['reward_plans']]})
         task.task_id = task_id
         task.robot = robot
         task.original_instruction = instruction
@@ -1381,6 +1490,9 @@ class TrainingOrchestrator:
         semantic_block = self._check_task_semantics(task_dir, state, intent, task)
         if semantic_block is not None:
             return semantic_block
+        contract_block = self._check_task_contract(task_dir, state, task)
+        if contract_block is not None:
+            return contract_block
         if unsupported:
             report = {"task_id": task_id, "state": AgentState.HUMAN_REVIEW.value,
                       "unsupported_requirements": unsupported,
@@ -1405,14 +1517,17 @@ class TrainingOrchestrator:
         plans = plans[:self.settings.num_reward_candidates]
         normalization_records = []
         for plan in plans:
+            provided_task_id = plan.task_id
             plan.task_id = task_id
             adjustments = self._normalize_plan_for_task(task, plan)
-            normalization_records.append({"version": plan.version, "adjustments": adjustments})
+            normalization_records.append({"version": plan.version, "adjustments": adjustments,
+                                          'provided_task_id': provided_task_id, 'effective_task_id': task_id})
         write_json(task_dir / "plan_normalization.json", normalization_records)
 
         state.transition(AgentState.REWARD_REVIEWING, {"agent_role": "reward_reviewer"})
         review = self.reward_reviewer.review(
-            intent, task, plans, dict(manifest.dict(), require_objective_links=not dry_run), design.get("reward_hacking_risks", []))
+            intent, task, plans, dict(manifest.dict(), require_objective_links=not dry_run,
+                     max_abs_reward_weight=self.settings.max_abs_reward_weight), design.get("reward_hacking_risks", []))
         from ..rewards.quality_gate import capability_gaps
         local_gaps = capability_gaps(task, manifest.dict())
         write_json(task_dir / 'reward_capability_gaps.json', {'gaps': local_gaps,
@@ -1421,43 +1536,40 @@ class TrainingOrchestrator:
             write_json(task_dir / ("reward_review_attempt_%02d.json" % attempt), review)
             if review.approved or local_gaps or attempt == self.settings.reward_design_review_retries:
                 break
-            # 只重新设计全被拒绝的奖励；任务与验收合同不可由修复请求降级。
-            feedback = {"attempt": attempt + 1, "review": review.dict(),
-                        "fixed_task_spec": task.dict(),
-                        "instruction": instruction, "robot": robot}
-            JsonlEventRecorder(task_dir / "events.jsonl").emit("reward_redesign", feedback)
-            retry_prompt = compiled_prompt["prompt"] + (
-                "\n奖励业务审查未通过。根据下列逐候选意见重新设计；保留原始动作、"
-                "环境能力及固定 TaskSpec 的全部验收标准，只修改 reward_plans。\n" +
-                json.dumps(feedback, ensure_ascii=False))
             try:
-                if hasattr(self.provider, "design_task_bundle"):
-                    design = self._provider_call(
-                        task_dir, "reward_designer", "review_redesign",
-                        lambda: self.provider.design_task_bundle(retry_prompt))
-                else:
-                    retry_context = dict(augmented_capabilities, reward_review_feedback=feedback)
-                    design = self._provider_call(
-                        task_dir, "reward_designer", "review_redesign",
-                        lambda: self.provider.design_task_and_rewards(
-                            instruction, robot, retry_context))
-                write_json(task_dir / ("design_response_attempt_%02d.json" % (attempt + 1)), design)
-                plans = [RewardPlan.parse_obj(item) for item in design["reward_plans"]
-                         ][:self.settings.num_reward_candidates]
-                normalization_records = []
-                for plan in plans:
-                    plan.task_id = task_id
-                    adjustments = self._normalize_plan_for_task(task, plan)
-                    normalization_records.append({"version": plan.version, "adjustments": adjustments})
-                write_json(task_dir / "plan_normalization.json", normalization_records)
-                write_json(task_dir / ("plan_normalization_attempt_%02d.json" % (attempt + 1)),
-                           normalization_records)
+                plans, patch_audit = self._repair_reward_candidates(
+                    task, task_dir, plans, review, manifest, task_dir / 'reward_repairs', attempt + 1,
+                    require_objective_links=not dry_run)
+                JsonlEventRecorder(task_dir / 'events.jsonl').emit('reward_field_repair', patch_audit)
+                write_json(task_dir / ("design_response_attempt_%02d.json" % (attempt + 1)), dict(
+                    design, task_spec=task.dict(), reward_plans=[plan.dict() for plan in plans]))
+                # 已规范化来源由补丁白名单保护；不能再调用可能改写无关项的规范化。
                 review = self.reward_reviewer.review(
-                    intent, task, plans, dict(manifest.dict(), require_objective_links=not dry_run), design.get("reward_hacking_risks", []))
+                    intent, task, plans, dict(manifest.dict(), require_objective_links=not dry_run,
+                     max_abs_reward_weight=self.settings.max_abs_reward_weight), design.get("reward_hacking_risks", []))
             except (ProviderError, ValueError, KeyError) as exc:
-                review.approved = False
-                review.conflicts.append("奖励重新设计失败：%s" % exc)
-                break
+                atomic_write_text(task_dir / 'reward_repairs' / ('error_%02d.txt' % (attempt + 1)), str(exc) + '\n')
+                review.conflicts.append("奖励局部修复失败：%s" % exc)
+        if not review.approved and not local_gaps:
+            from ..rewards.front_flip_baseline import BASELINE_VERSION, build_front_flip_baseline
+            baseline = build_front_flip_baseline(task, manifest.dict(),
+                version=max((plan.version for plan in plans), default=0) + 1)
+            if baseline is not None:
+                write_json(task_dir / 'reward_review_before_baseline.json', review)
+                write_json(task_dir / 'local_reward_baseline.json', {
+                    'source': BASELINE_VERSION, 'run_id': run_id,
+                    'reason': '模型候选全部被拒绝；提交独立本地基线，保持冻结任务合同与原有审核',
+                    'task_identity': self._task_acceptance_identity(task), 'reward_plan': baseline.dict()})
+                plans.append(baseline)
+                review = self.reward_reviewer.review(intent, task, plans,
+                    dict(manifest.dict(), require_objective_links=True,
+                         max_abs_reward_weight=self.settings.max_abs_reward_weight), design.get('reward_hacking_risks', []))
+                write_json(task_dir / 'reward_review_with_baseline.json', review)
+                JsonlEventRecorder(task_dir / 'events.jsonl').emit('local_reward_baseline', {
+                    'source': BASELINE_VERSION, 'run_id': run_id, 'candidate_index': len(plans),
+                    'reward_version': baseline.version, 'approved': len(plans) in review.passed_candidate_indexes})
+                print('[奖励基线] %s：%s；原有验收、硬约束和预算继续执行' % (
+                    BASELINE_VERSION, '审查通过' if review.approved else '审查未通过'), flush=True)
         # 保留实际用于审查/编译的设计，但强制绑定原始 TaskSpec。
         write_json(task_dir / "design_response.json", dict(
             design, task_spec=task.dict(), reward_plans=[plan.dict() for plan in plans]))
@@ -1682,9 +1794,14 @@ class TrainingOrchestrator:
         try:
             trajectory = pd.read_parquet(media['trajectory'])
             rewards = pd.read_parquet(media['rewards'])
-            metrics = TrajectoryMetrics().compute(trajectory)
+            collector = TrajectoryMetrics()
+            metrics = (collector.compute_pilot(trajectory)
+                       if classify_forward_flip(task.original_instruction) == ForwardFlipKind.AERIAL
+                       else collector.compute(trajectory))
             report = audit_rollout(task, item['plan'], trajectory, rewards, metrics,
                                    metadata=read_json(media['metadata']), require_contact_metadata=True)
+            if metrics.get('pilot_reset_count', 0) > 0:
+                report['warnings'].append('早期策略发生原生重置，进度按独立 episode 计算；不代表动作完成')
         except (OSError, ValueError, KeyError) as exc:
             write_json(directory / 'audit.json', {'passed': False, 'errors': ['奖励审计证据不可用：' + str(exc)]})
             return False
@@ -1826,7 +1943,10 @@ class TrainingOrchestrator:
     def _task_reward_proxy(task: TaskSpec, latest: Dict[str, float]) -> tuple:
         """按动作选择原始奖励代理；代理只用于筛选，不替代最终物理验收。"""
         text = (task.task_name + ' ' + task.original_instruction).lower()
-        if '侧翻' in text or 'side_flip' in text:
+        if classify_forward_flip(task.original_instruction) == ForwardFlipKind.AERIAL:
+            terms = ['takeoff_velocity', 'airborne_duration', 'pitch_rotation',
+                     'net_pitch_progress', 'front_flip_recovery']
+        elif '侧翻' in text or 'side_flip' in text:
             terms = ['takeoff_velocity', 'airborne_duration', 'roll_rotation', 'landing_recovery']
         elif is_front_leg_support_text((task.original_instruction,)):
             terms = ['front_leg_stand', 'front_leg_walk']
@@ -2362,44 +2482,42 @@ class TrainingOrchestrator:
         intent = TaskIntentSpec.parse_obj(read_json(intent_path)) if intent_path.is_file() else TaskIntentSpec(
             original_instruction=task.original_instruction, robot=task.robot,
             action_name=task.task_name, normalized_goal=task.normalized_description)
+        revised, review = None, None
         for attempt in range(self.settings.reward_design_review_retries + 1):
-            write_json(root / ('request_%02d.json' % attempt), payload)
-            raw = self._provider_call(task_dir, 'reward_designer', 'redesign_rewards',
-                lambda: self.provider.redesign_rewards(payload))
             try:
-                revised = RewardPlan.parse_obj(raw.dict() if hasattr(raw, 'dict') else raw)
-            except ValueError as exc:
-                payload['validation_feedback'] = str(exc)
-                atomic_write_text(root / ('validation_error_%02d.txt' % attempt), str(exc) + '\n')
-                if attempt == self.settings.reward_design_review_retries:
-                    raise RewardValidationError('重设计返回的计划格式非法：' + str(exc)) from exc
-                continue
-            revised.task_id = task.task_id
-            revised.parent_version = selected['plan'].version
-            revised.version = selected['plan'].version + 1
-            write_json(root / ('proposal_%02d.json' % attempt), revised)
-            try:
-                # 先核对模型原提案；不通过补指标或改阈值掩盖目标漂移。
-                for metric in task.success_metrics:
-                    if metric.required and not any(m.dict() == metric.dict() for m in revised.success_metrics):
-                        raise RewardValidationError('重设计不得改变或遗漏验收指标：' + metric.name)
-                audit = self._normalize_plan_for_task(task, revised)
-                self._validate_plan_metric_coverage(task, revised)
+                if attempt == 0:
+                    write_json(root / 'request_00.json', payload)
+                    raw = self._provider_call(task_dir, 'reward_designer', 'redesign_rewards',
+                        lambda: self.provider.redesign_rewards(payload))
+                    write_json(root / 'response_00.json', raw)
+                    revised = RewardPlan.parse_obj(raw.dict() if hasattr(raw, 'dict') else raw)
+                    revised.task_id = task.task_id
+                    revised.parent_version = selected['plan'].version
+                    revised.version = selected['plan'].version + 1
+                else:
+                    if revised is None or review is None:
+                        raise RewardValidationError('重设计未保留可定位的提案，禁止重新生成完整计划')
+                    updated, _ = self._repair_reward_candidates(task, task_dir, [revised], review, manifest,
+                        root / 'field_repairs', attempt, extra_context=payload)
+                    revised = updated[0]
+                write_json(root / ('proposal_%02d.json' % attempt), revised)
                 review = self.reward_reviewer.review(intent, task, [revised],
-                    dict(manifest.dict(), require_objective_links=True),
+                    dict(manifest.dict(), require_objective_links=True,
+                         max_abs_reward_weight=self.settings.max_abs_reward_weight),
                     ['失败后的新奖励必须重新验证收益、动作形态及安全约束'])
                 write_json(root / ('review_%02d.json' % attempt), review)
                 if not review.approved:
-                    raise RewardValidationError('重设计审核未通过：' + '；'.join(review.conflicts + review.omissions))
+                    raise RewardValidationError('重设计审核未通过（验收指标及执行配置）：' + '；'.join(review.conflicts + review.omissions))
+                self._validate_plan_metric_coverage(task, revised)
                 from ..rewards.validator import RewardPlanValidator
                 RewardPlanValidator(manifest.rewards, self.settings.max_abs_reward_weight).validate(revised)
                 write_json(root / 'approved_reward_plan.json', revised)
-                return revised, ['GPT 基于失败分析和建议独立重设计完整奖励计划'] + audit
-            except RewardValidationError as exc:
+                return revised, ['GPT 基于失败分析提出新奖励方案；审核问题仅按本地字段白名单修复']
+            except (ProviderError, ValueError, KeyError) as exc:
                 payload['validation_feedback'] = str(exc)
                 atomic_write_text(root / ('validation_error_%02d.txt' % attempt), str(exc) + '\n')
                 if attempt == self.settings.reward_design_review_retries:
-                    raise
+                    raise RewardValidationError(str(exc)) from exc
         raise RewardValidationError('重设计未产生可执行计划')
 
     def _compile_revision(self, task: TaskSpec, task_dir: Path, state: PersistentStateMachine,
@@ -2416,7 +2534,8 @@ class TrainingOrchestrator:
         else:
             revised = selected["plan"].copy(deep=True)
             audit = ["奖励和课程保持不变，仅按诊断追加训练"]
-        audit.extend(self._normalize_plan_for_task(task, revised))
+        if not (self.settings.failure_reward_redesign and not dry_run):
+            audit.extend(self._normalize_plan_for_task(task, revised))
         self._validate_plan_metric_coverage(task, revised)
         experiment_id = "%s-revision-%02d-v%02d" % (selected["id"], round_index, revised.version)
         directory = self.store.candidate_dir(task.task_id, experiment_id)

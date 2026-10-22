@@ -32,7 +32,10 @@ def test_valid_walk_jump_and_front_leg_contracts():
 def test_proxy_and_unknown_implementation_cannot_claim_goal_coverage(metric):
     report = audit_objectives(*case(metric, 'roll_rotation'))
     assert not report['passed']
-    assert any('缺少已实现' in e for e in report['errors'])
+    message = '候选未启用' if metric == 'final_roll_angle' else '缺少已实现'
+    assert any(message in e for e in report['errors'])
+    assert report['coverage'][0]['active_terms'] == []
+    assert not report['coverage'][0]['verified']
 
 
 def test_missing_links_and_disabled_curriculum_are_rejected():
@@ -41,7 +44,7 @@ def test_missing_links_and_disabled_curriculum_are_rejected():
     assert not audit_objectives(task, plan)['passed']
     plan.curriculum = [CurriculumStage(name='off', start_iteration=0, end_iteration=50,
         parameter_changes={'reward_scales': {'tracking_lin_vel': 0}})]
-    assert any('缺少已实现' in e for e in audit_objectives(task, plan)['errors'])
+    assert any('候选未启用' in e for e in audit_objectives(task, plan)['errors'])
 
 
 def test_safety_all_stages_and_immutable_thresholds():

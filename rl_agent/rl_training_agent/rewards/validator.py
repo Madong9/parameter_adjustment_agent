@@ -93,10 +93,35 @@ def validate_plan_execution(plan: RewardPlan, max_abs_weight: float = 100.0) -> 
         for name, value in term.parameters.items():
             if not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise RewardValidationError('奖励参数不是有限数值：' + name)
-            if ('sigma' in name or name in {'takeoff_velocity_target', 'net_roll_target'}) and value <= 0:
+            if ('sigma' in name or name in {'takeoff_velocity_target', 'net_roll_target', 'net_pitch_target', 'pitch_rate_target'}) and value <= 0:
                 raise RewardValidationError('奖励尺度必须大于零：' + name)
             if name == 'min_air_time_threshold' and value < 0:
                 raise RewardValidationError('最小腾空时间不能为负数')
+
+
+def validate_registered_weights(plan, registry, max_abs_weight=100., ignore_unknown=False):
+    """审核和编译共用注册表符号与权重边界，避免问题延迟到编译才发现。"""
+    for term in plan.terms:
+        if term.name not in registry:
+            if ignore_unknown:
+                continue
+            raise RewardValidationError("reward is not present in registry: %s" % term.name)
+        if not isinstance(term.parameters, dict):
+            raise RewardValidationError("reward parameters must be an object: %s" % term.name)
+        if not math.isfinite(term.weight):
+            raise RewardValidationError("reward weight is not finite: %s" % term.name)
+        if abs(term.weight) > max_abs_weight:
+            raise RewardValidationError("reward weight exceeds safety limit: %s" % term.name)
+        item = registry[term.name]
+        expected_sign = item.get('sign') if isinstance(item, dict) else item.sign
+        if expected_sign == "negative" and term.weight > 0:
+            raise RewardValidationError("penalty reward has unsafe positive sign: %s" % term.name)
+        if expected_sign == "positive" and term.weight < 0:
+            raise RewardValidationError("positive reward has unsafe negative sign: %s" % term.name)
+        for stage in plan.curriculum:
+            override = stage.parameter_changes.get('reward_scales', {}).get(term.name, term.weight)
+            if (expected_sign == 'negative' and override > 0) or (expected_sign == 'positive' and override < 0):
+                raise RewardValidationError('课程权重违反奖励符号：' + term.name)
 
 
 class RewardPlanValidator:
@@ -108,24 +133,7 @@ class RewardPlanValidator:
     def validate(self, plan: RewardPlan) -> None:
         """校验奖励计划只使用安全且已注册的奖励项。"""
         validate_plan_execution(plan, self.max_abs_weight)
-        for term in plan.terms:
-            if term.name not in self.registry:
-                raise RewardValidationError("reward is not present in registry: %s" % term.name)
-            if not isinstance(term.parameters, dict):
-                raise RewardValidationError("reward parameters must be an object: %s" % term.name)
-            if not math.isfinite(term.weight):
-                raise RewardValidationError("reward weight is not finite: %s" % term.name)
-            if abs(term.weight) > self.max_abs_weight:
-                raise RewardValidationError("reward weight exceeds safety limit: %s" % term.name)
-            expected_sign = self.registry[term.name].sign
-            if expected_sign == "negative" and term.weight > 0:
-                raise RewardValidationError("penalty reward has unsafe positive sign: %s" % term.name)
-            if expected_sign == "positive" and term.weight < 0:
-                raise RewardValidationError("positive reward has unsafe negative sign: %s" % term.name)
-            for stage in plan.curriculum:
-                override = stage.parameter_changes.get('reward_scales', {}).get(term.name, term.weight)
-                if (expected_sign == 'negative' and override > 0) or (expected_sign == 'positive' and override < 0):
-                    raise RewardValidationError('课程权重违反奖励符号：' + term.name)
+        validate_registered_weights(plan, self.registry, self.max_abs_weight)
 
 
 class RewardCodeValidator:

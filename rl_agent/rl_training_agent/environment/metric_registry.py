@@ -36,6 +36,11 @@ def canonical_metric_name(name: str, supported: Iterable[str]) -> str:
     alias = EXPLICIT_ALIASES.get(normalized)
     if alias in supported_names:
         return alias
+    if ('flip' in normalized or 'somersault' in normalized or
+            ('pitch' in normalized and any(token in normalized for token in (
+                'final', 'progress', 'rotation', 'completion')))):
+        # 未实现的前翻进度不能通过名字相似性降级成普通俯仰上界。
+        return normalized
     if "contact" in normalized and ("force" in normalized or "collision" in normalized):
         return "forbidden_body_contact" if "forbidden_body_contact" in supported_names else normalized
     if "pitch" in normalized:

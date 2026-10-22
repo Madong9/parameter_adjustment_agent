@@ -74,6 +74,7 @@ class EnvironmentInspector:
                 "front_leg_forward_speed", "rear_leg_forward_speed",
                 "final_roll_angle", "max_roll_velocity", "landing_stability", "feet_air_time",
                 "takeoff_time_spread", "landing_pitch_abs",
+                "final_pitch_angle", "pitch_axis_error",
             ])
 
     def write(self, path: Path, robot: str = "go2") -> CapabilityManifest:
